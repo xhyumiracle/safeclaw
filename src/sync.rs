@@ -246,7 +246,72 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
     // already-synced rows 409-skip without blocking the rest.
     push_keys_best_effort(state, vault_id).await;
     push_items_best_effort(state, vault_id).await;
+    deliver_team_marks(state, vault_id).await;
     Ok(SyncOutcome { pulled, connects })
+}
+
+/// Drain the post-migration cloud marks for one vault (team §8.3/§5.15):
+/// the owner lock-list registration (config-ids) and the one-way `format=2`
+/// ratchet. Both idempotent server-side; delivered only after the push above
+/// so the format gate never fronts rows that aren't up yet. Best-effort —
+/// stays queued for the next round on any failure.
+async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
+    let cfg = match crate::cli::active::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some(dk) = device_key() else { return };
+    let has_ids = state
+        .pending_config_ids
+        .lock()
+        .unwrap()
+        .get(vault_id)
+        .cloned();
+    let has_format = state.pending_format_mark.lock().unwrap().contains(vault_id);
+    if has_ids.is_none() && !has_format {
+        return;
+    }
+    let Ok(client) = crate::cli::egress_proxy::client(Duration::from_secs(10)) else {
+        return;
+    };
+    let cloud = cloud.trim_end_matches('/');
+    if let Some(ids) = has_ids {
+        let url = format!("{}/v/{}/config-ids", cloud, vault_id);
+        match client
+            .post(&url)
+            .bearer_auth(&dk)
+            .json(&serde_json::json!({ "ids": ids }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                state.pending_config_ids.lock().unwrap().remove(vault_id);
+                tracing::info!(vault = %vault_id, "owner lock-list registered");
+            }
+            Ok(r) => tracing::debug!(vault = %vault_id, status = %r.status(), "config-ids register deferred"),
+            Err(e) => tracing::debug!(vault = %vault_id, "config-ids register failed: {}", e),
+        }
+    }
+    if has_format {
+        let url = format!("{}/v/{}/format", cloud, vault_id);
+        match client
+            .patch(&url)
+            .bearer_auth(&dk)
+            .json(&serde_json::json!({ "format": 2 }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                state.pending_format_mark.lock().unwrap().remove(vault_id);
+                tracing::info!(vault = %vault_id, "vault marked format=2 (unified addressing)");
+            }
+            Ok(r) => tracing::debug!(vault = %vault_id, status = %r.status(), "format mark deferred"),
+            Err(e) => tracing::debug!(vault = %vault_id, "format mark failed: {}", e),
+        }
+    }
 }
 
 /// After a per-item pull adopted new rows, refresh the in-memory cache for an

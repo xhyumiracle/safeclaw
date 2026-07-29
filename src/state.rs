@@ -298,6 +298,14 @@ pub struct AppState {
     /// credentials parking its sync — keeps serving a SHARED vault only for
     /// the lease window.
     pub cloud_contact: Mutex<HashMap<String, std::time::Instant>>,
+    /// Vaults whose addressing migration completed locally but whose cloud
+    /// `format=2` mark hasn't landed yet — the sync loop drains this after a
+    /// successful item push (团队 §8.3: mark only after the rows are up).
+    pub pending_format_mark: Mutex<std::collections::HashSet<String>>,
+    /// Owner lock-list registrations awaiting delivery: vault → blinded ids of
+    /// the config singletons (computed at unlock while K was in hand; the sync
+    /// loop POSTs them once for SHARED vaults). §5.15 two-tier write model.
+    pub pending_config_ids: Mutex<HashMap<String, Vec<String>>>,
     pub challenges: Mutex<ChallengeStore>,
     pub approvals: Mutex<ApprovalStore>,
     pub services: ServiceRegistry,
@@ -428,6 +436,8 @@ impl AppState {
             config,
             vaults,
             cloud_contact: Mutex::new(HashMap::new()),
+            pending_format_mark: Mutex::new(std::collections::HashSet::new()),
+            pending_config_ids: Mutex::new(HashMap::new()),
             challenges: Mutex::new(ChallengeStore::new()),
             approvals: Mutex::new(ApprovalStore::new()),
             services: ServiceRegistry::load(),

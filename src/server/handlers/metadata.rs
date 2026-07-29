@@ -315,6 +315,26 @@ pub fn unwrap_k_from_keyset(
     Ok(zeroize::Zeroizing::new(k_bytes))
 }
 
+/// Blinded item ids of the six config singletons under this vault's `K` —
+/// the owner lock list the backend write-gates (team §5.15). Non-secret by
+/// design (the aux-id registration decision): naming WHICH ids are config
+/// reveals category, never content.
+fn config_singleton_ids(k: &[u8], vault_id: &str) -> Result<Vec<String>> {
+    use crate::storage::item::ItemNs;
+    let _ = vault_id;
+    [
+        ItemNs::Policy,
+        ItemNs::Stores,
+        ItemNs::StoreOrder,
+        ItemNs::AuditRetentionDays,
+        ItemNs::Services,
+        ItemNs::Members,
+    ]
+    .into_iter()
+    .map(|ns| crate::storage::item::item_id::<StdPrimitives>(k, ns.as_str(), ""))
+    .collect()
+}
+
 /// Per-item analogue of [`decrypt_vault_view`]: unwrap `K` from the keyset via
 /// the grant, then fold all live item rows into a [`VaultPlaintextView`]. Used
 /// by the per-item Export path. Discards `K` after the fold (read-only).
@@ -411,6 +431,17 @@ pub fn open_view_for_grant_keep_key(
             // pre-migration file (never plaintext to disk). Version-bumped
             // rows ride the normal sync push. Failures leave the vault
             // readable via the fold's dual-read — never block an unlock.
+            // Shared vault: queue the owner lock-list registration (blinded
+            // ids of the config singletons) — the sync loop delivers it once.
+            if !view.aux.members.is_empty() {
+                if let Ok(ids) = config_singleton_ids(&k, vault_id) {
+                    state
+                        .pending_config_ids
+                        .lock()
+                        .unwrap()
+                        .insert(vault_id.to_string(), ids);
+                }
+            }
             if view.legacy_addressing {
                 let backup = path.with_extension("pre-migration.json");
                 if !backup.exists() {
@@ -425,6 +456,11 @@ pub fn open_view_for_grant_keep_key(
                             Ok(()) => {
                                 tracing::info!(vault = %vault_id, items = changed.len(),
                                     "unified-addressing migration complete (legacy rows tombstoned)");
+                                state
+                                    .pending_format_mark
+                                    .lock()
+                                    .unwrap()
+                                    .insert(vault_id.to_string());
                                 // Re-fold so the session view reflects the
                                 // migrated state, and let the regular sync
                                 // loop push the bumped rows.
