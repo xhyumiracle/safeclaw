@@ -74,8 +74,16 @@ pub fn register_pending_use(
 
     let (op_id, expires_at) = {
         let mut store = state.approvals.lock().unwrap();
-        let id =
-            store.create_with_policy(vault_id.to_string(), op.clone(), r.clone(), policy_context);
+        // Op-agent binding (team §C1): the triggering agent's prefix lands on
+        // the record so every consumption surface can enforce "only the agent
+        // this was approved FOR can use it".
+        let id = store.create_bound(
+            vault_id.to_string(),
+            op.clone(),
+            r.clone(),
+            policy_context,
+            agent_prefix.clone(),
+        );
         let exp = store.get(&id).map(|rec| rec.expires_at_unix).unwrap_or(0);
         (id, exp)
     };

@@ -69,6 +69,28 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
         if let Err(r) = require_key(state, req.headers()).await {
             return r;
         }
+        // Op-agent binding (team §C1): an agent-created op is pollable only by
+        // the agent that triggered it — a different (still valid) key gets the
+        // same shape as an unknown op, so this face leaks nothing about other
+        // agents' pending work. Ops with no agent stamp (ceremonies) stay
+        // reachable by any valid key, matching today's user-surface semantics.
+        {
+            let bound = state
+                .approvals
+                .lock()
+                .unwrap()
+                .get(op_id)
+                .and_then(|r| r.agent_prefix.clone());
+            if let Some(expected) = bound {
+                let caller = bearer_token(req.headers())
+                    .as_deref()
+                    .map(crate::audit::agent_key_prefix)
+                    .unwrap_or_default();
+                if caller != expected {
+                    return problem(ScCode::NotFound, "Not found");
+                }
+            }
+        }
         return match crate::server::handlers::approve::op_poll_value(state, op_id) {
             Ok(v) => op_poll_response(&v),
             Err(e) => app_err(e),

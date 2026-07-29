@@ -51,6 +51,14 @@ pub struct ApprovalRecord {
     /// next matching request. Daemon-internal: never appears on the wire,
     /// never signed into the grant.
     pub policy_context: Option<PolicyContext>,
+    /// Prefix of the agent api-key that TRIGGERED this op (op-agent binding,
+    /// team §C1) — the daemon-side enforcement handle. Every agent-facing
+    /// consumption surface (proxy op poll, op_grants redeem, ask-cache
+    /// write/read) compares the acting key against this. The same value rides
+    /// in `o.act.scope.agent` so the human's signature covers it; this copy
+    /// exists so enforcement never re-parses the signed op. `None` = op not
+    /// created by an agent request (ceremonies) — no agent gate applies.
+    pub agent_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,18 +122,31 @@ impl ApprovalStore {
 
     /// Create a new pending approval. Returns the new approval id.
     pub fn create(&mut self, vault_id: String, op: Operation, r: String) -> String {
-        self.create_with_policy(vault_id, op, r, None)
+        self.create_bound(vault_id, op, r, None, None)
     }
 
     /// Same as [`create`] but stashes the policy-decision context that led
-    /// to this op being created. Used by /use; ops created by other paths
-    /// (export, write, lifecycle) pass `None`.
+    /// to this op being created.
     pub fn create_with_policy(
         &mut self,
         vault_id: String,
         op: Operation,
         r: String,
         policy_context: Option<PolicyContext>,
+    ) -> String {
+        self.create_bound(vault_id, op, r, policy_context, None)
+    }
+
+    /// Full-fat create: policy context + the triggering agent's key prefix
+    /// (op-agent binding). Used by the broker paths; ceremonies (export,
+    /// write, lifecycle) have no agent and pass `None`.
+    pub fn create_bound(
+        &mut self,
+        vault_id: String,
+        op: Operation,
+        r: String,
+        policy_context: Option<PolicyContext>,
+        agent_prefix: Option<String>,
     ) -> String {
         let id = Uuid::new_v4().to_string();
         let now_unix = SystemTime::now()
@@ -154,6 +175,7 @@ impl ApprovalStore {
             expires_at_unix: now_unix + ttl_secs,
             ttl: Duration::from_secs(ttl_secs),
             policy_context,
+            agent_prefix,
             fail_count: 0,
         };
         self.inner.insert(id.clone(), rec);

@@ -78,6 +78,11 @@ pub struct CacheEntry {
     /// ask-always path never reads `entries` at all — see `op_grants`.) A real
     /// grant (from `approve_op`) overwrites it with `from_bootstrap = false`.
     pub from_bootstrap: bool,
+    /// Op-agent binding (team §C1): for a GRANT entry, the prefix of the agent
+    /// key the approval was minted for — `cache_lookup_grant` misses for any
+    /// other agent. `None` on bootstrap/residency entries (allow-level values
+    /// are not approvals; any policy-allowed agent may use them).
+    pub agent_prefix: Option<String>,
 }
 
 /// How long an approved `ask-always` one-shot grant stays redeemable
@@ -124,7 +129,11 @@ pub struct SecretsCache {
     /// requests *of the same scope* within the TTL fast-path without
     /// re-prompting. `ask-always` never lands here; `allow` doesn't need it.
     ///
-    /// Key shape: `(connection_id, rule_id, method, host)`. The grant is bound to:
+    /// Key shape: `(agent_prefix, connection_id, rule_id, method, host)`. The
+    /// grant is bound to:
+    ///   - the **agent** that triggered the approved op (op-agent binding,
+    ///     team §C1) — agent A's approved ask never fast-paths agent B's
+    ///     identical request inside the window;
     ///   - the **connection** — approving account A's send never fast-paths B;
     ///   - the matched **policy rule** — which carries the path scope, so a
     ///     grant can never reach beyond the rule the user's approval matched;
@@ -140,9 +149,11 @@ pub struct SecretsCache {
     /// Lives in the same memory window as the rest of the cache: dropped on
     /// lock (which zero-outs the entire cache via Default drop). Daemon
     /// restart also blows it away (vaults boot Locked, cache starts empty).
-    pub rule_approvals: HashMap<(String, String, String, String), u64>,
+    pub rule_approvals: HashMap<(String, String, String, String, String), u64>,
     /// `ask-always` one-shot grants, keyed by the REQUEST the user approved:
-    /// `(connection_id, method, host, path, scope_digest)`. Written by
+    /// `(agent_prefix, connection_id, method, host, path, scope_digest)` —
+    /// agent-bound like `rule_approvals` (a grant minted for agent A's request
+    /// cannot be spent by agent B). Written by
     /// `approve_op` when the op's policy level was AskAlways; consumed (removed)
     /// by the proxy's replay exactly once. This is what makes an `ask-always`
     /// approval mean "this action, once": a grant minted for `POST /v2/purchase`
@@ -162,7 +173,7 @@ pub struct SecretsCache {
     /// (e.g. a chat agent) may take minutes to re-run. Single-use + exact
     /// binding is what makes the long window safe — time is not the guard.
     /// Same memory window as the rest of the cache: dropped on lock/refresh.
-    pub op_grants: HashMap<(String, String, String, String, String), CacheEntry>,
+    pub op_grants: HashMap<(String, String, String, String, String, String), CacheEntry>,
     /// Item names present in the decrypted `native-secrets` kv (names only,
     /// never values). Surface for `GET /v/{vid}/secret-keys` so the frontend
     /// can decide which services are "reachable" without paying for an
@@ -796,16 +807,19 @@ impl AppState {
         conn_id: &str,
         value: Vec<u8>,
         expires_at: Option<u64>,
+        agent_prefix: Option<String>,
     ) {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.entries.insert(
                 conn_id.to_string(),
-                // A real approval grant — consumable by the ask retry path.
+                // A real approval grant — consumable by the ask retry path,
+                // bound to the agent the approval was minted for.
                 CacheEntry {
                     value,
                     expires_at,
                     from_bootstrap: false,
+                    agent_prefix,
                 },
             );
         }
@@ -819,6 +833,7 @@ impl AppState {
     pub fn op_grant_insert(
         &self,
         vault_id: &str,
+        agent_prefix: &str,
         conn_id: &str,
         method: &str,
         host: &str,
@@ -831,6 +846,7 @@ impl AppState {
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.op_grants.insert(
                 (
+                    agent_prefix.to_string(),
                     conn_id.to_string(),
                     method.to_string(),
                     host.to_ascii_lowercase(),
@@ -841,6 +857,7 @@ impl AppState {
                     value,
                     expires_at: Some(expires_at),
                     from_bootstrap: false,
+                    agent_prefix: Some(agent_prefix.to_string()),
                 },
             );
         }
@@ -863,6 +880,7 @@ impl AppState {
     pub fn op_grant_take(
         &self,
         vault_id: &str,
+        agent_prefix: &str,
         conn_id: &str,
         method: &str,
         host: &str,
@@ -880,6 +898,7 @@ impl AppState {
             _ => return None,
         };
         let key = (
+            agent_prefix.to_string(),
             conn_id.to_string(),
             method.to_string(),
             host.to_ascii_lowercase(),
@@ -905,7 +924,12 @@ impl AppState {
     /// first matching request forces a passkey approval instead of riding the
     /// connection's allow-level residency; after approval the downgraded (Allow)
     /// retry reads the real grant via `cache_lookup`. Non-destructive; honors TTL.
-    pub fn cache_lookup_grant(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
+    pub fn cache_lookup_grant(
+        &self,
+        vault_id: &str,
+        conn_id: &str,
+        agent_prefix: &str,
+    ) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -917,6 +941,11 @@ impl AppState {
         };
         let entry = cache.entries.get(conn_id)?;
         if entry.from_bootstrap {
+            return None;
+        }
+        // Op-agent binding: a grant minted for one agent is not a grant for
+        // another — miss (and re-prompt) instead of riding it.
+        if entry.agent_prefix.as_deref() != Some(agent_prefix) {
             return None;
         }
         if let Some(exp) = entry.expires_at {
@@ -984,6 +1013,7 @@ impl AppState {
                     expires_at: Some(expires_at),
                     // oauth_access has its own lookup path; the flag is unread here.
                     from_bootstrap: false,
+                    agent_prefix: None,
                 },
             );
         }
@@ -1042,6 +1072,7 @@ impl AppState {
     pub fn evaluate_request_policy(
         &self,
         vault_id: &str,
+        agent_prefix: &str,
         connection_id: &str,
         service_id: &str,
         method: &str,
@@ -1128,10 +1159,13 @@ impl AppState {
         // request could ride. Only a genuinely scope-less rule uses this window.
         if level == crate::core::policy::AccessLevel::Ask && !has_scope_shape {
             if let Some(rule_id) = matched_rule.clone() {
-                // The grant is scoped to the **connection** (not the service),
-                // the matched rule, the method, AND the resolved host: an
-                // approval for host A must not fast-path host B in the window.
+                // The grant is scoped to the **agent** (op-agent binding),
+                // the **connection** (not the service), the matched rule, the
+                // method, AND the resolved host: an approval for host A must
+                // not fast-path host B in the window, and agent A's approval
+                // never fast-paths agent B.
                 let key = (
+                    agent_prefix.to_string(),
                     connection_id.to_string(),
                     rule_id,
                     method.to_string(),
@@ -1168,6 +1202,7 @@ impl AppState {
     pub fn record_ask_approval(
         &self,
         vault_id: &str,
+        agent_prefix: &str,
         connection_id: &str,
         rule_id: Option<String>,
         method: &str,
@@ -1184,6 +1219,7 @@ impl AppState {
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.rule_approvals.insert(
                 (
+                    agent_prefix.to_string(),
                     connection_id.to_string(),
                     rule_id,
                     method.to_string(),
@@ -1406,6 +1442,7 @@ mod tests {
                     value: value.to_vec(),
                     expires_at: None,
                     from_bootstrap: true,
+                    agent_prefix: None,
                 },
             );
         }
@@ -1419,13 +1456,14 @@ mod tests {
         // allow fast-path uses the residency…
         assert_eq!(state.cache_lookup("v1", "github"), Some(b"tok".to_vec()));
         // …but ask must NOT: a bootstrap value is not a grant.
-        assert_eq!(state.cache_lookup_grant("v1", "github"), None);
+        assert_eq!(state.cache_lookup_grant("v1", "github", "agA"), None);
         // ask-always never reads `entries` at all — the residency (and even a
         // real conn-keyed ask grant) is invisible to op_grant_take.
-        state.cache_insert("v1", "github", b"granted".to_vec(), None);
+        state.cache_insert("v1", "github", b"granted".to_vec(), None, Some("agA".into()));
         assert_eq!(
             state.op_grant_take(
                 "v1",
+                "agA",
                 "github",
                 "DELETE",
                 "api.github.com",
@@ -1437,7 +1475,7 @@ mod tests {
         );
         // The ask path sees its grant as usual.
         assert_eq!(
-            state.cache_lookup_grant("v1", "github"),
+            state.cache_lookup_grant("v1", "github", "agA"),
             Some(b"granted".to_vec())
         );
     }
@@ -1446,7 +1484,7 @@ mod tests {
     fn cache_insert_no_expiry_persists_lookups() {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        state.cache_insert("v1", "svc", b"secret".to_vec(), None);
+        state.cache_insert("v1", "svc", b"secret".to_vec(), None, Some("agA".into()));
         assert_eq!(state.cache_lookup("v1", "svc"), Some(b"secret".to_vec()));
         // Multiple lookups still hit (no eviction without expiry).
         assert_eq!(state.cache_lookup("v1", "svc"), Some(b"secret".to_vec()));
@@ -1464,6 +1502,7 @@ mod tests {
             + 600;
         state.op_grant_insert(
             "v1",
+            "agA",
             "svc",
             "POST",
             "api.x.com",
@@ -1474,13 +1513,13 @@ mod tests {
         );
         // First take returns the value …
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
             Some(b"tok".to_vec())
         );
         // … and removes it: a second take misses, and nothing leaked into the
         // conn-keyed entries for the allow/ask paths to find.
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
             None
         );
         assert_eq!(state.cache_lookup("v1", "svc"), None);
@@ -1501,6 +1540,7 @@ mod tests {
             + 600;
         state.op_grant_insert(
             "v1",
+            "agA",
             "svc",
             "POST",
             "api.x.com",
@@ -1511,26 +1551,93 @@ mod tests {
         );
         // Different path / method / host / connection → all miss.
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/refund", "", true),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/refund", "", true),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "svc", "DELETE", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take("v1", "agA", "svc", "DELETE", "api.x.com", "/v2/purchase", "", true),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.y.com", "/v2/purchase", "", true),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.y.com", "/v2/purchase", "", true),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "other", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take("v1", "agA", "other", "POST", "api.x.com", "/v2/purchase", "", true),
             None
         );
         // Host comparison is case-insensitive (hosts are lowercased at insert).
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "API.X.COM", "/v2/purchase", "", true),
+            state.op_grant_take("v1", "agA", "svc", "POST", "API.X.COM", "/v2/purchase", "", true),
             Some(b"tok".to_vec())
         );
+    }
+
+    /// Op-agent binding (team §C1): every grant surface is keyed by the agent
+    /// the approval was minted for. Agent B holding a perfectly valid key must
+    /// never redeem/ride agent A's approval — and B's miss must not consume
+    /// A's grant.
+    #[test]
+    fn grants_are_agent_bound_across_all_three_surfaces() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+
+        // (1) ask-always / scoped op_grants.
+        state.op_grant_insert(
+            "v1",
+            "agA",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/v2/purchase",
+            "",
+            b"tok".to_vec(),
+            far,
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "agB", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            None,
+            "agent B cannot redeem A's grant"
+        );
+        assert_eq!(
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            Some(b"tok".to_vec()),
+            "B's miss must not have consumed A's grant"
+        );
+
+        // (2) unscoped-ask conn-keyed grant.
+        state.cache_insert("v1", "svc", b"granted".to_vec(), None, Some("agA".into()));
+        assert_eq!(state.cache_lookup_grant("v1", "svc", "agB"), None);
+        assert_eq!(
+            state.cache_lookup_grant("v1", "svc", "agA"),
+            Some(b"granted".to_vec())
+        );
+
+        // (3) rule-approvals window: recorded for A, B still re-prompts.
+        state.record_ask_approval("v1", "agA", "gh", Some("read".into()), "GET", "h.com", 60);
+        {
+            let states = state.vault_states.lock().unwrap();
+            if let Some(VaultState::Unlocked { cache, .. }) = states.get("v1") {
+                let key_a = (
+                    "agA".to_string(),
+                    "gh".to_string(),
+                    "read".to_string(),
+                    "GET".to_string(),
+                    "h.com".to_string(),
+                );
+                let mut key_b = key_a.clone();
+                key_b.0 = "agB".to_string();
+                assert!(cache.rule_approvals.contains_key(&key_a));
+                assert!(!cache.rule_approvals.contains_key(&key_b));
+            } else {
+                panic!("vault not unlocked");
+            }
+        }
     }
 
     #[test]
@@ -1539,6 +1646,7 @@ mod tests {
         unlock_with_empty_cache(&state, "v1");
         state.op_grant_insert(
             "v1",
+            "agA",
             "svc",
             "POST",
             "api.x.com",
@@ -1549,7 +1657,7 @@ mod tests {
         );
         // Expired grant is not returned (and is consumed/dropped).
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/p", "", true),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/p", "", true),
             None
         );
     }
@@ -1571,6 +1679,7 @@ mod tests {
         let d180 = crate::service::scope_digest(&[("amount".into(), "180".into())]);
         state.op_grant_insert(
             "v1",
+            "agA",
             "svc",
             "POST",
             "api.x.com",
@@ -1583,6 +1692,7 @@ mod tests {
         assert_eq!(
             state.op_grant_take(
                 "v1",
+                "agA",
                 "svc",
                 "POST",
                 "api.x.com",
@@ -1594,11 +1704,11 @@ mod tests {
         );
         // …so the honest ($80) replay still succeeds, exactly once.
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
             Some(b"tok".to_vec())
         );
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
             None
         );
     }
@@ -1620,6 +1730,7 @@ mod tests {
         let d_other = crate::service::scope_digest(&[("q".into(), "beta".into())]);
         state.op_grant_insert(
             "v1",
+            "agA",
             "svc",
             "POST",
             "api.x.com",
@@ -1630,20 +1741,20 @@ mod tests {
         );
         // Peek (consume=false) reuses the SAME action any number of times…
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/search", &d_read, false),
             Some(b"tok".to_vec())
         );
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/search", &d_read, false),
             Some(b"tok".to_vec())
         );
         // …but a DIFFERENT bound value misses (re-prompt), without disturbing the grant.
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_other, false),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/search", &d_other, false),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/search", &d_read, false),
             Some(b"tok".to_vec())
         );
     }
@@ -1653,7 +1764,7 @@ mod tests {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
         // Already-expired entry.
-        state.cache_insert("v1", "svc", b"secret".to_vec(), Some(0));
+        state.cache_insert("v1", "svc", b"secret".to_vec(), Some(0), Some("agA".into()));
         assert_eq!(state.cache_lookup("v1", "svc"), None);
         // Subsequent insert with valid TTL should succeed (lazy eviction
         // dropped the stale entry; nothing leaks across).
@@ -1662,7 +1773,7 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3600;
-        state.cache_insert("v1", "svc", b"new".to_vec(), Some(future));
+        state.cache_insert("v1", "svc", b"new".to_vec(), Some(future), Some("agA".into()));
         assert_eq!(state.cache_lookup("v1", "svc"), Some(b"new".to_vec()));
     }
 
@@ -1672,7 +1783,7 @@ mod tests {
         // Never unlocked.
         assert_eq!(state.cache_lookup("v1", "svc"), None);
         // Insert into a locked vault should be a no-op too.
-        state.cache_insert("v1", "svc", b"x".to_vec(), None);
+        state.cache_insert("v1", "svc", b"x".to_vec(), None, Some("agA".into()));
         assert_eq!(state.cache_lookup("v1", "svc"), None);
     }
 
@@ -1715,6 +1826,7 @@ mod tests {
         let (lvl, rule, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "gh",
                 "gh",
                 "GET",
@@ -1729,12 +1841,13 @@ mod tests {
         assert_eq!(rule.as_deref(), Some("read"));
 
         // User approves that GET toward host A.
-        state.record_ask_approval(vid, "gh", Some("read".to_string()), "GET", "api.gh.com", 60);
+        state.record_ask_approval(vid, "agA", "gh", Some("read".to_string()), "GET", "api.gh.com", 60);
 
         // The same GET toward the same host now fast-paths (the feature works).
         let (lvl, _, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "gh",
                 "gh",
                 "GET",
@@ -1752,6 +1865,7 @@ mod tests {
         let (lvl, _, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "gh",
                 "gh",
                 "GET",
@@ -1772,6 +1886,7 @@ mod tests {
         let (lvl, rule, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "gh",
                 "gh",
                 "POST",
@@ -1791,7 +1906,7 @@ mod tests {
 
         // A tag-default Ask (no rule) is never recorded, so it can never
         // produce a fast-path — record is a no-op for rule_id == None.
-        state.record_ask_approval(vid, "gh", None, "GET", "api.gh.com", 60);
+        state.record_ask_approval(vid, "agA", "gh", None, "GET", "api.gh.com", 60);
     }
 
     // A path that declares a `[requests]` scope shape must bind its approval
@@ -1830,6 +1945,7 @@ mod tests {
         // the coarse connection-window key (exactly the empty-body path).
         state.record_ask_approval(
             vid,
+            "agA",
             "shop",
             Some("purchase".to_string()),
             "POST",
@@ -1841,6 +1957,7 @@ mod tests {
         let (lvl, _, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "shop",
                 "shop",
                 "POST",
@@ -1858,6 +1975,7 @@ mod tests {
         let (lvl, _, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "shop",
                 "shop",
                 "POST",

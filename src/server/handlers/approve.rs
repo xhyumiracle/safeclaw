@@ -786,12 +786,14 @@ pub async fn approve_op(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let pc = state
-                .approvals
-                .lock()
-                .unwrap()
-                .get(&op_id)
-                .and_then(|r| r.policy_context.clone());
+            let (pc, grant_agent) = {
+                let store = state.approvals.lock().unwrap();
+                let rec = store.get(&op_id);
+                (
+                    rec.and_then(|r| r.policy_context.clone()),
+                    rec.and_then(|r| r.agent_prefix.clone()).unwrap_or_default(),
+                )
+            };
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -842,6 +844,7 @@ pub async fn approve_op(
                 if !conn.is_empty() && !method.is_empty() && !host.is_empty() && !path.is_empty() {
                     state.op_grant_insert(
                         &vault_id,
+                        &grant_agent,
                         &conn,
                         method,
                         &host,
@@ -860,7 +863,13 @@ pub async fn approve_op(
                 // Unscoped ask (and legacy no-context ops): conn-keyed value with
                 // the grant-window TTL, read by the downgraded-to-Allow retry.
                 let ttl = pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300);
-                state.cache_insert(&vault_id, &conn, s_o, Some(now + ttl));
+                state.cache_insert(
+                    &vault_id,
+                    &conn,
+                    s_o,
+                    Some(now + ttl),
+                    Some(grant_agent.clone()),
+                );
             }
             (
                 json!({ "ok": true, "act": "use", "authorized": true, "stream": true }),
@@ -1706,7 +1715,7 @@ pub async fn approve_op(
     // the record before mutation so we can write into the rule-approvals
     // cache below — without this, an `ask`-with-TTL approval would never
     // short-circuit the next matching request.
-    let (rec_id, rec_vault_id, response_preview, policy_ctx_for_cache) = {
+    let (rec_id, rec_vault_id, response_preview, policy_ctx_for_cache, rec_agent_prefix) = {
         let mut store = state.approvals.lock().unwrap();
         let rec = store
             .approve(&op_id, cached_value.clone())
@@ -1725,7 +1734,13 @@ pub async fn approve_op(
         } else {
             None
         };
-        (rec.id.clone(), rec.vault_id.clone(), preview, pc)
+        (
+            rec.id.clone(),
+            rec.vault_id.clone(),
+            preview,
+            pc,
+            rec.agent_prefix.clone().unwrap_or_default(),
+        )
     };
 
     // Cache write: an Ask-level approval scopes a TTL'd "next matching
@@ -1793,6 +1808,7 @@ pub async fn approve_op(
             if !conn.is_empty() && !req_method.is_empty() {
                 state.record_ask_approval(
                     &rec_vault_id,
+                    &rec_agent_prefix,
                     &conn,
                     pc.rule_id,
                     &req_method,
@@ -2087,6 +2103,7 @@ pub(crate) fn bootstrap_cache_from_view(
                             value: val.to_vec(),
                             expires_at: None, // allow = lives whole unlocked session
                             from_bootstrap: true,
+                            agent_prefix: None,
                         },
                     );
                 }
@@ -2149,6 +2166,7 @@ pub(crate) fn bootstrap_cache_from_view(
                         value: val.to_vec(),
                         expires_at: None,
                         from_bootstrap: true,
+                        agent_prefix: None,
                     },
                 );
             }
@@ -2207,6 +2225,7 @@ pub(crate) fn bootstrap_cache_from_view(
                     value: primary,
                     expires_at: None,
                     from_bootstrap: true,
+                    agent_prefix: None,
                 },
             );
         }
@@ -2422,6 +2441,7 @@ pub(crate) async fn lazy_fill_external(
                     value: val,
                     expires_at: None,
                     from_bootstrap: true,
+                    agent_prefix: None,
                 });
         }
         if !map.is_empty() {

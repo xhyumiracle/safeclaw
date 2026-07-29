@@ -448,8 +448,16 @@ impl BrokerHandler {
         // ── policy ───────────────────────────────────────────────────────────
         // The same lossy view the phantom scan used (unified boundary).
         let body_for_policy = body_text.as_deref();
+        // Op-agent binding: every approval/grant surface below keys on the
+        // requesting agent (the pipeline validated self.key before secrets).
+        let agent_prefix = self
+            .key
+            .as_deref()
+            .map(crate::audit::agent_key_prefix)
+            .unwrap_or_default();
         let decision = self.state.evaluate_request_policy(
             &vault_id,
+            &agent_prefix,
             &conn,
             &service_id,
             &method,
@@ -508,6 +516,7 @@ impl BrokerHandler {
             AccessLevel::AskAlways => (
                 self.state.op_grant_take(
                     &vault_id,
+                    &agent_prefix,
                     &conn,
                     &method,
                     &dest_host,
@@ -524,6 +533,7 @@ impl BrokerHandler {
             AccessLevel::Ask if scoped => (
                 self.state.op_grant_take(
                     &vault_id,
+                    &agent_prefix,
                     &conn,
                     &method,
                     &dest_host,
@@ -533,7 +543,10 @@ impl BrokerHandler {
                 ),
                 None,
             ),
-            AccessLevel::Ask => (self.state.cache_lookup_grant(&vault_id, &conn), None),
+            AccessLevel::Ask => (
+                self.state.cache_lookup_grant(&vault_id, &conn, &agent_prefix),
+                None,
+            ),
             _ => (
                 self.state.cache_lookup(&vault_id, &conn),
                 self.state.cache_lookup_secrets(&vault_id, &conn),
@@ -823,6 +836,14 @@ impl BrokerHandler {
             "path": path,
             "authorize_only": true,
         });
+        // Op-agent binding (team §C1): the requesting agent's key prefix is
+        // signed into β via the scope, so the human's approval covers "for
+        // THIS agent" — swapping agents invalidates the grant. The grant page
+        // can render it as the requester line. Enforcement reads the record's
+        // copy (ApprovalRecord.agent_prefix), not this.
+        if let Some(prefix) = self.key.as_deref().map(crate::audit::agent_key_prefix) {
+            scope["agent"] = serde_json::Value::String(prefix);
+        }
         // Phase 2: fold the bound `[requests]` scope-field VALUES and the consent
         // template into the op scope. They are signed into β (the user's passkey
         // authorizes exactly the fields shown) and re-derived at approve to build
@@ -937,11 +958,15 @@ impl BrokerHandler {
     ) -> RequestOrResponse {
         use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
         let now = now_secs();
-        let scope = json!({
+        let mut scope = json!({
             "connection_id": conn,
             "host": host,
             "etld1": etld1(host),
         });
+        // Same signed agent stamp as the credential-use op above.
+        if let Some(prefix) = self.key.as_deref().map(crate::audit::agent_key_prefix) {
+            scope["agent"] = serde_json::Value::String(prefix);
+        }
         let op = Operation {
             act: Act {
                 kind: ActType::Custom("widen-host".into()),
