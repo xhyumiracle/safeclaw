@@ -374,6 +374,37 @@ impl BrokerHandler {
             }
         }
 
+        // ── shared-vault offline lease (team §7.5) ───────────────────────────
+        // A SHARED vault serves offline only inside the lease window (default
+        // 24h; `SAFECLAW_TEAM_LEASE_SECS` overrides — 1800 in team e2e). The
+        // clock starts at unlock and refreshes on every successful cloud
+        // contact, so a parked daemon (revoked device/member) or a cut cable
+        // both converge to a clean stop instead of serving stale team
+        // credentials forever. Personal vaults are untouched.
+        if self.state.vault_is_shared(&vault_id) {
+            static LEASE_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let lease = *LEASE_SECS.get_or_init(|| {
+                std::env::var("SAFECLAW_TEAM_LEASE_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(86_400)
+            });
+            if let Some(age) = self.state.cloud_contact_age_secs(&vault_id) {
+                if age > lease {
+                    return err_response(
+                        ScCode::TeamLeaseExpired,
+                        &format!(
+                            "this shared vault has been offline for {}h (lease {}h); \
+                             reconnect to the cloud to resume",
+                            age / 3600,
+                            lease / 3600
+                        ),
+                    )
+                    .into();
+                }
+            }
+        }
+
         // ── resolve the connection ───────────────────────────────────────────
         // Resolve the connection record. An explicit aux.connections entry wins;
         // otherwise, if <conn> names a known service (compiled or custom) we

@@ -216,17 +216,19 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
         if let Some(dk2) = device_key() {
             match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2).await {
                 Ok(n) if n > 0 => {
+                    state.record_cloud_contact(vault_id);
                     tracing::info!(vault = %vault_id, adopted = n, "keyset pull: adopted rows")
                 }
-                Ok(_) => {}
+                Ok(_) => state.record_cloud_contact(vault_id),
                 Err(e) => tracing::debug!(vault = %vault_id, "keyset pull failed: {}", e),
             }
             match pull_items(&state.config.state_dir, cloud2, vault_id, &dk2).await {
                 Ok(n) if n > 0 => {
+                    state.record_cloud_contact(vault_id);
                     tracing::info!(vault = %vault_id, adopted = n, "per-item pull: adopted rows");
                     refresh_after_item_pull(state, vault_id);
                 }
-                Ok(_) => {}
+                Ok(_) => state.record_cloud_contact(vault_id),
                 Err(e) => tracing::debug!(vault = %vault_id, "per-item pull failed: {}", e),
             }
         }

@@ -248,6 +248,9 @@ pub struct SecretsCache {
     /// re-key). Snapshot of `view.aux.agents` at unlock/refresh. Absent entry
     /// = `AgentMask::All` (personal parity).
     pub agents: std::collections::BTreeMap<String, crate::storage::plaintext::AgentEntry>,
+    /// Team membership snapshot (`view.aux.members`): `user_id → role`.
+    /// Non-empty = shared vault (drives the offline lease + team surfaces).
+    pub members: std::collections::BTreeMap<String, crate::storage::plaintext::MemberRole>,
     /// Custom (per-vault `aux.services`) service definitions, validated at
     /// unlock. Wiped on lock (Default drop). A custom service folds into
     /// discovery like a compiled one and never shadows a built-in id.
@@ -289,6 +292,12 @@ pub struct PendingLoopback {
 pub struct AppState {
     pub config: Config,
     pub vaults: VaultDir,
+    /// Last successful cloud contact per vault (unlock initialises, sync
+    /// successes refresh). Drives the shared-vault offline lease (team §7.5):
+    /// a daemon cut off from the cloud — network loss OR revoked/offboarded
+    /// credentials parking its sync — keeps serving a SHARED vault only for
+    /// the lease window.
+    pub cloud_contact: Mutex<HashMap<String, std::time::Instant>>,
     pub challenges: Mutex<ChallengeStore>,
     pub approvals: Mutex<ApprovalStore>,
     pub services: ServiceRegistry,
@@ -418,6 +427,7 @@ impl AppState {
         Self {
             config,
             vaults,
+            cloud_contact: Mutex::new(HashMap::new()),
             challenges: Mutex::new(ChallengeStore::new()),
             approvals: Mutex::new(ApprovalStore::new()),
             services: ServiceRegistry::load(),
@@ -646,6 +656,8 @@ impl AppState {
         cache: SecretsCache,
         state_key: zeroize::Zeroizing<Vec<u8>>,
     ) {
+        // Team lease clock starts at unlock (a human was just present).
+        self.record_cloud_contact(&vault_id);
         let unlocked_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1233,6 +1245,35 @@ impl AppState {
                 ),
                 now + ttl_seconds,
             );
+        }
+    }
+
+    /// Record a successful cloud contact for this vault (sync pull/push, or
+    /// unlock — a human is present). Feeds the shared-vault offline lease.
+    pub fn record_cloud_contact(&self, vault_id: &str) {
+        self.cloud_contact
+            .lock()
+            .unwrap()
+            .insert(vault_id.to_string(), std::time::Instant::now());
+    }
+
+    /// Seconds since the last cloud contact, `None` if never recorded (treated
+    /// as fresh by callers — the entry appears at unlock).
+    pub fn cloud_contact_age_secs(&self, vault_id: &str) -> Option<u64> {
+        self.cloud_contact
+            .lock()
+            .unwrap()
+            .get(vault_id)
+            .map(|t| t.elapsed().as_secs())
+    }
+
+    /// Is this vault SHARED (has a team membership record)? Snapshot from the
+    /// unlocked cache; a locked/unknown vault answers false.
+    pub fn vault_is_shared(&self, vault_id: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => !cache.members.is_empty(),
+            _ => false,
         }
     }
 

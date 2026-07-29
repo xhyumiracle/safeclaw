@@ -37,6 +37,10 @@ pub enum ScCode {
     /// (team §8.1: visible-but-locked — the connection exists, this agent
     /// is not enabled for it; the responsible member can enable it).
     MaskNotEnabled,
+    /// Shared-vault offline lease expired — the daemon has been cut off from
+    /// the cloud (network, or revoked membership parking its sync) beyond the
+    /// lease window; team credentials stop serving until contact resumes.
+    TeamLeaseExpired,
     HostNotAnchored,
     MultiConnection,
     NoVault,
@@ -131,6 +135,13 @@ impl ScCode {
                 "mask_not_enabled",
                 "Connection not enabled for this agent",
                 "none",
+                "policy",
+            ),
+            TeamLeaseExpired => (
+                403,
+                "team_lease_expired",
+                "Shared-vault offline lease expired",
+                "retry",
                 "policy",
             ),
             HostNotAnchored => (
