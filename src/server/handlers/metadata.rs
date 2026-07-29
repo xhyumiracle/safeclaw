@@ -397,13 +397,52 @@ pub fn open_view_for_grant_keep_key(
     vault: Option<&crate::storage::SealedVault>,
 ) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
     if let Ok(path) = state.vaults.per_item_path(vault_id) {
-        if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
-            return decrypt_vault_view_peritem_keep_key(
+        if let Ok(Some(mut pv)) = crate::storage::sealed_vault::read_per_item(&path) {
+            let (view, k) = decrypt_vault_view_peritem_keep_key(
                 wrapping_key,
                 credential_id_bytes,
                 &pv,
                 vault_id,
-            );
+            )?;
+            // One-shot addressing migration (team §8.3 "升级即切换"): first
+            // unlock of a legacy-format vault by this binary rewrites the five
+            // config singletons at their unified addresses and tombstones the
+            // legacy rows. Rollback insurance = a CIPHERTEXT copy of the
+            // pre-migration file (never plaintext to disk). Version-bumped
+            // rows ride the normal sync push. Failures leave the vault
+            // readable via the fold's dual-read — never block an unlock.
+            if view.legacy_addressing {
+                let backup = path.with_extension("pre-migration.json");
+                if !backup.exists() {
+                    if let Err(e) = std::fs::copy(&path, &backup) {
+                        tracing::warn!(vault = %vault_id, "migration backup failed, skipping migration this unlock: {}", e);
+                        return Ok((view, k));
+                    }
+                }
+                match pv.migrate_addressing::<StdPrimitives>(&k, vault_id) {
+                    Ok(changed) if !changed.is_empty() => {
+                        match crate::storage::sealed_vault::write_per_item_atomic(&path, &pv) {
+                            Ok(()) => {
+                                tracing::info!(vault = %vault_id, items = changed.len(),
+                                    "unified-addressing migration complete (legacy rows tombstoned)");
+                                // Re-fold so the session view reflects the
+                                // migrated state, and let the regular sync
+                                // loop push the bumped rows.
+                                let fresh = pv.fold_view::<StdPrimitives>(&k, vault_id)?;
+                                return Ok((fresh, k));
+                            }
+                            Err(e) => {
+                                tracing::warn!(vault = %vault_id, "migration write failed (will retry next unlock): {}", e);
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(vault = %vault_id, "addressing migration failed (dual-read continues): {}", e);
+                    }
+                }
+            }
+            return Ok((view, k));
         }
     }
     // Whole-blob fallback — see open_view_for_grant.
