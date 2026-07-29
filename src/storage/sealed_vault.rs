@@ -913,6 +913,28 @@ impl PerItemVault {
                             "policy" => legacy_policy = Some(payload.body),
                             "audit_retention_days" => legacy_retention = Some(payload.body),
                             "services" => legacy_services = Some(payload.body),
+                            // The console still seals aux subtrees as whole
+                            // blobs (legacy addressing). `agents`/`members`
+                            // arrive that way until the frontend seal layer
+                            // moves to per-item; parse them here (a blob wins
+                            // over nothing, and the migration splits `agents`
+                            // into per-agent items + promotes `members` to its
+                            // singleton). Only applied if no new-address item
+                            // set the same field.
+                            "agents" => {
+                                if aux.agents.is_empty() {
+                                    if let Ok(m) = serde_json::from_value(payload.body) {
+                                        aux.agents = m;
+                                    }
+                                }
+                            }
+                            "members" => {
+                                if !seen_new.members && aux.members.is_empty() {
+                                    if let Ok(m) = serde_json::from_value(payload.body) {
+                                        aux.members = m;
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
