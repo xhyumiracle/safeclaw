@@ -41,6 +41,8 @@ For users and service authors, in [`reference/`](reference/):
 [services.md](reference/services.md) (writing a `service.toml`),
 [policy.md](reference/policy.md) (per-action decisions),
 [diagnostics.md](reference/diagnostics.md) (every error code, with fixes),
+[passkey-support.md](reference/passkey-support.md) (which devices can encrypt a vault),
+[platform-support.md](reference/platform-support.md) (which OSes run the `sc` binary),
 [consent-templates.md](reference/consent-templates.md) (approval-copy grammar).
 
 ## Design docs

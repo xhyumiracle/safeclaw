@@ -10,7 +10,8 @@ curl -fsSL https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/install.
 ```
 
 Puts the `sc` binary in `~/.local/bin` after verifying its `SHA256SUMS`. No
-sudo, no system changes. `sc --version` to confirm.
+sudo, no system changes. `sc --version` to confirm. Supported platforms and how
+to verify the download: [Platform support](reference/platform-support.md).
 
 ## 2. Create your vault
 
