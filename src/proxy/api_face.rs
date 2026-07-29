@@ -96,6 +96,51 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
             Err(e) => app_err(e),
         };
     }
+    // GET /vaults — the agent's vault index (team §A/§7.7): every vault this
+    // daemon holds, with lock state and a per-vault connection summary the
+    // caller's reach mask has already been applied to. EXISTS ONLY ON THIS
+    // AUTHED AGENT FACE — the control plane deliberately never exposes a
+    // vault index (see registry.rs's no-vault_id note). The vid in each entry
+    // is the address the agent puts on the wire (proxy auth / URL); item
+    // names stay bare and resolve inside the chosen vault.
+    if path == "/vaults" {
+        if let Err(r) = require_key(state, req.headers()).await {
+            return r;
+        }
+        let agent = bearer_token(req.headers())
+            .as_deref()
+            .map(crate::audit::agent_key_prefix)
+            .unwrap_or_default();
+        let mut vaults: Vec<Value> = Vec::new();
+        let ids = state.vaults.list().unwrap_or_default();
+        for vid in ids {
+            let locked = state.is_vault_locked(&vid);
+            let mut conns: Vec<Value> = Vec::new();
+            if !locked {
+                let whitelist = state.agent_mask_whitelist(&vid, &agent);
+                let allow: Option<std::collections::HashSet<String>> =
+                    whitelist.map(|w| w.into_iter().collect());
+                let snapshot = state.connections_snapshot(&vid);
+                for (id, conn) in snapshot {
+                    let masked = allow.as_ref().map(|a| !a.contains(&id)).unwrap_or(false);
+                    let mut row = json!({ "id": id, "service": conn.service });
+                    if masked {
+                        row["locked"] = Value::Bool(true);
+                    }
+                    conns.push(row);
+                }
+                conns.sort_by(|a, b| {
+                    a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or(""))
+                });
+            }
+            vaults.push(json!({
+                "vid": vid,
+                "locked": locked,
+                "connections": conns,
+            }));
+        }
+        return json(StatusCode::OK, &json!({ "vaults": vaults }));
+    }
     if let Some(vid) = path
         .strip_prefix("/v/")
         .and_then(|r| r.strip_suffix("/registry"))
@@ -106,7 +151,16 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
         let q = crate::server::handlers::registry::RegistryQuery::from_query_str(
             req.uri().query().unwrap_or(""),
         );
-        return match crate::server::handlers::registry::vault_registry_value(state, vid, &q) {
+        // Agent surface: annotate reach-masked connections as locked stubs.
+        let agent = bearer_token(req.headers())
+            .as_deref()
+            .map(crate::audit::agent_key_prefix);
+        return match crate::server::handlers::registry::vault_registry_value(
+            state,
+            vid,
+            &q,
+            agent.as_deref(),
+        ) {
             Ok(v) => json(StatusCode::OK, &v),
             Err(e) => app_err(e),
         };

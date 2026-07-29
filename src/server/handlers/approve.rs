@@ -2027,6 +2027,7 @@ pub(crate) fn bootstrap_cache_from_view(
         .iter()
         .map(|(c, conn)| (c.clone(), conn.clone()))
         .collect();
+    cache.agents = view.aux.agents.clone();
     // Snapshot native-store item names (names only, never values). Surface
     // for GET /v/{vid}/secret-keys so the frontend can compute "which
     // services are reachable" without re-walking the kv map.

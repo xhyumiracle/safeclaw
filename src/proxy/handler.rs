@@ -351,6 +351,29 @@ impl BrokerHandler {
             return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG).into();
         }
 
+        // ── reach mask (team §8.1) ───────────────────────────────────────────
+        // Visible-but-locked semantics: a masked-off connection is announced as
+        // `locked` in the registry, and a named use gets THIS explicit,
+        // actionable refusal — never a silent 404, never a policy prompt.
+        {
+            let mask_agent = self
+                .key
+                .as_deref()
+                .map(crate::audit::agent_key_prefix)
+                .unwrap_or_default();
+            if self.state.agent_mask_allows(&vault_id, &mask_agent, &conn) == Some(false) {
+                return err_response(
+                    ScCode::MaskNotEnabled,
+                    &format!(
+                        "connection '{}' exists in this vault but is not enabled for this agent; \
+                         the responsible member can enable it in the console (Agents)",
+                        conn
+                    ),
+                )
+                .into();
+            }
+        }
+
         // ── resolve the connection ───────────────────────────────────────────
         // Resolve the connection record. An explicit aux.connections entry wins;
         // otherwise, if <conn> names a known service (compiled or custom) we

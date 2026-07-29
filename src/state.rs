@@ -242,6 +242,12 @@ pub struct SecretsCache {
     /// per-connection (`policy.connections.<id>`), while the built-in rules it
     /// merges come from the shared service definition.
     pub connections: HashMap<String, crate::storage::plaintext::Connection>,
+    /// Per-agent reach masks (team §8.1), keyed by the agent api-key PREFIX —
+    /// the identity handle the daemon can derive from a presented Bearer (the
+    /// pubkey-derived agent id takes this slot when AIK ships; few rows, cheap
+    /// re-key). Snapshot of `view.aux.agents` at unlock/refresh. Absent entry
+    /// = `AgentMask::All` (personal parity).
+    pub agents: std::collections::BTreeMap<String, crate::storage::plaintext::AgentEntry>,
     /// Custom (per-vault `aux.services`) service definitions, validated at
     /// unlock. Wiped on lock (Default drop). A custom service folds into
     /// discovery like a compiled one and never shadows a built-in id.
@@ -1230,6 +1236,47 @@ impl AppState {
         }
     }
 
+    /// Does this vault's reach mask let `agent_prefix` use `connection_id`?
+    /// (team §8.1 — ONE pipeline: the proxy deny, the registry annotation and
+    /// GET /vaults all read THIS.) Locked vault → `None` (caller renders its
+    /// usual locked answer). An agent with no mask entry is unrestricted.
+    pub fn agent_mask_allows(
+        &self,
+        vault_id: &str,
+        agent_prefix: &str,
+        connection_id: &str,
+    ) -> Option<bool> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => Some(
+                cache
+                    .agents
+                    .get(agent_prefix)
+                    .map(|e| e.connections.allows(connection_id))
+                    .unwrap_or(true),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The full mask verdict set for one agent: `None` = unrestricted,
+    /// `Some(set)` = fail-closed whitelist. Used by the registry/vaults
+    /// surfaces to annotate rows without N lock round-trips.
+    pub fn agent_mask_whitelist(
+        &self,
+        vault_id: &str,
+        agent_prefix: &str,
+    ) -> Option<Vec<String>> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache
+                .agents
+                .get(agent_prefix)
+                .and_then(|e| e.connections.selected().map(|s| s.to_vec())),
+            _ => None,
+        }
+    }
+
     /// The approval-hold window (seconds): how long a pending `ask` op waits
     /// for the passkey gesture before it expires. This is the user's
     /// `aux.policy.timeout` ("Approval timeout" in the console), or a 30-minute
@@ -1254,6 +1301,23 @@ impl AppState {
 
     /// Clone a connection record out of the unlocked routing snapshot. `None`
     /// when the vault is Locked or the connection id is unknown.
+    /// All connections of one vault (id → record), empty when locked. Used by
+    /// the agent-face `/vaults` index.
+    pub fn connections_snapshot(
+        &self,
+        vault_id: &str,
+    ) -> Vec<(String, crate::storage::plaintext::Connection)> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache
+                .connections
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn connection_snapshot(
         &self,
         vault_id: &str,

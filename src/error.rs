@@ -33,6 +33,10 @@ pub enum ScCode {
     EgressUnreachable,
     ExposesUnsupported,
     HostForbidden,
+    /// A team reach mask excludes this connection for the calling agent
+    /// (team §8.1: visible-but-locked — the connection exists, this agent
+    /// is not enabled for it; the responsible member can enable it).
+    MaskNotEnabled,
     HostNotAnchored,
     MultiConnection,
     NoVault,
@@ -122,6 +126,13 @@ impl ScCode {
                 "request",
             ),
             HostForbidden => (403, "host_forbidden", "Host forbidden", "none", "policy"),
+            MaskNotEnabled => (
+                403,
+                "mask_not_enabled",
+                "Connection not enabled for this agent",
+                "none",
+                "policy",
+            ),
             HostNotAnchored => (
                 403,
                 "host_not_anchored",
