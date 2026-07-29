@@ -2499,6 +2499,7 @@ mod tests {
         let view = VaultPlaintextView {
             aux,
             native_secrets,
+            legacy_addressing: false,
         };
 
         let cache = bootstrap_cache_from_view(&view, &state);

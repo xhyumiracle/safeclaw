@@ -579,58 +579,66 @@ impl PerItemVault {
             let payload = ItemPayload::live(ItemNs::Connecting, conn_id.clone(), body);
             self.seal_and_upsert::<S>(k, vault_id, ItemNs::Connecting, conn_id, 1, &payload)?;
         }
-        // aux subtrees → one `aux` item each (only the modeled names).
-        let stores = serde_json::to_value(&view.aux.stores).map_err(AppError::from)?;
-        self.seal_and_upsert::<S>(
-            k,
-            vault_id,
-            ItemNs::Aux,
-            "stores",
-            1,
-            &ItemPayload::live(ItemNs::Aux, "stores", stores),
-        )?;
-        let store_order = serde_json::to_value(&view.aux.store_order).map_err(AppError::from)?;
-        self.seal_and_upsert::<S>(
-            k,
-            vault_id,
-            ItemNs::Aux,
-            "store_order",
-            1,
-            &ItemPayload::live(ItemNs::Aux, "store_order", store_order),
-        )?;
-        if let Some(policy) = &view.aux.policy {
-            let body = serde_json::to_value(policy).map_err(AppError::from)?;
-            self.seal_and_upsert::<S>(
-                k,
-                vault_id,
-                ItemNs::Aux,
-                "policy",
-                1,
-                &ItemPayload::live(ItemNs::Aux, "policy", body),
-            )?;
+        // per-agent reach masks → one `agent` item each (team §8.1).
+        for (agent_id, entry) in &view.aux.agents {
+            let body = serde_json::to_value(entry).map_err(AppError::from)?;
+            let payload = ItemPayload::live(ItemNs::Agent, agent_id.clone(), body);
+            self.seal_and_upsert::<S>(k, vault_id, ItemNs::Agent, agent_id, 1, &payload)?;
         }
-        if let Some(days) = view.aux.audit_retention_days {
+        // config singletons → one item per ns, empty name (unified addressing,
+        // team §8.2: `ns` = the VaultAux field, singletons use the empty name;
+        // the legacy `aux:<name>` spelling is read-compat only).
+        for (ns, body) in Self::singleton_bodies(&view.aux)? {
             self.seal_and_upsert::<S>(
                 k,
                 vault_id,
-                ItemNs::Aux,
-                "audit_retention_days",
+                ns,
+                "",
                 1,
-                &ItemPayload::live(ItemNs::Aux, "audit_retention_days", serde_json::json!(days)),
-            )?;
-        }
-        if !view.aux.services.is_empty() {
-            let body = serde_json::to_value(&view.aux.services).map_err(AppError::from)?;
-            self.seal_and_upsert::<S>(
-                k,
-                vault_id,
-                ItemNs::Aux,
-                "services",
-                1,
-                &ItemPayload::live(ItemNs::Aux, "services", body),
+                &ItemPayload::live(ns, "", body),
             )?;
         }
         Ok(())
+    }
+
+    /// The config singletons a view wants materialised, as `(ns, body)` pairs
+    /// under the unified addressing (team §8.2). Shared by seed + reconcile so
+    /// the two write paths can never disagree on the mapping. Default/empty
+    /// subtrees are skipped (same rule as before: no tombstone-like noise).
+    fn singleton_bodies(
+        aux: &crate::storage::plaintext::VaultAux,
+    ) -> Result<Vec<(ItemNs, serde_json::Value)>> {
+        let mut out = Vec::new();
+        out.push((
+            ItemNs::Stores,
+            serde_json::to_value(&aux.stores).map_err(AppError::from)?,
+        ));
+        out.push((
+            ItemNs::StoreOrder,
+            serde_json::to_value(&aux.store_order).map_err(AppError::from)?,
+        ));
+        if let Some(policy) = &aux.policy {
+            out.push((
+                ItemNs::Policy,
+                serde_json::to_value(policy).map_err(AppError::from)?,
+            ));
+        }
+        if let Some(days) = aux.audit_retention_days {
+            out.push((ItemNs::AuditRetentionDays, serde_json::json!(days)));
+        }
+        if !aux.services.is_empty() {
+            out.push((
+                ItemNs::Services,
+                serde_json::to_value(&aux.services).map_err(AppError::from)?,
+            ));
+        }
+        if !aux.members.is_empty() {
+            out.push((
+                ItemNs::Members,
+                serde_json::to_value(&aux.members).map_err(AppError::from)?,
+            ));
+        }
+        Ok(out)
     }
 
     /// Reconcile the item rows toward a freshly-decrypted [`VaultPlaintextView`]
@@ -676,35 +684,15 @@ impl PerItemVault {
                 serde_json::to_value(c).map_err(AppError::from)?,
             );
         }
-        for (name, body) in [
-            (
-                "stores",
-                serde_json::to_value(&view.aux.stores).map_err(AppError::from)?,
-            ),
-            (
-                "store_order",
-                serde_json::to_value(&view.aux.store_order).map_err(AppError::from)?,
-            ),
-        ] {
-            desired.insert((ItemNs::Aux, name.to_string()), body);
-        }
-        if let Some(policy) = &view.aux.policy {
+        for (agent_id, entry) in &view.aux.agents {
             desired.insert(
-                (ItemNs::Aux, "policy".to_string()),
-                serde_json::to_value(policy).map_err(AppError::from)?,
+                (ItemNs::Agent, agent_id.clone()),
+                serde_json::to_value(entry).map_err(AppError::from)?,
             );
         }
-        if let Some(days) = view.aux.audit_retention_days {
-            desired.insert(
-                (ItemNs::Aux, "audit_retention_days".to_string()),
-                serde_json::json!(days),
-            );
-        }
-        if !view.aux.services.is_empty() {
-            desired.insert(
-                (ItemNs::Aux, "services".to_string()),
-                serde_json::to_value(&view.aux.services).map_err(AppError::from)?,
-            );
+        // Config singletons at their unified addresses (empty name).
+        for (ns, body) in Self::singleton_bodies(&view.aux)? {
+            desired.insert((ns, String::new()), body);
         }
 
         // Upsert every desired item whose sealed body differs from what we hold.
@@ -763,6 +751,20 @@ impl PerItemVault {
                 changed.push(iid);
             }
         }
+        // A removed agent's mask row is tombstoned like a dropped connection
+        // (offboarding sweeps a member's agents through here, team §5.20).
+        for id in mine.aux.agents.keys() {
+            if !desired.contains_key(&(ItemNs::Agent, id.clone())) {
+                let (iid, _v) = self.seal_and_bump::<S>(
+                    k,
+                    vault_id,
+                    ItemNs::Agent,
+                    id,
+                    &ItemPayload::tombstone(ItemNs::Agent, id.clone()),
+                )?;
+                changed.push(iid);
+            }
+        }
 
         Ok(changed)
     }
@@ -787,10 +789,34 @@ impl PerItemVault {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
-        // Start from the fresh-vault defaults; aux items OVERRIDE their subtree,
-        // secret/connection/connecting items fill their maps.
+        // Start from the fresh-vault defaults; config items OVERRIDE their
+        // subtree, secret/connection/connecting/agent items fill their maps.
+        //
+        // Unified addressing (team §8.2): config singletons live at their own
+        // ns with the empty name. Legacy `aux:<name>` items are still parsed
+        // (read-compat for not-yet-migrated vaults) but NEW addresses win when
+        // both spellings exist mid-migration — precedence is tracked with
+        // `seen_new`, not item order (the id map iterates in hash order).
         let mut aux = VaultAux::initial();
         let mut native_secrets: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        #[derive(Default)]
+        struct SeenNew {
+            stores: bool,
+            store_order: bool,
+            policy: bool,
+            retention: bool,
+            services: bool,
+            members: bool,
+        }
+        let mut seen_new = SeenNew::default();
+        // Legacy values parked until the loop ends (applied only where no new-
+        // address item set the field).
+        let mut legacy_stores: Option<serde_json::Value> = None;
+        let mut legacy_store_order: Option<serde_json::Value> = None;
+        let mut legacy_policy: Option<serde_json::Value> = None;
+        let mut legacy_retention: Option<serde_json::Value> = None;
+        let mut legacy_services: Option<serde_json::Value> = None;
+        let mut legacy_addressing = false;
 
         for (id_b64, stored) in &self.items {
             // Fold each item independently: a single unreadable/unparseable item
@@ -832,42 +858,61 @@ impl PerItemVault {
                         })?;
                         aux.connecting.insert(name, c);
                     }
+                    ItemNs::Agent => {
+                        let entry = serde_json::from_value(payload.body).map_err(|e| {
+                            AppError::Internal(format!("agent '{}' parse: {}", name, e))
+                        })?;
+                        aux.agents.insert(name, entry);
+                    }
+                    ItemNs::Policy => {
+                        aux.policy = Some(serde_json::from_value(payload.body).map_err(|e| {
+                            AppError::Internal(format!("policy parse: {}", e))
+                        })?);
+                        seen_new.policy = true;
+                    }
+                    ItemNs::Stores => {
+                        aux.stores = serde_json::from_value(payload.body).map_err(|e| {
+                            AppError::Internal(format!("stores parse: {}", e))
+                        })?;
+                        seen_new.stores = true;
+                    }
+                    ItemNs::StoreOrder => {
+                        aux.store_order = serde_json::from_value(payload.body).map_err(|e| {
+                            AppError::Internal(format!("store_order parse: {}", e))
+                        })?;
+                        seen_new.store_order = true;
+                    }
+                    ItemNs::AuditRetentionDays => {
+                        aux.audit_retention_days = serde_json::from_value(payload.body)
+                            .map_err(|e| {
+                                AppError::Internal(format!("audit_retention_days parse: {}", e))
+                            })?;
+                        seen_new.retention = true;
+                    }
+                    ItemNs::Services => {
+                        aux.services = serde_json::from_value(payload.body).map_err(|e| {
+                            AppError::Internal(format!("services parse: {}", e))
+                        })?;
+                        seen_new.services = true;
+                    }
+                    ItemNs::Members => {
+                        aux.members = serde_json::from_value(payload.body).map_err(|e| {
+                            AppError::Internal(format!("members parse: {}", e))
+                        })?;
+                        seen_new.members = true;
+                    }
                     ItemNs::Aux => {
-                        // One aux item per subtree (contract §2). Unknown names are
-                        // ignored (forward-compat with aux subtrees we don't model).
+                        // LEGACY addressing (pre-unification). Park the value;
+                        // applied after the loop only if no new-address item
+                        // set the same field. Unknown names ignored (forward-
+                        // compat, unchanged).
+                        legacy_addressing = true;
                         match name.as_str() {
-                            "stores" => {
-                                aux.stores = serde_json::from_value(payload.body).map_err(|e| {
-                                    AppError::Internal(format!("aux.stores parse: {}", e))
-                                })?;
-                            }
-                            "store_order" => {
-                                aux.store_order =
-                                    serde_json::from_value(payload.body).map_err(|e| {
-                                        AppError::Internal(format!("aux.store_order parse: {}", e))
-                                    })?;
-                            }
-                            "policy" => {
-                                aux.policy =
-                                    Some(serde_json::from_value(payload.body).map_err(|e| {
-                                        AppError::Internal(format!("aux.policy parse: {}", e))
-                                    })?);
-                            }
-                            "audit_retention_days" => {
-                                aux.audit_retention_days = serde_json::from_value(payload.body)
-                                    .map_err(|e| {
-                                        AppError::Internal(format!(
-                                            "aux.audit_retention_days parse: {}",
-                                            e
-                                        ))
-                                    })?;
-                            }
-                            "services" => {
-                                aux.services =
-                                    serde_json::from_value(payload.body).map_err(|e| {
-                                        AppError::Internal(format!("aux.services parse: {}", e))
-                                    })?;
-                            }
+                            "stores" => legacy_stores = Some(payload.body),
+                            "store_order" => legacy_store_order = Some(payload.body),
+                            "policy" => legacy_policy = Some(payload.body),
+                            "audit_retention_days" => legacy_retention = Some(payload.body),
+                            "services" => legacy_services = Some(payload.body),
                             _ => {}
                         }
                     }
@@ -879,10 +924,120 @@ impl PerItemVault {
             }
         }
 
+        // Apply parked legacy values where no new-address item set the field.
+        if !seen_new.stores {
+            if let Some(v) = legacy_stores {
+                aux.stores = serde_json::from_value(v)
+                    .map_err(|e| AppError::Internal(format!("aux.stores parse: {}", e)))?;
+            }
+        }
+        if !seen_new.store_order {
+            if let Some(v) = legacy_store_order {
+                aux.store_order = serde_json::from_value(v)
+                    .map_err(|e| AppError::Internal(format!("aux.store_order parse: {}", e)))?;
+            }
+        }
+        if !seen_new.policy {
+            if let Some(v) = legacy_policy {
+                aux.policy = Some(
+                    serde_json::from_value(v)
+                        .map_err(|e| AppError::Internal(format!("aux.policy parse: {}", e)))?,
+                );
+            }
+        }
+        if !seen_new.retention {
+            if let Some(v) = legacy_retention {
+                aux.audit_retention_days = serde_json::from_value(v).map_err(|e| {
+                    AppError::Internal(format!("aux.audit_retention_days parse: {}", e))
+                })?;
+            }
+        }
+        if !seen_new.services {
+            if let Some(v) = legacy_services {
+                aux.services = serde_json::from_value(v)
+                    .map_err(|e| AppError::Internal(format!("aux.services parse: {}", e)))?;
+            }
+        }
+        let _ = seen_new.members; // no legacy spelling existed for members
+
         Ok(VaultPlaintextView {
             aux,
             native_secrets,
+            legacy_addressing,
         })
+    }
+
+    /// One-shot migration to the unified addressing (team §8.3 "升级即切换").
+    /// If the vault still holds live legacy `aux:*` items: fold, re-write every
+    /// config singleton at its new address, and tombstone the legacy rows —
+    /// all version-bumped so sync pushes them as normal item changes. Idempotent
+    /// (second call folds to `legacy_addressing == false` and does nothing).
+    /// Returns the changed item ids (empty = already migrated). The caller is
+    /// responsible for (a) writing a plaintext snapshot BEFORE calling this and
+    /// (b) marking the vault `format=2` server-side AFTER the push succeeds.
+    pub fn migrate_addressing<S: PrimitiveSuite>(
+        &mut self,
+        k: &[u8],
+        vault_id: &str,
+    ) -> Result<Vec<String>> {
+        let view = self.fold_view::<S>(k, vault_id)?;
+        if !view.legacy_addressing {
+            return Ok(Vec::new());
+        }
+        // Reconcile writes every config singleton at its NEW address (the
+        // mapping lives in `singleton_bodies`, shared with seed).
+        let mut changed = self.reconcile_from_view::<S>(k, vault_id, &view)?;
+        // Tombstone every live legacy aux row (known + unknown names alike —
+        // the namespace is retired wholesale).
+        let legacy: Vec<String> = self
+            .live_names_in_ns::<S>(k, vault_id, ItemNs::Aux)?
+            .into_iter()
+            .collect();
+        for name in legacy {
+            let (id, _v) = self.seal_and_bump::<S>(
+                k,
+                vault_id,
+                ItemNs::Aux,
+                &name,
+                &ItemPayload::tombstone(ItemNs::Aux, name.clone()),
+            )?;
+            changed.push(id);
+        }
+        Ok(changed)
+    }
+
+    /// Names of live (non-tombstone) items in one namespace. Unreadable items
+    /// are skipped with a warning (same fault isolation as the fold).
+    fn live_names_in_ns<S: PrimitiveSuite>(
+        &self,
+        k: &[u8],
+        vault_id: &str,
+        want: ItemNs,
+    ) -> Result<Vec<String>> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let mut out = Vec::new();
+        for (id_b64, stored) in &self.items {
+            let one: crate::error::Result<()> = (|| {
+                let raw_vec = URL_SAFE_NO_PAD
+                    .decode(id_b64.as_bytes())
+                    .map_err(|e| AppError::Internal(format!("item id decode: {}", e)))?;
+                let raw: [u8; 32] = raw_vec
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| AppError::Internal("item id is not 32 bytes".into()))?;
+                let ctx = ItemCtx::new(vault_id, raw, stored.version);
+                let payload = unseal_item::<S>(k, &ctx, &stored.ct)?;
+                if payload.ns == want && !payload.is_tombstone() {
+                    out.push(payload.name);
+                }
+                Ok(())
+            })();
+            if let Err(e) = one {
+                tracing::warn!(item = %id_b64, "live_names_in_ns: skipping unreadable item: {}", e);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1148,6 +1303,119 @@ mod tests {
         let loaded = read_per_item(&path).unwrap().unwrap();
         assert!(!loaded.get_item(&live).unwrap().tombstone);
         assert!(loaded.get_item(&dead).unwrap().tombstone);
+    }
+
+    #[test]
+    fn agent_mask_serde_all_and_selected() {
+        use crate::storage::plaintext::{AgentEntry, AgentMask};
+        // "all" round-trips as the bare string; a list stays a list.
+        let all: AgentEntry = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(all.connections.allows("anything"));
+        assert_eq!(
+            serde_json::to_value(&AgentEntry::default()).unwrap(),
+            serde_json::json!({ "connections": "all" })
+        );
+        let sel: AgentEntry =
+            serde_json::from_value(serde_json::json!({ "connections": ["github-work"] })).unwrap();
+        assert!(sel.connections.allows("github-work"));
+        assert!(!sel.connections.allows("stripe-live"), "fail-closed");
+        let back = serde_json::to_value(&sel).unwrap();
+        assert_eq!(back, serde_json::json!({ "connections": ["github-work"] }));
+    }
+
+    #[test]
+    fn unified_addressing_fold_new_wins_over_legacy_and_migration_is_idempotent() {
+        use sudp::primitives::StdPrimitives;
+        let k = [0x55u8; 32];
+        let vid = "vault-unified";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+
+        // Legacy spellings: aux:policy (timeout 111) + aux:store_order.
+        pv.seal_and_upsert::<StdPrimitives>(
+            &k,
+            vid,
+            ItemNs::Aux,
+            "policy",
+            1,
+            &ItemPayload::live(ItemNs::Aux, "policy", serde_json::json!({ "timeout": 111 })),
+        )
+        .unwrap();
+        pv.seal_and_upsert::<StdPrimitives>(
+            &k,
+            vid,
+            ItemNs::Aux,
+            "store_order",
+            1,
+            &ItemPayload::live(
+                ItemNs::Aux,
+                "store_order",
+                serde_json::json!(["native-secrets", "legacy-store"]),
+            ),
+        )
+        .unwrap();
+        // NEW spelling for policy only (timeout 222) — must beat the legacy one.
+        pv.seal_and_upsert::<StdPrimitives>(
+            &k,
+            vid,
+            ItemNs::Policy,
+            "",
+            1,
+            &ItemPayload::live(ItemNs::Policy, "", serde_json::json!({ "timeout": 222 })),
+        )
+        .unwrap();
+        // An agent mask item.
+        pv.seal_and_upsert::<StdPrimitives>(
+            &k,
+            vid,
+            ItemNs::Agent,
+            "ag_test",
+            1,
+            &ItemPayload::live(
+                ItemNs::Agent,
+                "ag_test",
+                serde_json::json!({ "connections": ["gmail"] }),
+            ),
+        )
+        .unwrap();
+
+        let view = pv.fold_view::<StdPrimitives>(&k, vid).unwrap();
+        assert!(view.legacy_addressing, "legacy items present pre-migration");
+        assert_eq!(
+            view.aux.policy.as_ref().unwrap().timeout,
+            Some(222),
+            "new address wins over legacy"
+        );
+        assert_eq!(
+            view.aux.store_order,
+            vec!["native-secrets".to_string(), "legacy-store".to_string()],
+            "legacy fills fields no new item set"
+        );
+        assert!(view.aux.agents["ag_test"].connections.allows("gmail"));
+
+        // Migrate: legacy rows tombstoned, data preserved at new addresses.
+        let changed = pv.migrate_addressing::<StdPrimitives>(&k, vid).unwrap();
+        assert!(!changed.is_empty());
+        let after = pv.fold_view::<StdPrimitives>(&k, vid).unwrap();
+        assert!(!after.legacy_addressing, "no live legacy rows remain");
+        assert_eq!(after.aux.policy.as_ref().unwrap().timeout, Some(222));
+        assert_eq!(
+            after.aux.store_order,
+            vec!["native-secrets".to_string(), "legacy-store".to_string()],
+            "legacy-only field carried over to the new address"
+        );
+        assert!(after.aux.agents["ag_test"].connections.allows("gmail"));
+
+        // Idempotent: second call is a no-op.
+        let again = pv.migrate_addressing::<StdPrimitives>(&k, vid).unwrap();
+        assert!(again.is_empty(), "second migration is a no-op");
     }
 
     #[test]

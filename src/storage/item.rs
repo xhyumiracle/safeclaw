@@ -188,8 +188,30 @@ pub enum ItemNs {
     Connection,
     /// `body` = `{ service, config, code, verifier }`.
     Connecting,
-    /// `ns = "aux"`, `name ∈ {policy, stores, store_order, …}`; `body` = subtree.
+    /// LEGACY (pre-unification): `ns = "aux"`, `name ∈ {policy, stores, …}`.
+    /// Read-compat only — the fold still parses it, nothing writes it. Team
+    /// §8.2: one rule now addresses everything (`ns` = the `VaultAux` field,
+    /// `name` = the map key, singletons use the empty name), so each former
+    /// aux subtree has its own ns below. Removable once the version census
+    /// says the fleet is migrated.
     Aux,
+    /// `body` = [`AgentEntry`] (reach mask); `name` = agent id. Team §8.1.
+    Agent,
+    /// Singleton (`name = ""`): `body` = the [`Policy`] tree.
+    Policy,
+    /// Singleton: `body` = the stores map.
+    Stores,
+    /// Singleton: `body` = the store-order list.
+    #[serde(rename = "store_order")]
+    StoreOrder,
+    /// Singleton: `body` = retention days (integer).
+    #[serde(rename = "audit_retention_days")]
+    AuditRetentionDays,
+    /// Singleton: `body` = custom-service source map.
+    Services,
+    /// Singleton: `body` = `{ user_id → role }` (team membership record —
+    /// the signed owner-list anchor once UIK config signatures land).
+    Members,
 }
 
 impl ItemNs {
@@ -200,7 +222,27 @@ impl ItemNs {
             ItemNs::Connection => "connection",
             ItemNs::Connecting => "connecting",
             ItemNs::Aux => "aux",
+            ItemNs::Agent => "agent",
+            ItemNs::Policy => "policy",
+            ItemNs::Stores => "stores",
+            ItemNs::StoreOrder => "store_order",
+            ItemNs::AuditRetentionDays => "audit_retention_days",
+            ItemNs::Services => "services",
+            ItemNs::Members => "members",
         }
+    }
+
+    /// Singleton namespaces address exactly one item and use the empty name.
+    pub fn is_singleton(self) -> bool {
+        matches!(
+            self,
+            ItemNs::Policy
+                | ItemNs::Stores
+                | ItemNs::StoreOrder
+                | ItemNs::AuditRetentionDays
+                | ItemNs::Services
+                | ItemNs::Members
+        )
     }
 }
 

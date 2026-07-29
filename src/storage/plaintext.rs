@@ -312,6 +312,71 @@ pub fn suggested_secret_key(conn_id: &str, service_id: &str, role: &str) -> Stri
     format!("{role}_{qual}")
 }
 
+/// Membership role inside a shared vault. Two tiers by design (team §7.1/§5.15):
+/// `Owner` = manage (config, members, reveal, kill switch); `Member` = edit
+/// (content). Multiple owners are the norm; the LAST owner can never be removed
+/// or demoted (§7.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberRole {
+    Owner,
+    Member,
+}
+
+/// A single agent's reach mask — which connections of THIS vault the agent may
+/// use (design/team §8.1). `All` is the default (absent item ≡ `All`, personal
+/// parity). `Selected` is a fail-closed whitelist: a connection added to the
+/// vault later is NOT reachable until explicitly listed. Everything else about
+/// agent permissioning (per-request levels, approvals) stays vault-wide policy —
+/// the mask is a reach/visibility gate, deliberately not a rule tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", untagged)]
+pub enum AgentMask {
+    /// `"all"` — no restriction from the mask.
+    All(AllTag),
+    /// Explicit whitelist of `connection_id`s.
+    Selected(Vec<String>),
+}
+
+/// Serde helper: the `All` arm serializes as the bare string `"all"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AllTag {
+    #[serde(rename = "all")]
+    All,
+}
+
+impl Default for AgentMask {
+    fn default() -> Self {
+        AgentMask::All(AllTag::All)
+    }
+}
+
+impl AgentMask {
+    /// Does the mask let this agent reach `connection_id`?
+    pub fn allows(&self, connection_id: &str) -> bool {
+        match self {
+            AgentMask::All(_) => true,
+            AgentMask::Selected(list) => list.iter().any(|c| c == connection_id),
+        }
+    }
+
+    /// `None` = unrestricted; `Some(set)` = the whitelist (fail-closed).
+    pub fn selected(&self) -> Option<&[String]> {
+        match self {
+            AgentMask::All(_) => None,
+            AgentMask::Selected(list) => Some(list),
+        }
+    }
+}
+
+/// The body of an `agent:<agent_id>` item: today just the mask, kept as a
+/// struct so future per-agent fields land without re-addressing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentEntry {
+    #[serde(default)]
+    pub connections: AgentMask,
+}
+
 /// `aux` payload — everything inside `ProtectedState.aux` for v4 vaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultAux {
@@ -348,6 +413,20 @@ pub struct VaultAux {
     /// it never shadows a built-in id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub services: BTreeMap<String, String>,
+    /// Per-agent reach masks, keyed by agent id (pubkey-derived once identity
+    /// ships; api-key id until then). Sparse — an absent entry means the agent
+    /// reaches everything (`AgentMask::All`, personal parity). Sliced to
+    /// `agent:<id>` items at the sync layer (one item per agent = independent
+    /// CAS, same pattern as connections). Team §8.1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentEntry>,
+    /// Team membership record `{ user_id → role }` — the vault-internal
+    /// authority for "who is in and what tier" (team §5.15b: becomes the
+    /// signed owner-list anchor once UIK config signatures land; until then
+    /// the server membership rows are the operational projection). Sparse —
+    /// empty for personal vaults. Sliced to the `members:` singleton item.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub members: BTreeMap<String, MemberRole>,
 }
 
 impl VaultAux {
@@ -373,6 +452,8 @@ impl VaultAux {
             connections: BTreeMap::new(),
             audit_retention_days: None,
             services: BTreeMap::new(),
+            agents: BTreeMap::new(),
+            members: BTreeMap::new(),
         }
     }
 }
@@ -388,6 +469,10 @@ pub struct VaultPlaintextView {
     /// because the view's lifetime is the request, not the protocol
     /// boundary — sudp's zeroize is preserved up to the moment we copy.
     pub native_secrets: BTreeMap<String, Vec<u8>>,
+    /// True when the fold saw any live legacy `aux:*` item — the trigger for
+    /// the one-shot addressing migration (team §8.3). Always false for views
+    /// opened from a whole-blob `ProtectedState` (no addressing there).
+    pub legacy_addressing: bool,
 }
 
 impl VaultPlaintextView {
@@ -408,6 +493,7 @@ impl VaultPlaintextView {
         Ok(VaultPlaintextView {
             aux,
             native_secrets,
+            legacy_addressing: false,
         })
     }
 
