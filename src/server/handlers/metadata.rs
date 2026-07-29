@@ -315,24 +315,21 @@ pub fn unwrap_k_from_keyset(
     Ok(zeroize::Zeroizing::new(k_bytes))
 }
 
-/// Blinded item ids of the six config singletons under this vault's `K` —
-/// the owner lock list the backend write-gates (team §5.15). Non-secret by
-/// design (the aux-id registration decision): naming WHICH ids are config
-/// reveals category, never content.
-fn config_singleton_ids(k: &[u8], vault_id: &str) -> Result<Vec<String>> {
+/// Blinded item ids of the owner-only config aux items under this vault's `K`
+/// — the owner lock list the backend write-gates (team §5.15). LEGACY `aux:*`
+/// addressing (T1). Non-secret by design (the aux-id registration decision):
+/// naming WHICH ids are config reveals category, never content. `members` is
+/// deliberately NOT gated here — a joiner's approve writes it during the
+/// ceremony; its integrity is a T2 UIK-signing concern, not a write gate.
+fn config_aux_item_ids(k: &[u8], vault_id: &str) -> Result<Vec<String>> {
     use crate::storage::item::ItemNs;
     let _ = vault_id;
-    [
-        ItemNs::Policy,
-        ItemNs::Stores,
-        ItemNs::StoreOrder,
-        ItemNs::AuditRetentionDays,
-        ItemNs::Services,
-        ItemNs::Members,
-    ]
-    .into_iter()
-    .map(|ns| crate::storage::item::item_id::<StdPrimitives>(k, ns.as_str(), ""))
-    .collect()
+    // The 5 true config subtrees. `agents` (member-edited masks) and `members`
+    // (ceremony-written) are deliberately NOT owner-gated in T1.
+    ["policy", "stores", "store_order", "audit_retention_days", "services"]
+        .into_iter()
+        .map(|name| crate::storage::item::item_id::<StdPrimitives>(k, ItemNs::Aux.as_str(), name))
+        .collect()
 }
 
 /// Per-item analogue of [`decrypt_vault_view`]: unwrap `K` from the keyset via
@@ -424,58 +421,22 @@ pub fn open_view_for_grant_keep_key(
                 &pv,
                 vault_id,
             )?;
-            // One-shot addressing migration (team §8.3 "升级即切换"): first
-            // unlock of a legacy-format vault by this binary rewrites the five
-            // config singletons at their unified addresses and tombstones the
-            // legacy rows. Rollback insurance = a CIPHERTEXT copy of the
-            // pre-migration file (never plaintext to disk). Version-bumped
-            // rows ride the normal sync push. Failures leave the vault
-            // readable via the fold's dual-read — never block an unlock.
-            // Shared vault: queue the owner lock-list registration (blinded
-            // ids of the config singletons) — the sync loop delivers it once.
+            // Shared vault: queue the owner lock-list registration — the
+            // blinded ids of the config aux items the backend write-gates as
+            // owner-only (team §5.15). The sync loop delivers it once. NOTE:
+            // T1 keeps config at LEGACY `aux:<name>` addressing (the console
+            // still reads/writes it), so the gated ids are the `aux:*` ids,
+            // NOT the not-yet-active unified per-ns ids. The unified-addressing
+            // cutover (§8.3) is a LATER coordinated core+console release; the
+            // ItemNs variants + fold dual-read are in place for it but nothing
+            // writes them or runs the migration yet.
             if !view.aux.members.is_empty() {
-                if let Ok(ids) = config_singleton_ids(&k, vault_id) {
+                if let Ok(ids) = config_aux_item_ids(&k, vault_id) {
                     state
                         .pending_config_ids
                         .lock()
                         .unwrap()
                         .insert(vault_id.to_string(), ids);
-                }
-            }
-            if view.legacy_addressing {
-                let backup = path.with_extension("pre-migration.json");
-                if !backup.exists() {
-                    if let Err(e) = std::fs::copy(&path, &backup) {
-                        tracing::warn!(vault = %vault_id, "migration backup failed, skipping migration this unlock: {}", e);
-                        return Ok((view, k));
-                    }
-                }
-                match pv.migrate_addressing::<StdPrimitives>(&k, vault_id) {
-                    Ok(changed) if !changed.is_empty() => {
-                        match crate::storage::sealed_vault::write_per_item_atomic(&path, &pv) {
-                            Ok(()) => {
-                                tracing::info!(vault = %vault_id, items = changed.len(),
-                                    "unified-addressing migration complete (legacy rows tombstoned)");
-                                state
-                                    .pending_format_mark
-                                    .lock()
-                                    .unwrap()
-                                    .insert(vault_id.to_string());
-                                // Re-fold so the session view reflects the
-                                // migrated state, and let the regular sync
-                                // loop push the bumped rows.
-                                let fresh = pv.fold_view::<StdPrimitives>(&k, vault_id)?;
-                                return Ok((fresh, k));
-                            }
-                            Err(e) => {
-                                tracing::warn!(vault = %vault_id, "migration write failed (will retry next unlock): {}", e);
-                            }
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(vault = %vault_id, "addressing migration failed (dual-read continues): {}", e);
-                    }
                 }
             }
             return Ok((view, k));
