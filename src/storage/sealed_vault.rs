@@ -579,63 +579,65 @@ impl PerItemVault {
             let payload = ItemPayload::live(ItemNs::Connecting, conn_id.clone(), body);
             self.seal_and_upsert::<S>(k, vault_id, ItemNs::Connecting, conn_id, 1, &payload)?;
         }
-        // aux subtrees → one `aux:<name>` item each (LEGACY addressing —
-        // team T1 stays here so the console, which still reads/writes
-        // `aux:*`, keeps working. `agents`/`members` are blobs too. The
-        // unified per-ns addressing (§8.2) + its ItemNs variants are folded
-        // dual-read for a LATER coordinated core+console cutover; nothing
-        // WRITES it yet.)
+        // aux subtrees → one `aux:<name>` item each. Config singletons +
+        // `members` are single blobs; AGENTS are PER-ITEM `aux:agent/<id>`
+        // (one item per agent) — independent CAS so two members editing their
+        // own agents never clobber, and a distinct item id per agent for the
+        // future per-author write gate (team §8.1). The `aux:` prefix is
+        // retained (the cosmetic drop → `agent:<id>` is the pre-launch
+        // console-coordinated cutover); the PER-ITEM SPLIT is here now.
         for (name, body) in Self::aux_blob_bodies(&view.aux)? {
             self.seal_and_upsert::<S>(
                 k,
                 vault_id,
                 ItemNs::Aux,
-                name,
+                &name,
                 1,
-                &ItemPayload::live(ItemNs::Aux, name, body),
+                &ItemPayload::live(ItemNs::Aux, name.clone(), body),
             )?;
         }
         Ok(())
     }
 
-    /// The aux subtrees a view wants materialised, as `(aux_name, body)` pairs
-    /// under LEGACY `aux:<name>` addressing. Shared by seed + reconcile so the
-    /// two write paths can never disagree. Default/empty subtrees are skipped
-    /// (no tombstone-like noise). `agents`/`members` ride here as whole blobs
-    /// (team T1 — console reads them as `aux:agents`/`aux:members`).
+    /// The aux items a view wants materialised, as `(aux_name, body)` pairs
+    /// under `aux:<name>` addressing. Shared by seed + reconcile so the two
+    /// write paths can never disagree. Config singletons + `members` are whole
+    /// blobs; each agent mask is its OWN item `aux:agent/<id>` (per-item CAS).
+    /// Default/empty subtrees are skipped (no tombstone-like noise).
     fn aux_blob_bodies(
         aux: &crate::storage::plaintext::VaultAux,
-    ) -> Result<Vec<(&'static str, serde_json::Value)>> {
-        let mut out = Vec::new();
+    ) -> Result<Vec<(String, serde_json::Value)>> {
+        let mut out: Vec<(String, serde_json::Value)> = Vec::new();
         out.push((
-            "stores",
+            "stores".into(),
             serde_json::to_value(&aux.stores).map_err(AppError::from)?,
         ));
         out.push((
-            "store_order",
+            "store_order".into(),
             serde_json::to_value(&aux.store_order).map_err(AppError::from)?,
         ));
         if let Some(policy) = &aux.policy {
-            out.push(("policy", serde_json::to_value(policy).map_err(AppError::from)?));
+            out.push(("policy".into(), serde_json::to_value(policy).map_err(AppError::from)?));
         }
         if let Some(days) = aux.audit_retention_days {
-            out.push(("audit_retention_days", serde_json::json!(days)));
+            out.push(("audit_retention_days".into(), serde_json::json!(days)));
         }
         if !aux.services.is_empty() {
             out.push((
-                "services",
+                "services".into(),
                 serde_json::to_value(&aux.services).map_err(AppError::from)?,
             ));
         }
-        if !aux.agents.is_empty() {
+        // PER-AGENT items — `aux:agent/<id>`, one each.
+        for (id, entry) in &aux.agents {
             out.push((
-                "agents",
-                serde_json::to_value(&aux.agents).map_err(AppError::from)?,
+                format!("agent/{}", id),
+                serde_json::to_value(entry).map_err(AppError::from)?,
             ));
         }
         if !aux.members.is_empty() {
             out.push((
-                "members",
+                "members".into(),
                 serde_json::to_value(&aux.members).map_err(AppError::from)?,
             ));
         }
@@ -746,6 +748,21 @@ impl PerItemVault {
                 changed.push(iid);
             }
         }
+        // A dropped agent mask (offboarding sweep, or a member deleting their
+        // own agent) → tombstone its per-item `aux:agent/<id>` row.
+        for id in mine.aux.agents.keys() {
+            let name = format!("agent/{}", id);
+            if !desired.contains_key(&(ItemNs::Aux, name.clone())) {
+                let (iid, _v) = self.seal_and_bump::<S>(
+                    k,
+                    vault_id,
+                    ItemNs::Aux,
+                    &name,
+                    &ItemPayload::tombstone(ItemNs::Aux, name.clone()),
+                )?;
+                changed.push(iid);
+            }
+        }
         Ok(changed)
     }
 
@@ -796,7 +813,6 @@ impl PerItemVault {
         let mut legacy_policy: Option<serde_json::Value> = None;
         let mut legacy_retention: Option<serde_json::Value> = None;
         let mut legacy_services: Option<serde_json::Value> = None;
-        let mut legacy_agents: Option<serde_json::Value> = None;
         let mut legacy_members: Option<serde_json::Value> = None;
         let mut legacy_addressing = false;
 
@@ -884,10 +900,11 @@ impl PerItemVault {
                         seen_new.members = true;
                     }
                     ItemNs::Aux => {
-                        // LEGACY addressing (pre-unification). Park the value;
-                        // applied after the loop only if no new-address item
-                        // set the same field. Unknown names ignored (forward-
-                        // compat, unchanged).
+                        // Config singletons ride `aux:<name>` blobs (parked +
+                        // applied after the loop if no unified-ns item set the
+                        // field — the cosmetic `aux:` drop is deferred). AGENTS
+                        // are per-item `aux:agent/<id>` — one mask each,
+                        // independent CAS (team §8.1). `members` stays a blob.
                         legacy_addressing = true;
                         match name.as_str() {
                             "stores" => legacy_stores = Some(payload.body),
@@ -895,21 +912,18 @@ impl PerItemVault {
                             "policy" => legacy_policy = Some(payload.body),
                             "audit_retention_days" => legacy_retention = Some(payload.body),
                             "services" => legacy_services = Some(payload.body),
-                            // The console still seals aux subtrees as whole
-                            // blobs (legacy addressing). `agents`/`members`
-                            // arrive that way until the frontend seal layer
-                            // moves to per-item; parse them here (a blob wins
-                            // over nothing, and the migration splits `agents`
-                            // into per-agent items + promotes `members` to its
-                            // singleton). Only applied if no new-address item
-                            // set the same field.
-                            // Park; applied after the loop with per-key merge so
-                            // any future per-item `agent:`/`members:` row wins
-                            // per key, order-independent (never the coarse
-                            // all-or-nothing drop).
-                            "agents" => legacy_agents = Some(payload.body),
                             "members" => legacy_members = Some(payload.body),
-                            _ => {}
+                            n => {
+                                if let Some(agent_id) = n.strip_prefix("agent/") {
+                                    let entry = serde_json::from_value(payload.body).map_err(|e| {
+                                        AppError::Internal(format!("agent '{}' parse: {}", agent_id, e))
+                                    })?;
+                                    // Per-item row is authoritative for its id;
+                                    // it overrides anything a legacy blob carried.
+                                    aux.agents.insert(agent_id.to_string(), entry);
+                                }
+                                // other unknown aux names: ignored (forward-compat).
+                            }
                         }
                     }
                 }
@@ -954,16 +968,8 @@ impl PerItemVault {
                     .map_err(|e| AppError::Internal(format!("aux.services parse: {}", e)))?;
             }
         }
-        // agents / members legacy blobs: per-key merge, per-item row wins.
-        if let Some(v) = legacy_agents {
-            if let Ok(m) = serde_json::from_value::<
-                std::collections::BTreeMap<String, crate::storage::plaintext::AgentEntry>,
-            >(v) {
-                for (id, entry) in m {
-                    aux.agents.entry(id).or_insert(entry);
-                }
-            }
-        }
+        // `members` legacy blob (single-blob singleton). Agents are per-item
+        // (`aux:agent/<id>`, folded inline above) — no blob to merge here.
         if !seen_new.members {
             if let Some(v) = legacy_members {
                 if let Ok(m) = serde_json::from_value::<
@@ -1339,13 +1345,14 @@ mod tests {
         assert_eq!(back, serde_json::json!({ "connections": ["github-work"] }));
     }
 
-    // T1 addressing: everything (config + agents + members) rides LEGACY
-    // `aux:<name>` blobs so the console (still on aux addressing) keeps working.
-    // The unified per-ns variants + fold dual-read exist for a LATER cutover but
-    // nothing writes them yet. This asserts the seed → fold round-trip and the
-    // agents/members per-key merge the reviewer flagged.
+    // T1 addressing: config singletons + `members` ride single `aux:<name>`
+    // blobs (console-compatible; the cosmetic `aux:` drop is the deferred
+    // cutover). AGENTS are PER-ITEM `aux:agent/<id>` — one item each, so two
+    // members editing their own agents never clobber (independent CAS). This
+    // asserts the seed → fold round-trip, per-item agent addressing, and that a
+    // dropped agent tombstones only its own row.
     #[test]
-    fn t1_aux_blob_addressing_roundtrips_including_agents_and_members() {
+    fn t1_agents_are_per_item_config_and_members_are_blobs() {
         use crate::storage::plaintext::{AgentEntry, AgentMask, MemberRole, VaultAux};
         use sudp::primitives::StdPrimitives;
         let k = [0x55u8; 32];
@@ -1360,13 +1367,14 @@ mod tests {
         )
         .unwrap();
 
-        // Seed from a view carrying policy + an agent mask + members.
+        // Seed from a view with policy + TWO agents + members.
         let mut aux = VaultAux::initial();
         aux.policy = Some(serde_json::from_value(serde_json::json!({ "timeout": 222 })).unwrap());
         aux.agents.insert(
-            "ag_test".into(),
+            "ag_alice".into(),
             AgentEntry { connections: AgentMask::Selected(vec!["gmail".into()]) },
         );
+        aux.agents.insert("ag_bob".into(), AgentEntry::default()); // "all"
         aux.members.insert("u_alice".into(), MemberRole::Owner);
         let view = crate::storage::plaintext::VaultPlaintextView {
             aux,
@@ -1375,33 +1383,32 @@ mod tests {
         };
         pv.seed_items_from_view::<StdPrimitives>(&k, vid, &view).unwrap();
 
-        // Every subtree comes back through the legacy `aux:*` blobs.
         let folded = pv.fold_view::<StdPrimitives>(&k, vid).unwrap();
         assert_eq!(folded.aux.policy.as_ref().unwrap().timeout, Some(222));
-        assert!(folded.aux.agents["ag_test"].connections.allows("gmail"));
-        assert!(!folded.aux.agents["ag_test"].connections.allows("stripe"), "fail-closed");
+        assert!(folded.aux.agents["ag_alice"].connections.allows("gmail"));
+        assert!(!folded.aux.agents["ag_alice"].connections.allows("stripe"), "fail-closed");
+        assert!(folded.aux.agents["ag_bob"].connections.allows("anything"), "all");
         assert_eq!(folded.aux.members.get("u_alice"), Some(&MemberRole::Owner));
-        // No per-ns unified items were written (T1 stays on legacy addressing).
+
+        // Per-item: each agent is its OWN `aux:agent/<id>` item (independent
+        // CAS), NOT a shared blob and NOT a new-ns row.
+        let aux_names = pv.live_names_in_ns::<StdPrimitives>(&k, vid, ItemNs::Aux).unwrap();
+        assert!(aux_names.contains(&"agent/ag_alice".to_string()));
+        assert!(aux_names.contains(&"agent/ag_bob".to_string()));
+        assert!(!aux_names.contains(&"agents".to_string()), "no shared agents blob");
         assert!(
             pv.live_names_in_ns::<StdPrimitives>(&k, vid, ItemNs::Agent).unwrap().is_empty(),
-            "T1 must not write per-item agent rows"
+            "T1 keeps agents under aux:, not the deferred agent: ns"
         );
 
-        // A per-item agent row (future addressing) wins per-key over the blob;
-        // an agent only in the blob still survives (per-key merge, not drop).
-        pv.seal_and_upsert::<StdPrimitives>(
-            &k,
-            vid,
-            ItemNs::Agent,
-            "ag_new",
-            1,
-            &ItemPayload::live(ItemNs::Agent, "ag_new", serde_json::json!({ "connections": "all" })),
-        )
-        .unwrap();
-        let merged = pv.fold_view::<StdPrimitives>(&k, vid).unwrap();
-        assert!(merged.aux.agents.contains_key("ag_test"), "blob agent survives");
-        assert!(merged.aux.agents.contains_key("ag_new"), "per-item agent present");
-        assert!(merged.aux.agents["ag_new"].connections.allows("anything"));
+        // Drop ag_bob (offboard/delete) — reconcile tombstones ONLY its row;
+        // ag_alice's item is untouched (the anti-clobber property).
+        let mut view2 = pv.fold_view::<StdPrimitives>(&k, vid).unwrap();
+        view2.aux.agents.remove("ag_bob");
+        pv.reconcile_from_view::<StdPrimitives>(&k, vid, &view2).unwrap();
+        let after = pv.fold_view::<StdPrimitives>(&k, vid).unwrap();
+        assert!(after.aux.agents.contains_key("ag_alice"), "other agent survives");
+        assert!(!after.aux.agents.contains_key("ag_bob"), "dropped agent tombstoned");
     }
 
     #[test]

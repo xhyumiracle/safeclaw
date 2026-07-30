@@ -316,17 +316,17 @@ pub fn unwrap_k_from_keyset(
 }
 
 /// Blinded item ids of the owner-only config aux items under this vault's `K`
-/// — the owner lock list the backend write-gates (team §5.15). LEGACY `aux:*`
-/// addressing (T1). Non-secret by design (the aux-id registration decision):
-/// naming WHICH ids are config reveals category, never content. `members` is
-/// deliberately NOT gated here — a joiner's approve writes it during the
-/// ceremony; its integrity is a T2 UIK-signing concern, not a write gate.
+/// — the owner lock list the backend write-gates (team §5.15). `aux:*`
+/// addressing. Non-secret by design (the aux-id registration decision):
+/// naming WHICH ids are config reveals category, never content. Includes
+/// `members` (owner-managed: only owners approve joins / change roles), so a
+/// member can't rewrite the roster. `agents` is NOT here — each agent mask is
+/// its own `aux:agent/<id>` item, member-edited (edit tier); its per-author
+/// gate is a T2 concern (needs the agent-id→member registration).
 fn config_aux_item_ids(k: &[u8], vault_id: &str) -> Result<Vec<String>> {
     use crate::storage::item::ItemNs;
     let _ = vault_id;
-    // The 5 true config subtrees. `agents` (member-edited masks) and `members`
-    // (ceremony-written) are deliberately NOT owner-gated in T1.
-    ["policy", "stores", "store_order", "audit_retention_days", "services"]
+    ["policy", "stores", "store_order", "audit_retention_days", "services", "members"]
         .into_iter()
         .map(|name| crate::storage::item::item_id::<StdPrimitives>(k, ItemNs::Aux.as_str(), name))
         .collect()
