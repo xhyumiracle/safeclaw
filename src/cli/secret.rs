@@ -27,7 +27,7 @@ enum BrokerIntent {
 }
 
 pub async fn run_set(args: SetArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     // §1: secret KEYs are ALWAYS uppercase. Force-uppercase on input (a lowercase
     // key is auto-converted, never stored lowercase) so there is one canonical
     // form. Reject anything that isn't a valid env KEY even after uppercasing.
@@ -195,7 +195,7 @@ fn prompt_host(key: &str) -> Result<String, String> {
 }
 
 pub async fn run_rm(args: RmArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     // §1: secret KEYs are canonical uppercase — normalize on input so `sc rm
     // github_token` finds the stored `GITHUB_TOKEN`.
     let key = args.key.trim().to_ascii_uppercase();
@@ -253,7 +253,7 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
 }
 
 pub async fn run_get(args: GetArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     // Case-SENSITIVE exact match — the mainstream convention for env vars and
     // secret managers (GCP/AWS/Vault). `get` reads across ALL stores: native
     // keys are canonical UPPERCASE, but external stores (GCP Secret Manager)

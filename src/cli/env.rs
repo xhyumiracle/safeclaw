@@ -6,40 +6,33 @@
 //! eval "$(safeclaw env)"
 //! ```
 //!
-//! `sc env` is the DEVICE/human's tool (CREDENTIAL_BROKER.md §14) — it emits the
-//! routing vars only, NEVER a key:
+//! `sc env` is the DEVICE/human's tool (CREDENTIAL_BROKER.md §14) — it emits
+//! ONE routing var, never a key:
 //!
 //! - `SAFECLAW_BROKER_URL` — the resident daemon's API face
 //!   (`http://127.0.0.1:<PROXY_PORT>`), for reference / manual `/health` / `/ca`.
-//! - `SAFECLAW_VAULT_ID`   — the active vault; this PINS the shell's vault
-//!   (`resolve_active` reads it), the `AWS_PROFILE` analog.
 //!
-//! The AGENT's config (these routing vars PLUS its per-agent `SAFECLAW_API_KEY`)
-//! is minted whole by `sc agent add`, not here: agent ≡ api-key, account-level,
+//! Deliberately NOT emitted: `SAFECLAW_VAULT_ID`. A durable pin in a human
+//! shell shadows `sc vault use` forever (design/vault-addressing.md) — vault
+//! follows the device default; per-call override is the global `--vault`.
+//! The pin's one legitimate minter is `sc run`, which injects it into the
+//! child it launches.
+//!
+//! The AGENT's config (routing var PLUS its per-agent `SAFECLAW_API_KEY`) is
+//! minted whole by `sc agent add`, not here: agent ≡ api-key, account-level,
 //! so each agent holds its own key and `sc env` (device scope) must never emit
-//! one — that would collapse every agent on the device to one key. `sc run`
-//! derives the child's HTTPS_PROXY live from the broker face + that key, so
-//! neither tool bakes a precomputed proxy URL. See
+//! one — that would collapse every agent on the device to one key. See
 //! [[project_vault_agent_architecture_2026_06_25]] / CREDENTIAL_BROKER.md §14.
-//!
-//! Falls back to printing comments + a clear hint if no config has been
-//! written yet — `eval "$(safeclaw env)"` then no-ops safely instead of
-//! exporting empty strings.
 
-use crate::cli::active::{device_daemon_host, device_default_vault, load as load_config};
+use crate::cli::active::{device_daemon_host, load as load_config};
 use crate::config::PROXY_PORT;
 
 pub fn run() -> Result<(), String> {
-    let cfg = load_config()?;
-    // Device atoms only — never the process env (`sc env` MINTS the pin; a
+    // Device atoms only — never the process env (`sc env` MINTS output; a
     // re-eval that read its own prior output would freeze stale values).
-    let Some(vault) = device_default_vault(&cfg) else {
-        println!("# safeclaw: no vault on this device — run `sc login` or `sc vault create` first");
-        return Ok(());
-    };
+    let cfg = load_config()?;
     let broker_url = format!("{}:{}", device_daemon_host(&cfg), PROXY_PORT);
     println!("export SAFECLAW_BROKER_URL={}", shell_quote(&broker_url));
-    println!("export SAFECLAW_VAULT_ID={}", shell_quote(&vault));
     Ok(())
 }
 

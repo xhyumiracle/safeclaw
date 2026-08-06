@@ -12,8 +12,11 @@ block:
 | Var | Meaning |
 |---|---|
 | `SAFECLAW_BROKER_URL` | the local broker, e.g. `http://127.0.0.1:23294` |
-| `SAFECLAW_VAULT_ID` | which vault its requests resolve against |
 | `SAFECLAW_API_KEY` | this agent's bearer identity |
+
+The vault is not part of the env: each request names one in its URL
+(`/v/<vault>/…`), and `sc run` binds one per launched command
+(`sc run --vault <id> --` to pick). `sc vault ls` lists ids (`*` = default).
 
 One key per agent keeps the audit trail attributable: every brokered request
 and every approval you grant is tied to a named agent, so "which agent did

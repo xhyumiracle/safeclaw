@@ -38,8 +38,8 @@ struct StoreError {
     error: String,
 }
 
-pub async fn run(args: CommonArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+pub async fn run(_args: CommonArgs) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(None)?;
 
     let url = format!(
         "{}/v/{}/secret-keys",

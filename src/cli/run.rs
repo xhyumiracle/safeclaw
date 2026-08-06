@@ -24,7 +24,7 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
         );
     }
 
-    let (control, vid) = resolve_active(args.vault.as_deref())?;
+    let (control, vid) = resolve_active(None)?;
     let ca = resident_ca_path();
     preflight(&ca, &control).await?;
 

@@ -60,16 +60,7 @@ struct ListKey {
 
 async fn add(args: AgentAddArgs) -> Result<(), String> {
     let (cloud, key) = cloud_and_key()?;
-    // Resolve the projection inputs BEFORE minting: erroring out after the
-    // POST would strand a live account-level key the caller never saw.
     let cfg = load_config().unwrap_or_default();
-    let Some(vid) = crate::cli::active::device_default_vault(&cfg) else {
-        return Err(
-            "no vault on this device — run `sc login --pair-token <token>` (it sets the \
-             vault), or `sc vault use`, then retry"
-                .into(),
-        );
-    };
     let broker_url = format!(
         "{}:{}",
         crate::cli::active::device_daemon_host(&cfg),
@@ -92,20 +83,18 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         .map_err(|e| format!("parse response: {}", e))?;
 
     // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─
-    // Print the agent's env as three dotenv lines: the daemon's API face + the
-    // default vault + the fresh key. The agent appends ONE command's stdout to
-    // its own `.env` — its SSOT from then on — and never assembles a value.
-    // STDOUT only; stderr guidance carries NO secret, so blind-capture keeps the
-    // key out of the agent's transcript (and out of the install prompt).
+    // Print the agent's env as two dotenv lines: the daemon's API face + the
+    // fresh key. The agent appends ONE command's stdout to its own `.env` —
+    // its SSOT from then on — and never assembles a value. STDOUT only; stderr
+    // guidance carries NO secret, so blind-capture keeps the key out of the
+    // agent's transcript (and out of the install prompt).
     //
-    // We deliberately do NOT bake a precomputed full proxy URL
-    // (`<vid>:<key>@host`) here. It carries no information not already in these
-    // three vars, and baking it froze a host:port that a moved daemon made stale.
-    // `sc run` rebuilds the child's HTTPS_PROXY live from the broker face + this
-    // key, so the derived-only env self-heals — this is the skill's documented
-    // 3-var contract.
+    // Deliberately NOT baked: a precomputed proxy URL (froze a host:port that a
+    // moved daemon made stale — `sc run` rebuilds it live), and a vault id
+    // (froze the device default of mint day into a pin that shadowed
+    // `sc vault use` forever — vault is per-call, not identity; see
+    // design/vault-addressing.md). Identity-only env self-heals.
     println!("SAFECLAW_BROKER_URL={}", broker_url);
-    println!("SAFECLAW_VAULT_ID={}", vid);
     println!("SAFECLAW_API_KEY={}", r.token);
 
     let rm_name = if args.name.contains(char::is_whitespace) {

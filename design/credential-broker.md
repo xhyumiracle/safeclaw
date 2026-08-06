@@ -586,13 +586,18 @@ the guard, not time. Known boundary (settled 2026-07-09): the request BODY
 is not part of the binding — same method+host+path with a different body
 redeems. Body-field binding is the Phase-2 `[requests]`/vars/scope design.
 
-**The agent's env = its SSOT — four dotenv vars, minted as ONE block:**
+**The agent's env = its SSOT — two dotenv vars, minted as ONE block:**
 
 ```
 SAFECLAW_BROKER_URL=http://127.0.0.1:23294               # broker/API face
-SAFECLAW_VAULT_ID=<vid>                                  # discovery path param + proxy username
 SAFECLAW_API_KEY=<key>                                   # identity — Bearer (API face) + proxy password
 ```
+
+No vault var (design/vault-addressing.md): vault is per-call — the discovery
+path param and proxy username carry it, and `sc run` injects
+`$SAFECLAW_VAULT_ID` into the child it launches. Nothing durable mints the
+pin; a mint-time vault froze the device default of mint day into a shadow
+default `sc vault use` could never beat.
 
 **`sc agent add <name>` IS the single minter**: it prints this whole block to
 stdout (key shown once; stderr guidance carries no secret) — a mint-time
@@ -600,8 +605,8 @@ projection of the DEVICE atoms — and the agent appends it unseen to its own
 `.env`. The key stays out of the install prompt AND the transcript (settled:
 the cloud also can't know a device's real atoms, so a console-baked env would
 freeze assumptions). `sc env` stays the HUMAN-shell projection (`BROKER_URL`
-+ `VAULT_ID`, never a key — a device-level key would collapse per-agent
-revocation). Install chain: prompt = install + pair-token login + `sc agent
+only — never a key, which would collapse per-agent revocation, and never a
+vault pin, which would shadow `sc vault use`). Install chain: prompt = install + pair-token login + `sc agent
 add >> .env` + a CLAUDE.md reminder.
 
 **Atoms are truth, `_url`s are derived** — `src/cli/active.rs` is the single

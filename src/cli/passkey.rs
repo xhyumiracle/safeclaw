@@ -51,8 +51,8 @@ struct PasskeyMeta {
     created_at: Option<String>,
 }
 
-async fn run_ls(args: CommonArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+async fn run_ls(_args: CommonArgs) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(None)?;
     let url = format!(
         "{}/v/{}/passkeys",
         custodian.trim_end_matches('/'),

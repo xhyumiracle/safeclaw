@@ -34,7 +34,7 @@ fn is_localhost(custodian: &str) -> bool {
 pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
     match sub {
         VaultSubcommand::Status(a) => crate::cli::status::run(a).await,
-        VaultSubcommand::Ls => run_ls().await,
+        VaultSubcommand::Ls(a) => run_ls(a).await,
         VaultSubcommand::Use(a) => run_use(a).await,
         VaultSubcommand::Forget(a) => run_forget(a).await,
         VaultSubcommand::Create(a) => run_create(a).await,
@@ -44,14 +44,32 @@ pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
     }
 }
 
-async fn run_ls() -> Result<(), String> {
+async fn run_ls(args: crate::config::VaultLsArgs) -> Result<(), String> {
     let cfg = load_config()?;
     let known = known_vaults();
+    let active = (cfg.daemon.as_deref(), cfg.vault.as_deref());
+    if args.json {
+        let rows: Vec<serde_json::Value> = known
+            .iter()
+            .map(|kv| {
+                json!({
+                    "url": join_vault_url(&kv.daemon, &kv.vault),
+                    "daemon": kv.daemon,
+                    "vault": kv.vault,
+                    "default": active == (Some(kv.daemon.as_str()), Some(kv.vault.as_str())),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).unwrap_or_default()
+        );
+        return Ok(());
+    }
     if known.is_empty() {
         println!("(no vaults yet — `safeclaw vault create` or `safeclaw vault use`)");
         return Ok(());
     }
-    let active = (cfg.daemon.as_deref(), cfg.vault.as_deref());
     for (i, kv) in known.iter().enumerate() {
         let marker = if active == (Some(&kv.daemon), Some(&kv.vault)) {
             "*"
@@ -122,6 +140,20 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
     }
     put_active(&custodian, &vault).map_err(|e| format!("save config: {}", e))?;
     print_status(&s);
+    // Pin-aware (design/vault-addressing.md): a shell that carries a launch pin
+    // keeps targeting it — say so here, at the moment of the switch, instead of
+    // letting the very next `sc ls` contradict the header above.
+    if let Ok(pin) = std::env::var("SAFECLAW_VAULT_ID") {
+        if !pin.is_empty() && pin != vault {
+            eprintln!(
+                "note: this shell is pinned to {} via $SAFECLAW_VAULT_ID, so `sc` here still targets it;",
+                pin
+            );
+            eprintln!(
+                "      the new default applies everywhere else — `unset SAFECLAW_VAULT_ID` to follow it here"
+            );
+        }
+    }
     Ok(())
 }
 

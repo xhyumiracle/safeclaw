@@ -24,6 +24,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -518,20 +519,38 @@ pub fn device_default_vault(cfg: &CliConfig) -> Option<String> {
     cfg.vault.clone().or_else(single_known_vault)
 }
 
+/// The global `--vault` flag, recorded once by main right after clap parse so
+/// every handler resolves it through the ONE chain below instead of each
+/// subcommand carrying its own copy of the flag (design/vault-addressing.md).
+static VAULT_FLAG: OnceLock<Option<String>> = OnceLock::new();
+
+pub fn set_vault_flag(v: Option<String>) {
+    let _ = VAULT_FLAG.set(v);
+}
+
+pub fn vault_flag() -> Option<String> {
+    VAULT_FLAG
+        .get()
+        .cloned()
+        .flatten()
+        .filter(|s| !s.is_empty())
+}
+
 /// Resolve the active `(control_root, vault)` pair every short-lived `sc`
 /// command routes through — the single choke point (CREDENTIAL_BROKER.md §14).
 ///
 /// - **control root:** see [`control_root`] — the env `BROKER_URL` HOST wins
 ///   (the single-host invariant), else config, else the loopback default.
 /// - **vault precedence:** `--vault flag > $SAFECLAW_VAULT_ID (env pin) >
-///   config default > single-vault auto-select`. The env pin is what makes an
-///   agent's shelled-out `sc` target the SAME vault its own HTTP does — env
-///   overrides file for the VARYING axis, exactly like `AWS_PROFILE`. A fresh
-///   shell (no pin) still follows config + `sc vault use`.
+///   config default > single-vault auto-select`. The env pin is launch-scoped
+///   context (`sc run` injects it into the child) — it's what makes an agent's
+///   shelled-out `sc` target the SAME vault its own HTTP does. Nothing durable
+///   mints it, so a fresh shell follows config + `sc vault use`.
 pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), String> {
     let cfg = load()?;
     let explicit = vault_override
         .map(str::to_string)
+        .or_else(vault_flag)
         .or_else(|| {
             std::env::var("SAFECLAW_VAULT_ID")
                 .ok()

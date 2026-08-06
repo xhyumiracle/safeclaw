@@ -16,7 +16,6 @@ a literal string (a clean 401), never a leak.
 Your install prompt set these — use each verbatim, never construct one.
 
 - **`$SAFECLAW_BROKER_URL`** — SafeClaw's broker URL, e.g. `http://127.0.0.1:23294`.
-- **`$SAFECLAW_VAULT_ID`** — your vault id.
 - **`$SAFECLAW_API_KEY`** — your identity; send `Authorization: Bearer
   $SAFECLAW_API_KEY` on every request below.
 
@@ -34,8 +33,12 @@ Check `sc help` anytime for more.
 
 ## Discover what's available
 
+`<vault>` is a vault id: `$SAFECLAW_VAULT_ID` if your session was launched with
+one, else the `*` line of `sc vault ls`. Several vaults may exist — each
+request may target any of them.
+
 ```
-GET $SAFECLAW_BROKER_URL/v/$SAFECLAW_VAULT_ID/registry
+GET $SAFECLAW_BROKER_URL/v/<vault>/registry
 Authorization: Bearer $SAFECLAW_API_KEY
 ```
 
@@ -100,6 +103,9 @@ GITHUB_TOKEN=__sc__github__ sc run -- gh pr list
 
 Multi-account is by phantom VALUE, not env-var name: switch `__sc__github__` →
 `__sc__github_work__`. One request carries one connection's phantom(s).
+
+`sc run` binds the command to one vault — the default, or `sc run --vault <id>
+--`. A phantom from a different vault passes through unresolved.
 
 An auth failure (401/403) on a brokered call is usually routing, not the secret:
 confirm the command actually ran under `sc run --` with the phantom in the

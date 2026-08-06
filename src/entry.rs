@@ -41,6 +41,9 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
     let matches = cli::help::command().get_matches();
     let verbose = matches.get_count("verbose");
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // Record the global `--vault` once; `resolve_active` reads it as the top of
+    // the vault chain (flag > env pin > config default).
+    cli::active::set_vault_flag(cli.vault.clone());
     // `serve` installs its own subscriber below (long-running, different
     // defaults); every other (short-lived) verb gets a stderr subscriber only
     // when `-v` was asked, so a command's normal output stays clean.
