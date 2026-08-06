@@ -6,6 +6,8 @@ pub mod canonical;
 pub mod envelope;
 pub mod kdf;
 pub mod keys;
+pub mod server_key;
+pub mod vault_key;
 pub mod zeroize;
 
 pub use aead::{

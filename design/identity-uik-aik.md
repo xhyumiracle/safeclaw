@@ -1,5 +1,20 @@
 # User & Agent Identity Keys (UIK / AIK) — RFC
 
+> **STATUS (2026-08-05): UIK scope + keyset schema SUPERSEDED by
+> `unified-identity-schema.md`** (target SSOT). UIK becomes ONE per person (this RFC/impl
+> currently mints one per vault); keysets normalize into `identities` / `credentials` /
+> `vault_access` / `vault_meta` / delegation-event rows; NoUik is deleted (personal
+> unifies onto the UIK path). The crypto model carries over; on schema / UIK-scope
+> conflict, the unified doc wins.
+
+> **Status / supersede.** This is the **identity-layer RFC**. The later
+> first-principles redesign, `safeclaw-market/designs/team-shared-vault-security-model.md`
+> (**SM**, 2026-07-30/31), is the current authority for the team security/identity
+> model. **Where this RFC conflicts with SM, SM wins.** SM records the deltas
+> (three-layer `custody→UIK→K`; no in-vault member list; server-authoritative
+> sharedness `kind` bit; offboard re-key). Read SM first; this doc is kept for
+> the engineering detail it still contributes.
+
 Status: **proposal** (team-edition T2). Nothing here is implemented; T1 ships
 the deposit ceremony + op-agent binding this builds on. Ground truth for the
 pieces it composes: [protocol.md](protocol.md) (SUDP, key hierarchy),
@@ -136,6 +151,77 @@ config_item.body        = { data: <subtree>, sig: Ed25519(UIK, canonical(data �
 
 ### 4.3 The owner list is itself a signed config object (`members:`)
 
+> ✅✅ **SETTLED DESIGN (2026-08-04): membership/role authority = a signed
+> DELEGATION LOG folded to a FLAT owner-set, rooted at the creator. This is the
+> full multi-admin model; it SUPERSEDES the earlier one-hop "creator signs all"
+> design (which is what the CURRENT SHIPPED CODE does — see "Code status" at the
+> bottom). Grounded in SPKI/SDSI + Lampson/Abadi speaks-for + Keybase team sigchain
+> + MLS epochs; we are implementing a 30-year-formalized model, not inventing
+> crypto. First-principles derivation of WHY a log is necessary + the SPKI/Keybase
+> citations live in memory `reference_delegation_sigchain_first_principles`.**
+>
+> **Structure — a flat SET, mutated by an append-only signed LOG (NOT a dependency tree).**
+> - Membership/role is a flat set (who is currently `owner`/`member`). A member's
+>   standing does NOT depend on who added them.
+> - The set is the FOLD of an append-only log of signed events. Each event =
+>   `{op: add|remove, subject_uik, role, gen/seq, sig}` where `sig` is by a
+>   principal who was an OWNER at that point in the log (issuance-time authority).
+> - **ANY current owner** may sign add/remove events (egalitarian delegation) —
+>   this is the SPKI "delegation bit". The daemon verifies an event by folding the
+>   log up to it and checking the signer ∈ owner-set-so-far.
+>
+> **Root & transfer.** Genesis root = the creator's UIK sig key, TOFU-pinned by
+> each daemon on first unlock (the pin is set-once; server can't swap it).
+> Ownership transfer / creator-offboard = a **succession event** (the current root
+> signs a new root); the daemon follows the short succession chain. So the creator
+> is NOT a permanent hardcoded root — a colluding-server anchor bound to
+> `vaults.user_id` (the F-2 backend fix) must become "follow the succession", not
+> "forever the creator".
+>
+> **Revocation = EXPLICIT + NON-CASCADE (user-corrected 2026-08-04).** An event is
+> valid if signed by an owner-at-the-time and stays valid until an EXPLICIT `remove`
+> event. Removing A does NOT drop whoever A added — B stands on their own (Slack/
+> GitHub semantics; like a PKI cert surviving CA rotation until explicitly revoked).
+> NO cascade / subtree-prune (that earlier recommendation was WRONG). Malicious-
+> admin case: default non-cascade at the mechanism layer; when offboarding a
+> COMPROMISED admin, SURFACE "A also added X, Y" and let the human explicitly choose
+> to remove them too — cascade is a reviewed human decision, never automatic.
+>
+> **Rollback + compaction (keep the log short).** Events are generation-bound
+> (monotonic `generation`); a lower-gen replay is rejected. Compaction reuses the
+> existing **re-key as a checkpoint**: a re-key folds the log into a fresh, FLAT,
+> signed snapshot of the current owner-set at the new generation, prunes the
+> prefix, and flattens delegation depth back to 1 (and rotates K = forward secrecy).
+> Removals already re-key; adds are cheap events between re-keys; an on-demand/
+> periodic re-key compacts accumulated adds. A fresh daemon boots from the latest
+> snapshot + the short tail — never replays to genesis. Retained length = churn
+> since the last re-key, not total history. (Same shape as MLS epochs / Keybase
+> checkpoints / WAL compaction.)
+>
+> **Anti-equivocation: NOT via blockchain.** Keybase's Merkle-root-on-chain is
+> calibrated for a public-scale trust service; a 2-10-person private vault does not
+> need it. Our bar: the server-signed sync envelope (§9 / F) attests the current
+> chain-head (rollback + light anti-fork), plus the existing join-time SAS
+> fingerprint for out-of-band cross-member checks. Full public anti-equivocation is
+> explicitly out of scope (accepted boundary: server can withhold/delay, not forge).
+>
+> **daemon**: fold the log (from the latest checkpoint) → the verified owner-set;
+> config verification (§4.2) authorizes a signer iff ∈ that set. Unpinnable root /
+> unverifiable log ⇒ **fail-closed** (drop owner-config → safe defaults; secrets/
+> connections still fold). **backend**: mirrors the fold for its write-gate
+> (stability); `memberships.role` is not an authority; billing = seat count.
+>
+> **Code status (the gap to close — the queued build).** The CURRENT shipped code
+> implements the strict SUBSET of this design: a single fixed root (the creator),
+> depth-1, `role_sig` per keyset cred verified directly under the pinned
+> `creator_sig_pub` at the current generation, re-key-re-signs-all, creator-only
+> re-key/offboard, NO delegation log, NO succession/transfer. The rework to the
+> full delegation log (this section) is the next major build. See memory
+> `project_team_edition_design` for the exact code deltas.
+>
+> The genesis/change prose below is the ORIGINAL sketch of this idea (git-root-
+> commit analogy); it is subsumed by the settled design above.
+
 The authority anchor can't come from the server (a colluding cloud swaps it).
 `members:` = `{ user_id → role }`, signed by an owner. Trust chain:
 
@@ -147,6 +233,24 @@ The authority anchor can't come from the server (a colluding cloud swaps it).
 - server `memberships` rows (T1) are demoted to an **operational projection**:
   used for gating/billing/UI while offline from the signed truth; a mismatch
   with the signed `members:` is an alarm, never authority.
+  - **[SM §1 correction]** SM re-roots *membership existence* in **keyset-wrap
+    possession**, not this signed list: the server `memberships` table is the
+    operational projection of *who holds a wrap* (SM §1), and the vault stores
+    **no** membership list ("vault 里不存花名册"). `members:` survives here
+    only as the **role/owner** authority (see the note below), never as the
+    membership or sharedness source.
+
+> **Reconcile with SM §1/§4 (2026-07-30/31 redesign).** SM removes the
+> *in-vault membership list*: **membership existence** is "who holds a keyset
+> wrap" (SM §1), with the server `memberships` table as an *operational
+> projection*. This does **not** kill the signed `members:` object here; the two
+> are consistent. `members:` is retained ONLY as the **role/owner authority
+> anchor** (who is an owner, so daemons can verify config signatures), **not** as
+> a membership or sharedness list. **Sharedness** is the server-authoritative
+> `kind` bit (SM §4), never derived from `members:`. So SM's "vault 里不存花名册"
+> (no membership/sharedness list) and this §4.3's signed `members:` role map
+> coexist: one forbids a list of *who is in*, the other keeps a signed map of
+> *who is an owner*.
 
 ### 4.4 What UIK does NOT protect
 

@@ -1,0 +1,267 @@
+# Unified membership — end-to-end `verify(anchor, members, proof)`
+
+**Status: DESIGN LOCKED (2026-08-05, user-approved). SSOT for the implementation.**
+Code comes AFTER this doc + a compact (§9 is the TODO). This doc is the ONLY current
+design. Two earlier variants that lived in this file are **DEAD — do not resurrect**:
+- the **4-table "normalized" schema** (vault_access / vault_delegation_events /
+  vault_succession / uik_identities) — over-fragmented; replaced by the single
+  `vault_membership` triple below.
+- the **"wire-compat" row-translation strategy** (backend `demux` row→tables and
+  `synthesize` tables→row so the daemon kept reading cid-keyed rows) — an unneeded
+  translation layer. We go **end-to-end**: no row format anywhere.
+
+--------------------------------------------------------------------------------
+## 0. The model
+
+Membership of a vault is ONE authorization triple:
+
+```
+verify(anchor, members, proof) = true
+```
+
+- **`anchor`** — the genesis root: the creator's UIK **signing pubkey**. Set once at
+  vault birth, immutable. The whole fold roots here (it is a KEY, not a person — the
+  creator can be removed and the anchor stays).
+- **`members`** — the current membership, an object keyed by identity id:
+  `{ "us_…": { role, k_encapped, k_ct, role_sig }, … }`. Each entry = a member's role
+  + their K delivery (K sealed to their UIK enc-pub) + the root-signed checkpoint grant.
+- **`proof`** — what authorizes `members`:
+  `{ delegation_log[], succession[], generation, rekey_proof }`.
+
+**`verify`** = the fold: walk `succession` from `anchor` → current root + `role_epoch`;
+verify each `members[id].role_sig` under the current root; apply `delegation_log`
+(any-owner events, issuance-time authority, NON-CASCADE, last-owner guard) → the
+authorized owner-set; `generation` + `rekey_proof` are the K-rotation anti-rollback.
+
+**END-TO-END.** Frontend, backend, daemon, and DB ALL speak this triple. There is **NO
+row format and NO translation layer**.
+
+--------------------------------------------------------------------------------
+## 1. Threat-model conclusions (locked, 2026-08-05)
+
+1. **The daemon's local TOFU pin of `anchor` is THE boundary vs a malicious server.**
+   The daemon never trusts server-side role fields; it re-verifies `members`/`proof`
+   against the anchor pinned locally on first unlock. A server that rewrites the DB
+   (even a "set-once" column whose trigger it drops) is defeated by a pinned daemon.
+   No server/DB constraint defends against a malicious server — only the off-server pin.
+2. **The signature chain (`proof`) buys MULTI-ADMIN, not stronger server-resistance.**
+   Any non-creator owner can provably manage membership. And creator-removal REQUIRES
+   multi-admin, so the chain is not optional.
+3. **The append-only signed head is the substrate for a future public-log root**
+   (publish the head commitment + anchor to a CT-style log → closes fresh-device
+   first-touch + non-equivocation). Future; not now.
+4. **The proof IS the chain, packaged** — one self-contained object verified against
+   the pinned anchor.
+
+--------------------------------------------------------------------------------
+## 2. Schema — 3 tables
+
+```
+vault_membership            -- one row per vault; the verify(anchor, members, proof) triple.
+                            -- INDEPENDENT table (NOT merged into `vaults`): it is the crypto-
+                            -- authorization layer, distinct from the product metadata in
+                            -- `vaults`; and members/proof churn on every membership op, so they
+                            -- stay off the hot `vaults` row.
+  vault_id    PK
+  anchor      text          -- root = creator's UIK sig pubkey (b64 raw-32), SET-ONCE
+  members     jsonb         -- { "us_…": { role, k_encapped, k_ct, role_sig }, … }
+  proof       jsonb         -- { delegation_log[], succession[], generation, rekey_proof }
+  keyset_seq  bigint        -- monotone; drives the GET /membership since-delta
+  updated_at  timestamptz
+
+identities                  -- one per PRINCIPAL (user = UIK, agent = AIK)
+  id          PK            -- us_… / ag_… = derive_id(sig_pub); self-certifying
+  account_id  text          -- owning account
+  kind        text          -- 'user' | 'agent'
+  sig_pub     text          -- Ed25519 signing pubkey (b64 raw-32)
+  enc_pub     text          -- X25519 encryption pubkey (b64 raw-32; users)
+
+credentials                 -- one per DEVICE credential (was `passkeys`; `type` generalizes)
+  cid         PK            -- credential id (globally unique)
+  account_id  text          -- owning account
+  type        text          -- 'passkey' (only type today); future: 'recovery_code', …
+  identity_id text          -- which identity this credential unlocks
+  wrapped_uik text          -- the UIK root WRAPPED under this credential's custody (W_c)
+  wrap_salt   text          -- per-credential KDF salt for W_c (device scope, NOT per-vault)
+  wc_check    text          -- optional W_c key-check value (cross-device)
+  x, y, device_name, …      -- existing WebAuthn fields
+
+vaults  (UNCHANGED product table)  -- keeps: format (1 = legacy v1; 2 = triple), kind,
+  user_id (= created_by label, NOT an authority for shared vaults), label, status,
+  version, membership_epoch. NO crypto columns (anchor/members/proof live in vault_membership).
+```
+
+Naming convention for key material (§5): **encrypt** (data under a key) / **wrap** (a key
+under a symmetric key: UIK under custody) / **seal** (a key to a pubkey: K to a member's
+UIK, HPKE — `k_encapped` + `k_ct`).
+
+--------------------------------------------------------------------------------
+## 3. Wire — `GET`/`PUT /membership` (end-to-end, no row)
+
+```
+GET /v/{vid}/membership?since=<seq>          (daemon + console read)
+  → { keyset_seq }                            if keyset_seq <= since (nothing new)
+  → { anchor, members, proof, keyset_seq,
+      identities: { "us_…": { sig_pub, enc_pub }, … },   -- pubkeys for the members
+      credential: { cid, wrapped_uik, wrap_salt, wc_check } }   -- the CALLER's OWN credential
+  Daemon: own credential.wrapped_uik (custody→UIK) → open members[self].k_ct → K;
+          verify(anchor, members, proof) → owner-set.
+
+PUT /v/{vid}/membership   body { base_seq, anchor?, members, proof,
+                                 identity?: { sig_pub, enc_pub },
+                                 credential?: { wrapped_uik, wrap_salt, wc_check } }
+  CAS on keyset_seq (base_seq must equal current, else 409 → caller re-reads + retries).
+  Authorize: verify(anchor, members, proof) must hold AND the writer is either an OWNER
+  (owner op) OR only touching their OWN members[self] entry (self-service K re-seal).
+  `anchor` is SET-ONCE. Registers the writer's `identity` + `credential` if carried.
+  On success bump keyset_seq.
+```
+
+The CAS (`base_seq`) is the concurrency guard (same shape as the item CAS): an owner
+reads the triple, computes the new (members, proof) for their op, writes with the base;
+a concurrent write makes one side 409 + retry. Keyset ops are low-frequency.
+
+--------------------------------------------------------------------------------
+## 4. What each layer does
+
+- **Frontend (console):** every owner op (create / invite-approve / promote / demote /
+  offboard / re-key) computes the new `(members, proof)` and `PUT`s the triple (CAS).
+  Reads the triple from `GET` and folds it for display/authority.
+- **Backend:** stores the triple verbatim; the WRITE gate authorizes via the fold
+  (`keyset-roles.mjs` reads `vault_membership` — already done); serves the triple on GET;
+  registers identities + credentials. NO row, NO demux/synthesize.
+- **Daemon (Rust):** sync `GET`s the triple → builds its in-memory keyset from
+  `(anchor, members, own credential)` and folds `(anchor, members, proof)`. The in-memory
+  model shifts from **cid-keyed rows → id-keyed `members`** + the daemon's own credential
+  for unlock. **Crypto fold + golden vectors UNCHANGED** — only the data plumbing changes.
+
+--------------------------------------------------------------------------------
+## 5. Naming convention (apply to all key-material fields)
+
+`encrypt`/`ciphertext` = bulk data under a key (items under K). `wrap` = a key under a
+symmetric key (UIK under custody W_c → `wrapped_uik`). `seal` = a key to a pubkey (K to a
+member's UIK, HPKE → `k_encapped` + `k_ct`). Rule the name must convey: `seal` = "doable
+with only a public key" (add a member offline); `wrap` = "needs the symmetric key".
+
+--------------------------------------------------------------------------------
+## 6. Option B (creator = normal member)
+
+The creator is just an entry in `members` (role owner) — no `vaults.user_id`
+special-casing for the crypto. `isOwnedVaultId` (backend data-access gate) resolves
+**shared-vault** access from membership/fold, NOT `vaults.user_id`; **personal** vaults
+keep the `vaults.user_id` fast path (creator = permanent sole owner). **DELETE the
+reassign hack** (it was a lower-risk substitute I wrongly kept). Creator-removal = drop
+their `members` entry + an owner-signed `remove` delegation event + re-key; last-owner
+guard applies.
+
+--------------------------------------------------------------------------------
+## 7. Per-person UIK (get-or-create)
+
+One UIK per person, stable `us_…` across vaults. On create: RECOVER the person's existing
+UIK (unwrap `wrapped_uik` from an existing credential via their passkey) or MINT if first
+vault. Add-device: seal the SAME UIK to the new credential during enrollment (honor
+`cross-device-enroll-integrity.md`). Personal vaults are created as format=2 (owner-set
+of one). Today the ceremony mints a fresh UIK per vault — this replaces that.
+
+--------------------------------------------------------------------------------
+## 8. Migration / census (no flag-day)
+
+New vaults are born `format=2` (triple). Legacy `format=1` v1 vaults (personal, uik=None →
+NoUik) keep working via the legacy path and migrate LAZILY: a per-user version census
+flips a user's vaults to the triple only when ALL their devices are ≥ the release that
+understands it (no cross-device lockout, no deadline; client-side re-wrap on next unlock).
+DELETE the NoUik path + any legacy row/table + the `passkeys` compat view once the census
+shows zero `format=1` left. Team vaults are all format=2, so the team e2e needs no census
+(it creates fresh format=2 vaults). PROD personal migration is gated behind the deploy +
+daemon rollout (user-controlled) — highest-stakes, client-side, K never leaves the device.
+
+--------------------------------------------------------------------------------
+## 8b. Implementation decisions (locked during build, 2026-08-05/06)
+
+These fill gaps the design left open or correct one infeasibility — recorded so they are not
+silently lost:
+1. **Option B mechanism = creator gets a `memberships` owner row** at shared-vault create
+   (revocable; offboard deletes it). `vaults.user_id` is now a pure created_by LABEL, not an
+   authority. `vaultRoleFor`/`listMembers` scope the `user_id`→owner shortcut to PERSONAL
+   vaults; the reassign hack is deleted; `isOwnedVaultId` shared access = memberships row OR
+   crypto fold (`ownerViaFold`).
+2. **Bootstrap ≠ create.** `handleCreateVault` cannot write the initial triple — the anchor is
+   the creator's client-side UIK sig pub, unknown to the backend at create. The initial triple
+   is written by the ceremony's FIRST `PUT /membership` (base_seq 0). (Supersedes the literal
+   "create writes initial vault_membership" wording below.)
+3. **Wire tweaks:** `PUT /membership`'s `credential` body carries `cid`; `GET` returns a
+   `credentials[]` array (superset of the singular `credential`) so a multi-device daemon keys
+   each of its cids.
+4. **Identity account binding is SET-ONCE** (`registerIdentity`). `deriveUserId(sig_pub)` is
+   public, so a plain `upsert(onConflict:id)` let any caller rebind a victim's `us_…` to their
+   account by replaying the victim's public sig_pub — forging owner authority (`writerIds`) AND
+   shared-vault data access (`ownerViaFold`). Fixed: bind only when new / already-ours / unclaimed;
+   `writerIds` come from the DB, never a us_id the caller couldn't bind. (Found in self-review.)
+
+--------------------------------------------------------------------------------
+## 9. STATUS — implementation (ET1-ET4 DONE + verified; 2026-08-06)
+
+- **ET1 dev reconcile** ✓ — `cur→members`, `credentials.uik_wrapped→wrapped_uik`, dead
+  `vaults` cols + `bump_keyset_seq` dropped. (DB-introspected.)
+- **ET2 backend** ✓ — `GET/PUT /membership`, `/keys`+`/keys/{cid}` 409 for fmt≥2,
+  demux/synthesize/anchor-pin removed, Option B, `registerIdentity` set-once, deposit registers
+  joiner identity/credential, `handleUikMaterial`. (node --check + import golden self-checks.)
+- **ET3 daemon** ✓ — `pull_keys` 409→`pull_membership`; `adopt_membership_triple` reuses the
+  exact adopt helpers; fold/unlock/golden vectors untouched. cargo build + **373 tests** incl.
+  `membership_triple_adopts_same_owner_set_as_keys_wire` (triple↔row parity).
+- **ET4 frontend** ✓ — client `get/putMembership` + `rowsFromMembership`/`membershipFromRows`
+  converters + `getKeys` 409→/membership read-shim; ceremonies (setup/approve/rekey/delegation)
+  write the triple via `commitMembership`; **per-person UIK get-or-create** (`getOrCreatePersonUik`
+  in setup + join); dead `wrappingKey` removed. tsc clean + **verify-uik-crypto 58/58**.
+
+**Deferred (flagged, per the user's "先B" sequencing):**
+- **ET5 census + NoUik/legacy deletion** = the PRE-PROD breaking batch. Team vaults are all
+  fmt=2 so e2e does not need it; existing personal fmt=1 vaults keep the legacy `/keys` path
+  until the census migrates them (client-side re-wrap on unlock, version-gated). Do NOT delete
+  the NoUik runtime path before the census shows zero fmt=1.
+
+**Legacy TODO wording (kept for reference; superseded where §8b notes):**
+
+**Migrations / dev reconcile**
+- [ ] One clean migration = the final schema (`2026-08-05-membership.sql`; the churn
+      files 01–04 are deleted). Uses `if not exists`.
+- [ ] Reconcile dev (it carries the churn): rename `vault_membership.cur` → `members`;
+      DROP the dead `vaults` columns `genesis_anchor_pub` / `generation` / `rekey_proof`
+      / `keyset_seq`; drop the unused `bump_keyset_seq` RPC (keep `bump_vault_membership_seq`).
+
+**Backend**
+- [ ] Route + handler `GET /v/{vid}/membership` (serve triple + identities + caller
+      credential; since-delta on `keyset_seq`).
+- [ ] Route + handler `PUT /v/{vid}/membership` (CAS on `base_seq`; authorize via the
+      fold + owner/self rule; set-once anchor; register identity+credential; bump seq).
+- [ ] `keyset-roles.mjs`: fold-mirror already reads `vault_membership`; rename `cur`→`members`.
+- [ ] **RIP OUT**: `demuxKeysetRowToNormalized`, `synthesizeKeysFromNormalized`, the
+      `format>=2` branches in `handleKeysGet`/`handleKeyPut`, and the `vault_keys` write
+      for format=2 (Option-B item ②). `putKey`/`getKeys` stay ONLY for legacy format=1.
+- [ ] Option B: `isOwnedVaultId` shared→membership; **delete the reassign hack** in
+      `handleMemberRemove`; `handleCreateVault` writes the creator's initial
+      `vault_membership` (anchor + `members[creator]`) at `format=2`.
+- [ ] `offboardMember`: drop `members[id]` + bump seq (adapt the current partial version).
+
+**Daemon (Rust)**
+- [ ] Sync: replace the `/keys` pull with the `/membership` pull; build the keyset from
+      the triple; drop `adopt_key_rows`/row parsing for format=2.
+- [ ] In-memory model: id-keyed `members` (+ own credential for unlock) instead of
+      cid-keyed `creds`. Fold input iterates `members`. **Crypto + golden vectors unchanged.**
+- [ ] Unlock: own `credential.wrapped_uik` (custody→UIK) → `members[self].k_ct` → K.
+
+**Frontend (console)**
+- [ ] Ceremony (`vault-grant.ts`): write the triple via `PUT /membership` (compute
+      members+proof + CAS) instead of `putKey` rows; fold from `GET /membership`.
+- [ ] Per-person UIK get-or-create + add-device seal (§7).
+- [ ] `encrypt`/`wrap`/`seal` naming.
+
+**Finish**
+- [ ] Census migration (§8) + delete NoUik/legacy at census→0.
+- [ ] Unified adversarial re-audit of the fold; full green gates (core / backend / frontend).
+
+--------------------------------------------------------------------------------
+## 10. Non-goals
+- Anchor-KEY rotation on creator-key compromise (org-recovery; separate).
+- On-chain / SAS public-log root for first-touch (future; the head commitment is ready).
+- Any change to sudp.

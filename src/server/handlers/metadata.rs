@@ -26,6 +26,7 @@ use crate::error::{AppError, Result};
 use crate::protocol::Operation;
 use crate::server::handlers::op::validate_vault_id;
 use crate::state::AppState;
+use crate::storage::item::VaultKeys;
 use crate::storage::plaintext::VaultPlaintextView;
 use crate::storage::sealed_vault::find_pubkey_in_registry;
 
@@ -315,12 +316,56 @@ pub fn unwrap_k_from_keyset(
     Ok(zeroize::Zeroizing::new(k_bytes))
 }
 
+/// Acquire the vault state key `K` from a keyset given the 32-byte secret the
+/// grant delivered — the v1/v2 unified K-acquisition seam.
+///
+/// - **v1 keyset** (`uik = None`): `secret` is the custody wrapping key `W_c`;
+///   unwrap `K̂_c` directly ([`unwrap_k_from_keyset`]).
+/// - **v2 keyset** (`custody → UIK → K`, team-shared-vault-security-model.md §5):
+///   `secret` is the member's UIK **root** (the browser already custody-unwrapped
+///   it from the passkey PRF), and `K` is HPKE-sealed to the member's UIK enc key
+///   in this credential's per-row seal ([`crate::crypto::vault_key::UikRoot::open_k`]).
+///
+/// One seam so no read path can diverge on how a grant resolves `K` across the
+/// two keyset formats. The grant wire is identical in both cases (a 32-byte
+/// secret HPKE-sealed to the daemon's `sc_pk`); only its meaning differs, and
+/// the keyset shape (`uik.is_some()`) — not the wire — selects the branch.
+pub fn acquire_k_from_keyset(
+    keyset: &crate::storage::sealed_vault::Keyset,
+    secret: &[u8],
+    credential_id_bytes: &[u8],
+    vault_id: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let Some(uik) = keyset.uik.as_ref() else {
+        // v1: `secret` is W_c → unwrap K directly.
+        return unwrap_k_from_keyset(keyset, secret, credential_id_bytes);
+    };
+    // v2: `secret` is the UIK root → open K from this credential's seal.
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let cid_b64 = URL_SAFE_NO_PAD.encode(credential_id_bytes);
+    let entry = uik
+        .creds
+        .get(&cid_b64)
+        .ok_or_else(|| AppError::Unauthorized("no UIK seal for credential".into()))?;
+    if secret.len() != 32 {
+        return Err(AppError::Unauthorized("UIK root must be 32 bytes".into()));
+    }
+    let mut root = zeroize::Zeroizing::new([0u8; 32]);
+    root.copy_from_slice(secret);
+    crate::crypto::vault_key::UikRoot::from_root(*root).open_k(
+        vault_id,
+        &entry.k_encapped,
+        &entry.k_ct,
+    )
+}
+
 /// Blinded item ids of the owner-only config aux items under this vault's `K`
 /// — the owner lock list the backend write-gates (team §5.15). `aux:*`
 /// addressing. Non-secret by design (the aux-id registration decision):
 /// naming WHICH ids are config reveals category, never content. Includes
 /// `members` (owner-managed: only owners approve joins / change roles), so a
-/// member can't rewrite the roster. `agents` is NOT here — each agent mask is
+/// member can't rewrite the membership. `agents` is NOT here — each agent mask is
 /// its own `aux:agent/<id>` item, member-edited (edit tier); its per-author
 /// gate is a T2 concern (needs the agent-id→member registration).
 fn config_aux_item_ids(k: &[u8], vault_id: &str) -> Result<Vec<String>> {
@@ -341,8 +386,8 @@ pub fn decrypt_vault_view_peritem(
     vault: &crate::storage::sealed_vault::PerItemVault,
     vault_id: &str,
 ) -> Result<VaultPlaintextView> {
-    let k = unwrap_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes)?;
-    vault.fold_view::<StdPrimitives>(&k, vault_id)
+    let k = acquire_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes, vault_id)?;
+    vault.fold_view::<StdPrimitives>(VaultKeys::from_material(&k), vault_id)
 }
 
 /// Per-item analogue of [`decrypt_vault_view_keep_key`]: like
@@ -356,8 +401,8 @@ pub fn decrypt_vault_view_peritem_keep_key(
     vault: &crate::storage::sealed_vault::PerItemVault,
     vault_id: &str,
 ) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
-    let k = unwrap_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes)?;
-    let view = vault.fold_view::<StdPrimitives>(&k, vault_id)?;
+    let k = acquire_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes, vault_id)?;
+    let view = vault.fold_view::<StdPrimitives>(VaultKeys::from_material(&k), vault_id)?;
     Ok((view, k))
 }
 
@@ -371,7 +416,7 @@ pub fn decrypt_vault_view_peritem_with_key(
     vault: &crate::storage::sealed_vault::PerItemVault,
     vault_id: &str,
 ) -> Result<VaultPlaintextView> {
-    vault.fold_view::<StdPrimitives>(k, vault_id)
+    vault.fold_view::<StdPrimitives>(VaultKeys::from_material(k), vault_id)
 }
 
 /// THE per-item read seam for the live grant paths (Export / Use / unlock).
@@ -414,7 +459,7 @@ pub fn open_view_for_grant_keep_key(
     vault: Option<&crate::storage::SealedVault>,
 ) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
     if let Ok(path) = state.vaults.per_item_path(vault_id) {
-        if let Ok(Some(mut pv)) = crate::storage::sealed_vault::read_per_item(&path) {
+        if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
             let (view, k) = decrypt_vault_view_peritem_keep_key(
                 wrapping_key,
                 credential_id_bytes,
@@ -423,14 +468,21 @@ pub fn open_view_for_grant_keep_key(
             )?;
             // Shared vault: queue the owner lock-list registration — the
             // blinded ids of the config aux items the backend write-gates as
-            // owner-only (team §5.15). The sync loop delivers it once. NOTE:
-            // T1 keeps config at LEGACY `aux:<name>` addressing (the console
-            // still reads/writes it), so the gated ids are the `aux:*` ids,
-            // NOT the not-yet-active unified per-ns ids. The unified-addressing
-            // cutover (§8.3) is a LATER coordinated core+console release; the
-            // ItemNs variants + fold dual-read are in place for it but nothing
-            // writes them or runs the migration yet.
-            if !view.aux.members.is_empty() {
+            // owner-only (team §5.15). The sync loop delivers it once.
+            //
+            // Sharedness is the server-authoritative `kind` bit (SM §4), NOT the
+            // in-vault member count. The role rework removed `aux.members` (roles
+            // now ride the keyset cred, design/identity-uik-aik.md §4.3), so this
+            // MUST gate on `vault_is_shared`, not `!aux.members.is_empty()` — else
+            // shared vaults never register their lock-list and a non-owner could
+            // overwrite owner-config (the daemon drops it → falls to allow-by-
+            // default masks = self-escalation). The lock-list stays until plaintext
+            // record-type (B2) enables role×type gating to replace it (§0.7(5)).
+            //
+            // NOTE: T1 keeps config at LEGACY `aux:<name>` addressing (the console
+            // still reads/writes it), so the gated ids are the `aux:*` ids, NOT the
+            // not-yet-active unified per-ns ids (the §8.3 cutover is later).
+            if state.vault_is_shared(vault_id) {
                 if let Ok(ids) = config_aux_item_ids(&k, vault_id) {
                     state
                         .pending_config_ids

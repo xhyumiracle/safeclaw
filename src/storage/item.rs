@@ -121,6 +121,51 @@ fn hmac32(key: &[u8], msg: &[u8]) -> [u8; 32] {
     out
 }
 
+/// The two per-vault keys the item layer needs, split for DP-S1 re-key
+/// (team-shared-vault-security-model.md §3.2). `id_seed` derives the **stable**
+/// item-id key (`derive_item_id_key`) so item ids survive a re-key; `content` is
+/// the AEAD key for item bodies, which **rotates** on re-key. A gen-0 vault
+/// (never re-keyed) has `id_seed == content == K`, so [`VaultKeys::single`] keeps
+/// every pre-re-key call site a one-line wrap and byte-identical in behavior.
+#[derive(Clone, Copy)]
+pub struct VaultKeys<'a> {
+    /// Stable across re-key → item ids never change (sync sees content updates,
+    /// not delete-all + add-all).
+    pub id_seed: &'a [u8],
+    /// The current generation's content-encryption key (rotates on re-key).
+    pub content: &'a [u8],
+}
+
+impl<'a> VaultKeys<'a> {
+    /// A gen-0 (never-re-keyed) vault: id-seed and content are the same key `K`.
+    pub fn single(k: &'a [u8]) -> Self {
+        Self { id_seed: k, content: k }
+    }
+
+    /// Interpret acquired key material into the split view:
+    ///   - **64 bytes** = a v2 DP-S1 bundle `id_seed(32) ‖ content_key(32)` →
+    ///     the two halves (id_seed stable, content rotates on re-key);
+    ///   - **any other length** (32 = v1 single `K`) → `single` (id == content).
+    /// The daemon retains the acquired material and rebuilds this on each fold.
+    pub fn from_material(material: &'a [u8]) -> Self {
+        if material.len() == 64 {
+            Self { id_seed: &material[..32], content: &material[32..] }
+        } else {
+            Self::single(material)
+        }
+    }
+}
+
+/// Concatenate a DP-S1 key bundle: `id_seed(32) ‖ content_key(32)` = 64 bytes,
+/// the plaintext a v2 keyset seals to a member's UIK. Mirror on the browser side
+/// (lib/uik-crypto.ts). `VaultKeys::from_material` is the inverse.
+pub fn vault_key_bundle(id_seed: &[u8], content_key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(id_seed.len() + content_key.len());
+    out.extend_from_slice(id_seed);
+    out.extend_from_slice(content_key);
+    out
+}
+
 /// Owns the byte buffers a [`SealCtx`] borrows, so callers can build a sealing
 /// context for one item + version without lifetime juggling.
 ///

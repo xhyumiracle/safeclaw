@@ -1962,12 +1962,19 @@ fn seed_per_item_store(
             registry: vault.registry.clone(),
             credentials: vault.credentials.clone(),
             keyset_version,
+            // Bootstrapped from a v1 whole-blob vault → v1 keyset (a v2 vault is
+            // born directly as a per-item store in the ceremony, never here).
+            uik: None,
         },
         items: std::collections::BTreeMap::new(),
         items_seq,
         keyset_seq,
     };
-    if let Err(e) = pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view) {
+    if let Err(e) = pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(
+        crate::storage::item::VaultKeys::single(k),
+        vault_id,
+        view,
+    ) {
         tracing::warn!(vault = %vault_id, "per-item seed from view failed: {}", e);
         return;
     }
@@ -2028,7 +2035,6 @@ pub(crate) fn bootstrap_cache_from_view(
         .map(|(c, conn)| (c.clone(), conn.clone()))
         .collect();
     cache.agents = view.aux.agents.clone();
-    cache.members = view.aux.members.clone();
     // Snapshot native-store item names (names only, never values). Surface
     // for GET /v/{vid}/secret-keys so the frontend can compute "which
     // services are reachable" without re-walking the kv map.

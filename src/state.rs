@@ -248,9 +248,6 @@ pub struct SecretsCache {
     /// re-key). Snapshot of `view.aux.agents` at unlock/refresh. Absent entry
     /// = `AgentMask::All` (personal parity).
     pub agents: std::collections::BTreeMap<String, crate::storage::plaintext::AgentEntry>,
-    /// Team membership snapshot (`view.aux.members`): `user_id → role`.
-    /// Non-empty = shared vault (drives the offline lease + team surfaces).
-    pub members: std::collections::BTreeMap<String, crate::storage::plaintext::MemberRole>,
     /// Custom (per-vault `aux.services`) service definitions, validated at
     /// unlock. Wiped on lock (Default drop). A custom service folds into
     /// discovery like a compiled one and never shadows a built-in id.
@@ -298,6 +295,22 @@ pub struct AppState {
     /// credentials parking its sync — keeps serving a SHARED vault only for
     /// the lease window.
     pub cloud_contact: Mutex<HashMap<String, std::time::Instant>>,
+    /// Server-authoritative vault sharedness (team §4: explicit `kind`, default
+    /// private), delivered on the `/blob` sync envelope OUTSIDE the sealed body —
+    /// `kind` is a server operational fact, never E2E. `true` = shared, `false` =
+    /// private; an ABSENT entry (never synced, or an old server that omits the
+    /// field) reads as private via `vault_is_shared` — the fail-safe default so a
+    /// personal vault (and any pre-sync state) is never leased. Supersedes the old
+    /// "derive shared from the E2E members map" heuristic (review H1). In-memory
+    /// only, repopulated on each pull — same restart-softness as `cloud_contact`,
+    /// which the offline lease already accepts (it is a soft backstop).
+    pub vault_shared: Mutex<HashMap<String, bool>>,
+    /// Team-edition extension hooks (team-edition §9 open/closed split). The
+    /// open build leaves the [`crate::team_hooks::NoopHooks`] default (no team
+    /// policy); the closed `safeclaw-ee` overlay injects real ones via
+    /// [`AppState::with_team_hooks`]. Serve-time team policy (the offline lease,
+    /// etc.) lives behind these, never inline in open core.
+    pub team: std::sync::Arc<dyn crate::team_hooks::TeamHooks>,
     /// Vaults whose addressing migration completed locally but whose cloud
     /// `format=2` mark hasn't landed yet — the sync loop drains this after a
     /// successful item push (团队 §8.3: mark only after the rows are up).
@@ -426,6 +439,18 @@ pub struct OpPayloadEntry {
 }
 
 impl AppState {
+    /// Inject the closed `safeclaw-ee` team hooks (team-edition §9). The open
+    /// build leaves the [`crate::team_hooks::NoopHooks`] default; the overlay's
+    /// `main` calls this on the fresh `AppState` before it is wrapped in `Arc`.
+    /// Chainable.
+    pub fn with_team_hooks(
+        mut self,
+        hooks: std::sync::Arc<dyn crate::team_hooks::TeamHooks>,
+    ) -> Self {
+        self.team = hooks;
+        self
+    }
+
     pub fn new(config: Config) -> Self {
         let vaults = VaultDir::new(&config.state_dir);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -436,6 +461,8 @@ impl AppState {
             config,
             vaults,
             cloud_contact: Mutex::new(HashMap::new()),
+            vault_shared: Mutex::new(HashMap::new()),
+            team: std::sync::Arc::new(crate::team_hooks::NoopHooks),
             pending_format_mark: Mutex::new(std::collections::HashSet::new()),
             pending_config_ids: Mutex::new(HashMap::new()),
             challenges: Mutex::new(ChallengeStore::new()),
@@ -1277,14 +1304,31 @@ impl AppState {
             .map(|t| t.elapsed().as_secs())
     }
 
-    /// Is this vault SHARED (has a team membership record)? Snapshot from the
-    /// unlocked cache; a locked/unknown vault answers false.
+    /// Is this vault SHARED? Server-authoritative (team §4): the `kind` the
+    /// server stamps on the `/blob` sync envelope, cached in `vault_shared`.
+    /// An absent entry (never synced, or an old server without the field) is
+    /// PRIVATE — the fail-safe default so a personal vault, and any pre-sync
+    /// state, is never leased (review H1 is structurally impossible here: a
+    /// private vault's `kind` never reads shared). Independent of unlock state,
+    /// unlike the old E2E members-map derivation this replaces.
     pub fn vault_is_shared(&self, vault_id: &str) -> bool {
-        let states = self.vault_states.lock().unwrap();
-        match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => !cache.members.is_empty(),
-            _ => false,
-        }
+        *self
+            .vault_shared
+            .lock()
+            .unwrap()
+            .get(vault_id)
+            .unwrap_or(&false)
+    }
+
+    /// Record the server-authoritative sharedness (`kind`) for a vault, from the
+    /// `/blob` sync envelope. `true` = shared, `false` = private. Called by the
+    /// sync path whenever a fresh envelope carries the field; absent-field pulls
+    /// leave the last known value untouched (see `sync::apply_vault_kind`).
+    pub fn set_vault_shared(&self, vault_id: &str, shared: bool) {
+        self.vault_shared
+            .lock()
+            .unwrap()
+            .insert(vault_id.to_string(), shared);
     }
 
     /// Does this vault's reach mask let `agent_prefix` use `connection_id`?
@@ -1313,11 +1357,7 @@ impl AppState {
     /// The full mask verdict set for one agent: `None` = unrestricted,
     /// `Some(set)` = fail-closed whitelist. Used by the registry/vaults
     /// surfaces to annotate rows without N lock round-trips.
-    pub fn agent_mask_whitelist(
-        &self,
-        vault_id: &str,
-        agent_prefix: &str,
-    ) -> Option<Vec<String>> {
+    pub fn agent_mask_whitelist(&self, vault_id: &str, agent_prefix: &str) -> Option<Vec<String>> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
             Some(VaultState::Unlocked { cache, .. }) => cache
@@ -1574,7 +1614,13 @@ mod tests {
         assert_eq!(state.cache_lookup_grant("v1", "github", "agA"), None);
         // ask-always never reads `entries` at all — the residency (and even a
         // real conn-keyed ask grant) is invisible to op_grant_take.
-        state.cache_insert("v1", "github", b"granted".to_vec(), None, Some("agA".into()));
+        state.cache_insert(
+            "v1",
+            "github",
+            b"granted".to_vec(),
+            None,
+            Some("agA".into()),
+        );
         assert_eq!(
             state.op_grant_take(
                 "v1",
@@ -1628,13 +1674,31 @@ mod tests {
         );
         // First take returns the value …
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             Some(b"tok".to_vec())
         );
         // … and removes it: a second take misses, and nothing leaked into the
         // conn-keyed entries for the allow/ask paths to find.
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             None
         );
         assert_eq!(state.cache_lookup("v1", "svc"), None);
@@ -1666,24 +1730,69 @@ mod tests {
         );
         // Different path / method / host / connection → all miss.
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/refund", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/refund",
+                "",
+                true
+            ),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "DELETE", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "DELETE",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.y.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.y.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "agA", "other", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "other",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             None
         );
         // Host comparison is case-insensitive (hosts are lowercased at insert).
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "API.X.COM", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "API.X.COM",
+                "/v2/purchase",
+                "",
+                true
+            ),
             Some(b"tok".to_vec())
         );
     }
@@ -1715,12 +1824,30 @@ mod tests {
             far,
         );
         assert_eq!(
-            state.op_grant_take("v1", "agB", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agB",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             None,
             "agent B cannot redeem A's grant"
         );
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             Some(b"tok".to_vec()),
             "B's miss must not have consumed A's grant"
         );
@@ -1819,11 +1946,29 @@ mod tests {
         );
         // …so the honest ($80) replay still succeeds, exactly once.
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                &d80,
+                true
+            ),
             Some(b"tok".to_vec())
         );
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                &d80,
+                true
+            ),
             None
         );
     }
@@ -1856,20 +2001,56 @@ mod tests {
         );
         // Peek (consume=false) reuses the SAME action any number of times…
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/search",
+                &d_read,
+                false
+            ),
             Some(b"tok".to_vec())
         );
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/search",
+                &d_read,
+                false
+            ),
             Some(b"tok".to_vec())
         );
         // …but a DIFFERENT bound value misses (re-prompt), without disturbing the grant.
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/search", &d_other, false),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/search",
+                &d_other,
+                false
+            ),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/search",
+                &d_read,
+                false
+            ),
             Some(b"tok".to_vec())
         );
     }
@@ -1888,7 +2069,13 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3600;
-        state.cache_insert("v1", "svc", b"new".to_vec(), Some(future), Some("agA".into()));
+        state.cache_insert(
+            "v1",
+            "svc",
+            b"new".to_vec(),
+            Some(future),
+            Some("agA".into()),
+        );
         assert_eq!(state.cache_lookup("v1", "svc"), Some(b"new".to_vec()));
     }
 
@@ -1956,7 +2143,15 @@ mod tests {
         assert_eq!(rule.as_deref(), Some("read"));
 
         // User approves that GET toward host A.
-        state.record_ask_approval(vid, "agA", "gh", Some("read".to_string()), "GET", "api.gh.com", 60);
+        state.record_ask_approval(
+            vid,
+            "agA",
+            "gh",
+            Some("read".to_string()),
+            "GET",
+            "api.gh.com",
+            60,
+        );
 
         // The same GET toward the same host now fast-paths (the feature works).
         let (lvl, _, _) = state
@@ -2083,7 +2278,11 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(lvl, AccessLevel::Allow, "an unscoped rule still uses the window");
+        assert_eq!(
+            lvl,
+            AccessLevel::Allow,
+            "an unscoped rule still uses the window"
+        );
 
         // A SCOPED path must NOT ride that value-blind window — it re-asks so its
         // per-value op_grant binds the amount/merchant.

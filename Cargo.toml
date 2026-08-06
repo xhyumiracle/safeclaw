@@ -45,6 +45,13 @@ subtle = "2"
 # for cross-device pending-passkey seals. Suite: DHKEM(X25519, HKDF-SHA-256)
 # + HKDF-SHA-256 + ChaCha20-Poly1305 (= PROTOCOL.md §4.2 mandated).
 hpke = { version = "0.12", features = ["x25519"] }
+# Identity/signing layer (src/identity.rs) — Ed25519 UIK/AIK principals, config
+# signatures, re-key events, server-envelope signing. This is the SafeClaw-level
+# extension on top of sudp (sudp core carries no signing identity); see
+# design/sudp-identity-signing-revision.md §B1. data-encoding = base32 for the
+# self-certifying id (ETH-address style).
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+data-encoding = "2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

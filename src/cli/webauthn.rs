@@ -93,7 +93,6 @@ pub async fn do_browser_gesture(
     let state_token = random_hex(16);
     let (tx, rx) = oneshot::channel::<GestureResult>();
     let cb_state = Arc::new(CbState {
-        expected_state: state_token.clone(),
         tx: Mutex::new(Some(tx)),
     });
     let app = Router::new()
@@ -310,7 +309,6 @@ pub fn random_hex(n: usize) -> String {
 }
 
 struct CbState {
-    expected_state: String,
     tx: Mutex<Option<oneshot::Sender<GestureResult>>>,
 }
 

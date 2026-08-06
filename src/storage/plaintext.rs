@@ -316,10 +316,15 @@ pub fn suggested_secret_key(conn_id: &str, service_id: &str, role: &str) -> Stri
 /// `Owner` = manage (config, members, reveal, kill switch); `Member` = edit
 /// (content). Multiple owners are the norm; the LAST owner can never be removed
 /// or demoted (§7.9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MemberRole {
     Owner,
+    /// The least-privilege default: a cred that loads without an explicit role
+    /// (legacy row, serde default) is a `Member`, never an `Owner`. This is the
+    /// fail-closed choice for the owner-authority anchor — a missing role can
+    /// never silently confer owner powers.
+    #[default]
     Member,
 }
 
@@ -420,13 +425,6 @@ pub struct VaultAux {
     /// CAS, same pattern as connections). Team §8.1.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AgentEntry>,
-    /// Team membership record `{ user_id → role }` — the vault-internal
-    /// authority for "who is in and what tier" (team §5.15b: becomes the
-    /// signed owner-list anchor once UIK config signatures land; until then
-    /// the server membership rows are the operational projection). Sparse —
-    /// empty for personal vaults. Sliced to the `members:` singleton item.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub members: BTreeMap<String, MemberRole>,
 }
 
 impl VaultAux {
@@ -453,7 +451,6 @@ impl VaultAux {
             audit_retention_days: None,
             services: BTreeMap::new(),
             agents: BTreeMap::new(),
-            members: BTreeMap::new(),
         }
     }
 }
