@@ -7,8 +7,8 @@
 use crate::cli::active::resolve_active;
 use crate::config::SyncArgs;
 
-pub async fn run(args: SyncArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+pub async fn run(_args: SyncArgs) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(None)?;
     let url = format!(
         "{}/v/{}/sync",
         custodian.trim_end_matches('/'),

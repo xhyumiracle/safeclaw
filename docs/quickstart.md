@@ -30,7 +30,7 @@ runs:
 sc login --pair-token spt_…   # pair this machine; brings the daemon up and
                               # prints a passkey-approval link you open once
 sc agent add my-agent         # mint the agent's env file:
-                              # SAFECLAW_BROKER_URL / SAFECLAW_VAULT_ID / SAFECLAW_API_KEY
+                              # SAFECLAW_BROKER_URL / SAFECLAW_API_KEY
 ```
 
 The pair token is single-use and the approval is a passkey tap in your

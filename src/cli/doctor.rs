@@ -51,7 +51,7 @@ impl Report {
     }
 }
 
-pub async fn run(args: CommonArgs) -> Result<(), String> {
+pub async fn run(_args: CommonArgs) -> Result<(), String> {
     let mut report = Report::new();
 
     // Platform + build (debug aid): the first thing a bug report needs — which
@@ -116,7 +116,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
     }
 
     // Active config resolution
-    let resolved = resolve_active(args.vault.as_deref());
+    let resolved = resolve_active(None);
     let (custodian, vault) = match resolved {
         Ok(pair) => {
             report.push(

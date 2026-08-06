@@ -13,8 +13,8 @@ use crate::config::StoreSubcommand;
 
 pub async fn run(sub: StoreSubcommand) -> Result<(), String> {
     match sub {
-        StoreSubcommand::Ls(args) => {
-            let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+        StoreSubcommand::Ls(_args) => {
+            let (custodian, vault) = resolve_active(None)?;
             ls(&custodian, &vault).await
         }
     }

@@ -45,6 +45,11 @@ pub const DEFAULT_BODY_CAP: u64 = 32 * 1024 * 1024;
     about = "SafeClaw — passkey-gated credential broker"
 )]
 pub struct Cli {
+    /// Target vault id for this invocation (any subcommand, any position).
+    /// Overrides the shell's `$SAFECLAW_VAULT_ID` pin and the device default —
+    /// the top of the resolution chain (design/vault-addressing.md).
+    #[arg(long, global = true, value_name = "VAULT_ID")]
+    pub vault: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -126,9 +131,9 @@ pub enum Command {
     /// device-key/pair-token authed, cloud-backed.
     Device(DeviceArgs),
     /// Print `export` lines for the HUMAN's shell (`eval "$(sc env)"`):
-    /// SAFECLAW_BROKER_URL + SAFECLAW_VAULT_ID projected from this device's
-    /// config — never a key. An AGENT's complete env (incl. its key) is minted
-    /// by `sc agent add` instead.
+    /// SAFECLAW_BROKER_URL projected from this device's config — never a key,
+    /// never a vault pin (vault follows `sc vault use`; per-call override is
+    /// `--vault`). An AGENT's env (incl. its key) is minted by `sc agent add`.
     Env,
     /// Self-update: download the latest release binary for this platform,
     /// verify its sha256, and replace the running binary in place. No-op when
@@ -212,10 +217,6 @@ pub struct RunArgs {
     /// command — for `eval "$(sc run --export-env)"` to cover the whole shell.
     #[arg(long, conflicts_with = "cmd")]
     pub export_env: bool,
-    /// Override the active vault id (whose phantoms this run resolves). Defaults
-    /// to the active vault from `~/.safeclaw/config.toml`.
-    #[arg(long)]
-    pub vault: Option<String>,
     /// The command to run, after `--`. Everything past `--` is the child's
     /// argv, passed through verbatim (`sc run -- git clone https://…`).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -255,8 +256,6 @@ pub struct ConnectArgs {
     #[arg(long)]
     pub use_existing: Vec<String>,
     #[arg(long)]
-    pub vault: Option<String>,
-    #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
     #[arg(long, env = "SAFECLAW_CB_PORT")]
@@ -291,8 +290,6 @@ pub struct ConnectionLsArgs {
     /// Emit machine-readable JSON instead of the human table.
     #[arg(long)]
     pub json: bool,
-    #[arg(long)]
-    pub vault: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -310,8 +307,6 @@ pub struct ConnectionRmArgs {
     /// references; keys other connections still reference are always kept.
     #[arg(long)]
     pub keep_secrets: bool,
-    #[arg(long)]
-    pub vault: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
@@ -418,8 +413,6 @@ pub struct ServiceAddArgs {
     /// Path to the v4 service.toml to store in the vault.
     pub path: std::path::PathBuf,
     #[arg(long)]
-    pub vault: Option<String>,
-    #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
     #[arg(long, env = "SAFECLAW_CB_PORT")]
@@ -430,8 +423,6 @@ pub struct ServiceAddArgs {
 
 #[derive(Debug, Args)]
 pub struct ServiceLsArgs {
-    #[arg(long)]
-    pub vault: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
@@ -445,8 +436,6 @@ pub struct ServiceLsArgs {
 pub struct ServiceRmArgs {
     /// The service id to delete (as shown by `sc service ls`).
     pub id: String,
-    #[arg(long)]
-    pub vault: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server (for SSH port-forwarding).
@@ -483,9 +472,10 @@ pub struct AgentArgs {
 #[derive(Debug, Subcommand)]
 pub enum AgentSubcommand {
     /// Mint a new agent identity and print its COMPLETE env (dotenv lines:
-    /// BROKER_URL / VAULT_ID / API_KEY, key shown ONCE) — the agent appends
-    /// stdout to its own `.env`. Account-level: works on any of your paired
-    /// devices.
+    /// BROKER_URL / API_KEY, key shown ONCE) — the agent appends stdout to
+    /// its own `.env`. No vault line: vault is per-call, not identity
+    /// (design/vault-addressing.md). Account-level: works on any of your
+    /// paired devices.
     Add(AgentAddArgs),
     /// List this account's agents (name, key prefix, last-used).
     Ls,
@@ -545,18 +535,21 @@ pub enum PasskeySubcommand {
 pub struct PasskeyRemoveArgs {
     /// base64url credential id (as shown in `passkeys ls`).
     pub credential_id: String,
-    #[arg(long)]
-    pub vault: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct PasskeyRenameArgs {
     pub credential_id: String,
     pub new_name: String,
-    #[arg(long)]
-    pub vault: Option<String>,
 }
 
+#[derive(Debug, Args)]
+pub struct VaultLsArgs {
+    /// Emit a JSON array (`[{url, daemon, vault, default}]`) instead of the
+    /// human list.
+    #[arg(long)]
+    pub json: bool,
+}
 
 #[derive(Debug, Subcommand)]
 pub enum VaultSubcommand {
@@ -564,8 +557,8 @@ pub enum VaultSubcommand {
     /// passkey count, secret count. Top-level alias: `sc status`.
     Status(StatusArgs),
     /// List vaults this CLI has used (from local config) + mark the
-    /// active one with `*`.
-    Ls,
+    /// device default with `*`. `--json` for scripts/agents.
+    Ls(VaultLsArgs),
     /// Switch the active vault. Pass a vault URL (`<daemon>/v/<vault_id>`),
     /// an index from `sc vault ls`, --local for the localhost default vault,
     /// or nothing for an interactive prompt.
@@ -787,8 +780,8 @@ pub struct ServeArgs {
 }
 
 /// `sc status` takes no flags — the daemon (control root) comes from
-/// `~/.safeclaw/config.toml`; the active vault is `$SAFECLAW_VAULT_ID` (env pin)
-/// else the config default (§5).
+/// `~/.safeclaw/config.toml`; the active vault is `--vault` else
+/// `$SAFECLAW_VAULT_ID` (env pin) else the config default (§5).
 #[derive(Debug, Args)]
 pub struct StatusArgs {
     /// Emit machine-readable JSON (daemon + vault state, the vault selection —
@@ -799,19 +792,10 @@ pub struct StatusArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct SyncArgs {
-    /// Vault id (defaults to the active vault).
-    #[arg(long)]
-    pub vault: Option<String>,
-}
+pub struct SyncArgs {}
 
 #[derive(Debug, Args)]
 pub struct UnlockArgs {
-    /// Override the vault id (otherwise `$SAFECLAW_VAULT_ID` env pin, else the
-    /// `~/.safeclaw/config.toml` default — §5).
-    #[arg(long)]
-    pub vault: Option<String>,
-
     /// Don't try to auto-launch a browser; just print the URL.
     #[arg(long)]
     pub no_browser: bool,
@@ -893,19 +877,13 @@ pub struct LogoutArgs {
 /// root comes from the shared derivation (env `$SAFECLAW_BROKER_URL` host >
 /// config > default); `--vault` only reselects the vault id on that daemon.
 #[derive(Debug, Args)]
-pub struct CommonArgs {
-    #[arg(long)]
-    pub vault: Option<String>,
-}
+pub struct CommonArgs {}
 
 #[derive(Debug, Args)]
 pub struct GetArgs {
     /// Secret key to reveal, from any store (native or external), matched
     /// case-SENSITIVELY (`sc get OPENAI_API_KEY`; external keys verbatim).
     pub key: String,
-
-    #[arg(long)]
-    pub vault: Option<String>,
 
     #[arg(long)]
     pub no_browser: bool,
@@ -938,8 +916,6 @@ pub struct SetArgs {
     #[arg(long, conflicts_with = "host")]
     pub no_broker: bool,
     #[arg(long)]
-    pub vault: Option<String>,
-    #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server. When set, the CLI
     /// always binds to this port (useful for SSH port-forwarding).
@@ -959,8 +935,6 @@ pub struct RmArgs {
     /// re-added. Required off a terminal; interactive runs prompt instead.
     #[arg(long)]
     pub force: bool,
-    #[arg(long)]
-    pub vault: Option<String>,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server. When set, the CLI

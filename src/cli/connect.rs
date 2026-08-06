@@ -32,7 +32,7 @@ use crate::service::ServiceRegistry;
 use crate::storage::plaintext::suggested_secret_key;
 
 pub async fn run(mut args: ConnectArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
 
     // Resolve the connection id: slugify a provided handle, or (no id given) run
     // the TTY wizard — which prompts the id and may also pick a `--service`.
@@ -110,7 +110,7 @@ fn resolve_conn_id(args: &mut ConnectArgs) -> Result<String, String> {
 /// `sc connection ls` — the agent-usable connection projection (the same rows
 /// `sc status` prints), optionally as JSON.
 pub async fn run_ls(args: ConnectionLsArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     let conns = crate::cli::discovery::connections(&custodian, &vault).await?;
 
     if args.json {
@@ -152,7 +152,7 @@ pub async fn run_ls(args: ConnectionLsArgs) -> Result<(), String> {
 /// `--keep-secrets` keeps everything (unreference only). Two passkey gestures
 /// (unlock + write); confirms first unless `--yes`.
 pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     let id = slugify_conn_id(&args.id);
     if id.is_empty() {
         return Err(format!("'{}' is not a valid connection id", args.id));

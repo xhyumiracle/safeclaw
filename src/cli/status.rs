@@ -149,16 +149,20 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
     let control = crate::cli::active::control_root(&cfg);
     let d = probe_local_daemon(&control).await;
 
-    // Vault resolution mirrors `resolve_active` (§5): `--vault` isn't a status
-    // arg, so it's env-pin > config default. Surface BOTH so a shell pinned to a
+    // Vault resolution mirrors `resolve_active` (§5): global `--vault` flag >
+    // env pin > config default. Surface pin AND default so a shell pinned to a
     // different vault than the device default is legible (no coined verdict — the
     // facts). Routing DETECTION is gone (§9): the broker is opt-in, the agent
     // routes explicitly with `sc run`, so there's no "am I routed?" to report.
+    let flag = crate::cli::active::vault_flag();
     let env_pin = std::env::var("SAFECLAW_VAULT_ID")
         .ok()
         .filter(|s| !s.is_empty());
     let config_default = cfg.vault.clone();
-    let active_vault = env_pin.clone().or_else(|| config_default.clone());
+    let active_vault = flag
+        .clone()
+        .or_else(|| env_pin.clone())
+        .or_else(|| config_default.clone());
 
     let vault = match active_vault.as_deref() {
         Some(v) => Some(fetch_status(&control, v).await),
@@ -249,11 +253,14 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
         }
     }
     // Pin-vs-config (§5): flag a shell pinned to a different vault than the device
-    // default so a surprising `sc` target is legible.
-    if let (Some(pin), Some(def)) = (env_pin.as_deref(), config_default.as_deref()) {
-        if pin != def {
-            println!("  note:  this shell is pinned to {} via $SAFECLAW_VAULT_ID; the device default is {}", pin, def);
-            println!("         unset SAFECLAW_VAULT_ID (or re-run `eval \"$(sc env)\"`) to follow the default");
+    // default so a surprising `sc` target is legible. Suppressed under an explicit
+    // `--vault` (a deliberate per-call choice needs no warning).
+    if flag.is_none() {
+        if let (Some(pin), Some(def)) = (env_pin.as_deref(), config_default.as_deref()) {
+            if pin != def {
+                println!("  note:  this shell is pinned to {} via $SAFECLAW_VAULT_ID; the device default is {}", pin, def);
+                println!("         unset SAFECLAW_VAULT_ID to follow the default");
+            }
         }
     }
     // Connections are NOT shown here: while the vault is locked they can't be

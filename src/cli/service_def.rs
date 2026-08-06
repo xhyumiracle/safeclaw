@@ -48,7 +48,7 @@ pub async fn run_validate(args: ServiceValidateArgs) -> Result<(), String> {
 /// grant op. One passkey gesture; over SSH it surfaces the cloud grant link (no
 /// browser tunnel, no local WebAuthn ceremony). The daemon re-validates + seals.
 pub async fn run_add(args: ServiceAddArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     let toml_str = std::fs::read_to_string(&args.path)
         .map_err(|e| format!("cannot read {}: {}", args.path.display(), e))?;
 
@@ -100,7 +100,7 @@ pub async fn run_add(args: ServiceAddArgs) -> Result<(), String> {
 /// orphaned def is invisible everywhere but here. One passkey gesture (over SSH:
 /// the cloud grant link).
 pub async fn run_ls(args: ServiceLsArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     let op = json!({
         "act": { "type": { "custom": "service-ls" }, "target": "", "scope": null },
         "bind": { "redeemer": vault },
@@ -168,7 +168,7 @@ pub async fn run_ls(args: ServiceLsArgs) -> Result<(), String> {
 /// away) and reported so we can warn. One passkey gesture (over SSH: the cloud
 /// grant link).
 pub async fn run_rm(args: ServiceRmArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     let op = json!({
         "act": { "type": { "custom": "service-rm" }, "target": args.id, "scope": null },
         "bind": { "redeemer": vault },

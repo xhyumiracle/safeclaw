@@ -78,7 +78,6 @@ pub async fn ensure_unlocked() -> Result<(), String> {
 
     if should_attempt_unlock(&status.state) {
         let args = UnlockArgs {
-            vault: None,
             no_browser: false,
             cb_port: settings_cb_port(),
             timeout: 120,

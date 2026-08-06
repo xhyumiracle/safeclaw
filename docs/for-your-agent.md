@@ -36,8 +36,11 @@ this repo into their skills directory.
 | Var | Meaning |
 |---|---|
 | `SAFECLAW_BROKER_URL` | The local broker, e.g. `http://127.0.0.1:23294` |
-| `SAFECLAW_VAULT_ID` | Which vault its requests resolve against |
 | `SAFECLAW_API_KEY` | The agent's bearer identity |
+
+The vault is not part of the env: each request names one in its URL
+(`/v/<vault>/…`), and `sc run` binds one per launched command
+(`sc run --vault <id> --` to pick). `sc vault ls` lists ids (`*` = default).
 
 One identity per agent keeps the audit trail attributable; don't share a key
 across agents, and don't re-run `sc agent add` when the env already exists (it
