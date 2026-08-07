@@ -16,7 +16,7 @@ block:
 
 The vault is not part of the env: each request names one in its URL
 (`/v/<vault>/…`), and `sc run` binds one per launched command
-(`sc run --vault <id> --` to pick). `sc vault ls` lists ids (`*` = default).
+(`sc run --vault <id> -- <cmd>` to pick). `sc vault ls` lists ids (`*` = default).
 
 One key per agent keeps the audit trail attributable: every brokered request
 and every approval you grant is tied to a named agent, so "which agent did
