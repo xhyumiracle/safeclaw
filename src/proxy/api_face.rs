@@ -117,10 +117,11 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
             let locked = state.is_vault_locked(&vid);
             let mut conns: Vec<Value> = Vec::new();
             if !locked {
-                let whitelist = state.agent_mask_whitelist(&vid, &agent);
-                let allow: Option<std::collections::HashSet<String>> =
-                    whitelist.map(|w| w.into_iter().collect());
                 let snapshot = state.connections_snapshot(&vid);
+                let candidates: Vec<String> = snapshot.iter().map(|(id, _)| id.clone()).collect();
+                let allowed = state.agent_allowed_connections(&vid, &agent, &candidates);
+                let allow: Option<std::collections::HashSet<String>> =
+                    allowed.map(|w| w.into_iter().collect());
                 for (id, conn) in snapshot {
                     let masked = allow.as_ref().map(|a| !a.contains(&id)).unwrap_or(false);
                     let mut row = json!({ "id": id, "service": conn.service });

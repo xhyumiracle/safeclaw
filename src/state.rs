@@ -1354,16 +1354,31 @@ impl AppState {
         }
     }
 
-    /// The full mask verdict set for one agent: `None` = unrestricted,
-    /// `Some(set)` = fail-closed whitelist. Used by the registry/vaults
+    /// Which of `candidates` this agent is ALLOWED to reach in this vault —
+    /// evaluated through `AgentMask::allows` so the blacklist, the legacy
+    /// whitelist and `All` all resolve identically (team §8.1 ONE pipeline:
+    /// same verdict as the proxy deny). `None` = vault locked OR the agent has
+    /// no mask entry (unrestricted → caller masks nothing); `Some(set)` = the
+    /// subset of `candidates` that stays reachable. Used by the registry/vaults
     /// surfaces to annotate rows without N lock round-trips.
-    pub fn agent_mask_whitelist(&self, vault_id: &str, agent_prefix: &str) -> Option<Vec<String>> {
+    pub fn agent_allowed_connections(
+        &self,
+        vault_id: &str,
+        agent_prefix: &str,
+        candidates: &[String],
+    ) -> Option<Vec<String>> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => cache
-                .agents
-                .get(agent_prefix)
-                .and_then(|e| e.connections.selected().map(|s| s.to_vec())),
+            Some(VaultState::Unlocked { cache, .. }) => {
+                let entry = cache.agents.get(agent_prefix)?; // absent = unrestricted
+                Some(
+                    candidates
+                        .iter()
+                        .filter(|id| entry.connections.allows(id))
+                        .cloned()
+                        .collect(),
+                )
+            }
             _ => None,
         }
     }

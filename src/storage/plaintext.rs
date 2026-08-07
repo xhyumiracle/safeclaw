@@ -329,18 +329,27 @@ pub enum MemberRole {
 }
 
 /// A single agent's reach mask — which connections of THIS vault the agent may
-/// use (design/team §8.1). `All` is the default (absent item ≡ `All`, personal
-/// parity). `Selected` is a fail-closed whitelist: a connection added to the
-/// vault later is NOT reachable until explicitly listed. Everything else about
+/// use (design/team §8.1). The mask defaults OPEN and the console writes a
+/// BLACKLIST: `Blocked { deny }` lets the agent reach everything EXCEPT the
+/// listed connections, so a connection added to the vault later (or an unknown
+/// id) is reachable unless it is explicitly denied — fail-open by design. `All`
+/// is the default (absent item ≡ `All`, personal parity). Everything else about
 /// agent permissioning (per-request levels, approvals) stays vault-wide policy —
 /// the mask is a reach/visibility gate, deliberately not a rule tree.
+///
+/// Wire shape (untagged serde distinguishes purely by JSON shape — string vs
+/// object):
+///   `All`     → the bare string `"all"`
+///   `Blocked` → a JSON object  `{ "deny": ["a","b"] }`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", untagged)]
 pub enum AgentMask {
-    /// `"all"` — no restriction from the mask.
+    /// `"all"` — no restriction from the mask (the default; fail-open).
     All(AllTag),
-    /// Explicit whitelist of `connection_id`s.
-    Selected(Vec<String>),
+    /// Blacklist of denied `connection_id`s (wire `{ "deny": [...] }`): the
+    /// agent reaches everything EXCEPT these. Connections added later or unknown
+    /// ids are allowed (fail-open). This is what the console writes.
+    Blocked { deny: Vec<String> },
 }
 
 /// Serde helper: the `All` arm serializes as the bare string `"all"`.
@@ -357,19 +366,14 @@ impl Default for AgentMask {
 }
 
 impl AgentMask {
-    /// Does the mask let this agent reach `connection_id`?
+    /// Does the mask let this agent reach `connection_id`? THE reach verdict —
+    /// the proxy deny, the registry annotation and `GET /vaults` all read this
+    /// (team §8.1 ONE pipeline). `All` allows everything; the `Blocked` blacklist
+    /// allows everything not denied (fail-open, incl. later/unknown ids).
     pub fn allows(&self, connection_id: &str) -> bool {
         match self {
             AgentMask::All(_) => true,
-            AgentMask::Selected(list) => list.iter().any(|c| c == connection_id),
-        }
-    }
-
-    /// `None` = unrestricted; `Some(set)` = the whitelist (fail-closed).
-    pub fn selected(&self) -> Option<&[String]> {
-        match self {
-            AgentMask::All(_) => None,
-            AgentMask::Selected(list) => Some(list),
+            AgentMask::Blocked { deny } => !deny.iter().any(|c| c == connection_id),
         }
     }
 }

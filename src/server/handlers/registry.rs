@@ -648,9 +648,10 @@ pub fn vault_registry_value(
         // of "not configured") but is stripped to a minimal locked stub — no
         // hosts/secrets/phantoms.
         if let Some(agent) = agent_prefix {
-            if let Some(whitelist) = state.agent_mask_whitelist(vault_id, agent) {
+            let candidates: Vec<String> = conn_rows.iter().map(|r| r.id.clone()).collect();
+            if let Some(allowed) = state.agent_allowed_connections(vault_id, agent, &candidates) {
                 use std::collections::HashSet as MaskSet;
-                let allow: MaskSet<&str> = whitelist.iter().map(|s| s.as_str()).collect();
+                let allow: MaskSet<&str> = allowed.iter().map(|s| s.as_str()).collect();
                 for row in conn_rows.iter_mut() {
                     if !allow.contains(row.id.as_str()) {
                         row.hosts.clear();

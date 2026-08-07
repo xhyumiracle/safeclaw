@@ -2369,21 +2369,43 @@ mod tests {
     }
 
     #[test]
-    fn agent_mask_serde_all_and_selected() {
-        use crate::storage::plaintext::AgentEntry;
-        // "all" round-trips as the bare string; a list stays a list.
+    fn agent_mask_serde_all_and_blocked() {
+        use crate::storage::plaintext::{AgentEntry, AgentMask};
+        // Untagged serde distinguishes the two variants purely by JSON shape:
+        // string "all" → All, object { "deny": [...] } → Blocked.
+
+        // Default / "all" round-trips as the bare string; allows everything.
         let all: AgentEntry = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(all.connections.allows("anything"));
+        assert!(matches!(all.connections, AgentMask::All(_)), "default = All");
         assert_eq!(
             serde_json::to_value(&AgentEntry::default()).unwrap(),
             serde_json::json!({ "connections": "all" })
         );
-        let sel: AgentEntry =
-            serde_json::from_value(serde_json::json!({ "connections": ["github-work"] })).unwrap();
-        assert!(sel.connections.allows("github-work"));
-        assert!(!sel.connections.allows("stripe-live"), "fail-closed");
-        let back = serde_json::to_value(&sel).unwrap();
-        assert_eq!(back, serde_json::json!({ "connections": ["github-work"] }));
+
+        // Blacklist: an object `{ "deny": [...] }` → Blocked; allows everything
+        // EXCEPT the denied ids (fail-open — later/unknown ids stay reachable).
+        let blk: AgentEntry =
+            serde_json::from_value(serde_json::json!({ "connections": { "deny": ["stripe-live"] } }))
+                .unwrap();
+        assert!(matches!(blk.connections, AgentMask::Blocked { .. }), "object → Blocked");
+        assert!(!blk.connections.allows("stripe-live"), "denied conn refused");
+        assert!(blk.connections.allows("github-work"), "non-listed conn allowed");
+        assert!(
+            blk.connections.allows("added-later-conn"),
+            "unknown/new conn allowed (fail-open)"
+        );
+        let back = serde_json::to_value(&blk).unwrap();
+        assert_eq!(back, serde_json::json!({ "connections": { "deny": ["stripe-live"] } }));
+
+        // Direct allows() matrix, independent of AgentEntry wrapping.
+        assert!(AgentMask::default().allows("x"), "default = All");
+        assert!(AgentMask::Blocked { deny: vec!["a".into()] }.allows("b"));
+        assert!(!AgentMask::Blocked { deny: vec!["a".into()] }.allows("a"));
+        assert!(
+            AgentMask::Blocked { deny: vec![] }.allows("anything"),
+            "empty deny = allow all"
+        );
     }
 
     // T1 addressing: config singletons ride single `aux:<name>` blobs
@@ -2415,9 +2437,11 @@ mod tests {
         aux.agents.insert(
             "ag_alice".into(),
             AgentEntry {
-                connections: AgentMask::Selected(vec!["gmail".into()]),
+                connections: AgentMask::Blocked {
+                    deny: vec!["stripe".into()],
+                },
             },
-        );
+        ); // blacklist
         aux.agents.insert("ag_bob".into(), AgentEntry::default()); // "all"
         let view = crate::storage::plaintext::VaultPlaintextView {
             aux,
@@ -2431,10 +2455,25 @@ mod tests {
             .fold_view::<StdPrimitives>(VaultKeys::single(&k), vid)
             .unwrap();
         assert_eq!(folded.aux.policy.as_ref().unwrap().timeout, Some(222));
-        assert!(folded.aux.agents["ag_alice"].connections.allows("gmail"));
+        // Blacklist survives the seed → fold round-trip: denied conn refused,
+        // everything else (incl. ids never listed) allowed (fail-open).
+        assert!(matches!(
+            folded.aux.agents["ag_alice"].connections,
+            AgentMask::Blocked { .. }
+        ));
         assert!(
             !folded.aux.agents["ag_alice"].connections.allows("stripe"),
-            "fail-closed"
+            "blacklist denies"
+        );
+        assert!(
+            folded.aux.agents["ag_alice"].connections.allows("gmail"),
+            "blacklist allows non-denied"
+        );
+        assert!(
+            folded.aux.agents["ag_alice"]
+                .connections
+                .allows("added-later-conn"),
+            "blacklist allows unknown/new (fail-open)"
         );
         assert!(
             folded.aux.agents["ag_bob"].connections.allows("anything"),
