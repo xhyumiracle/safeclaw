@@ -7,6 +7,8 @@ reads, a request header, a config file) and run that command through `sc run --`
 SafeClaw swaps the phantom for the real value on the way out, only toward that
 connection's own `hosts`. The user approves anything sensitive with a passkey tap.
 
+Any tool works.
+
 Only traffic you deliberately route through `sc run` is touched; everything else
 goes straight out untouched. A phantom sent unrouted just reaches the upstream as
 a literal string (a clean 401), never a leak.
