@@ -5,6 +5,24 @@ One coherent wave: replace the two BEARER credentials (agent api-key, device pai
 possession-proven **keypair identities**, verified by **mutual mTLS**, symmetric in naming /
 paths / lifecycle. No loose ends, no half-migration. Code AFTER this doc.
 
+**Status update 2026-08-10:** the agent-authorization model was reworked to its simplest stable
+form. **GROUND TRUTH = §11 (LOCKED 2026-08-10)** for authz + connect/install flows; §1/§4/§5/§6/§7/§8
+still hold for mTLS / multi-agent / naming / migration / threat model; **§2/§3 admission framing is
+SUPERSEDED by §11.** Diagram: `design/identity-protocol.svg`. Post-compact execution plan: §11.6 +
+§9.
+
+### Decision log (what · why · why-not · reversals — one line each)
+- **AIK/DIK/UIK = Ed25519 keypairs, id = fold(pubkey)** · self-certifying, server can't swap a key behind an id · not bearers (injectable/replayable).
+- **Auth = mutual mTLS both hops** (AIK client cert to daemon; DIK to cloud) · a big-co reviewer named requestor-identity-check = mTLS · not a bearer, not per-op signing.
+- **hop-A needs the `sc` transport to present the cert** (generic HTTP clients can't client-cert an HTTPS proxy via env) · faithful to "sc transport does the mTLS" · NOT a data-path change the agent sees.
+- **hop-B realized as a DIK-signed request** when the cloud sits behind TLS-terminating hosting · same mutual-auth outcome · literal TLS-client-cert not available there.
+- **Authz = explicit in-vault authorized-agents TABLE, UIK-signed; daemon reads ONLY it** (§11) · one server-blind source, no trust in a server agent→account map · REVERSED two earlier tries: "presence = admitted grant" (Phase-1) and "membership-derived admission" (interim) — both needed a mode/join; the table is simpler + stable.
+- **Dropped open/gated modes** · a permanent two-state toggle to solve a one-time migration is complexity-for-nothing · the table ships WITH AIK so the legacy api-key path is untouched → nothing bricks.
+- **Account known-agents roster = management/discovery only, NOT authz** · keeps machine identity in one place (agent≡api-key) · does not entangle the daemon's authz decision.
+- **Per-member authority = the authz item's UIK signature** (fold+server verify signer ∈ {agent owner, any owner}) · reuses existing owner-config signing · not new crypto, not a fragile new "ownership marker".
+- **Authorization is Console-side, not in the agent prompt** · keeps the hard-won prompt lean · the vault(s) an agent lands on = which button the user clicked (§11.3).
+- **One passkey authorizes across many vaults** · UIK is per-account and unseals every vault's K · avoids per-vault taps.
+
 Grounded in the real (2026-08-09) architecture, verified in code:
 - The only live local brokered path is the resident **MITM egress proxy** (the old `/use` HTTP
   route is retired). Agent auth today = api-key in the `CONNECT Proxy-Authorization` Basic
@@ -75,20 +93,20 @@ Identity is bound to the connection; anything created on it (an op) inherits the
 --------------------------------------------------------------------------------
 ## 3. Agent access = 2 layers, not 3 (first-principles, user-corrected)
 
-The mask is enforced on the agent's **owner-member's own daemon** (which holds that member's K),
-so an agent's reach is **always ⊆ its owner-member** — it can never escalate. Therefore:
-1. **Account layer: the agent exists** (mint/revoke the AIK; account-wide). Irreducible.
-2. **Vault layer: ONE grant per (agent, vault) = its reach here.** "Admission" and "mask" are the
-   SAME grant object, not two layers: **present = admitted (whitelist, fail-closed → clean revoke);
-   the grant's deny-list = which connections (new ones stay open for an admitted agent).**
+> ⛔ **SUPERSEDED by §11 (LOCKED 2026-08-10).** The "presence = admitted grant" framing below
+> (and the later interim "membership-derived admission") are replaced by an explicit **in-vault
+> authorized-agents TABLE** (per item: `{ag_pubkey, owner us_, mask}`, UIK-signed) that is the
+> daemon's ONLY authz source, plus an account **known-agents roster** that is management-only.
+> Read §11. The paragraphs below are kept for lineage.
 
-- **Who authorizes:** a **member self-authorizes their OWN agents** (safe — agent ⊆ that member,
-  grants nothing new); an **owner** can admit/revoke ANY agent + override masks.
-- **Storage:** the grant lives in the E2E vault, **one current-state record per agent** (NOT an
-  append-only per-action log — that was wrongly copied from the owner delegation log; the owner
-  log guards K, agent grants don't). Per-agent signing is OPTIONAL hardening (least-privilege
-  integrity vs a co-member), NOT a boundary; **v1 unsigned E2E is fine** (bounded by agent ⊆ member).
-- **Revoke = drop the grant. NO re-key** (the agent never held K). Contrast member offboard (re-keys).
+Durable truths kept from this section: an agent's reach is **always ⊆ its owner-member** (the mask
+runs on that member's own daemon, which holds K, so an agent can never escalate); **revoke = drop
+the authorization, NO re-key** (the agent never held K — contrast member offboard, which re-keys).
+
+Lineage (why the rest was dropped, one line): the earlier "one grant object where *presence* =
+admitted (fail-closed) + deny-list mask, v1 UNSIGNED" was superseded by §11 — it left the
+"no-grant default" ambiguous (spawning the open/gated wart) and unsigned grants gave no per-member
+authority. §11's **UIK-signed in-vault table** fixes both with existing machinery.
 
 --------------------------------------------------------------------------------
 ## 4. Multiple agents: unaware · unmixable · safer
@@ -218,3 +236,68 @@ user's batch e2e. See `IDENTITY_WAVE_BUILD_LOG.md` (repo root) for the decision 
 - Remote-agent → cloud-broker path — future, gated (no such path today).
 - Per-op agent signatures — optional audit hardening; mutual mTLS on the connection is the base.
 - UIK changes — untouched here (that's the unified-identity-schema wave).
+
+--------------------------------------------------------------------------------
+## 11. Agent authorization & connect/install flows (LOCKED 2026-08-10)
+
+Reasoned to its simplest stable form with the user. **Supersedes** the admission framing in
+§2/§3: dropped are open/gated modes, "presence = admitted" (Phase-1 build), and the interim
+"membership-derived admission." The model below is the ground truth.
+
+### 11.1 One authoritative authorization source
+- **Account known-agents roster** (server, plaintext): the account's agents — `ag_` pubkey +
+  label + owner account. Minted/registered by `sc agent add` over the device (DIK) channel
+  (no K). **Management + discovery ONLY — never the daemon's authz source.**
+- **Vault authorized-agents TABLE** (E2E, inside the encrypted blob): per authorized agent an item
+  `{ ag_pubkey, owner us_, mask }`, **signed by the owning member's UIK**. **This is the daemon's
+  ONLY authz source:** presented AIK (mTLS client cert) → its pubkey ∈ this table → apply that
+  item's connection mask. No server join, no membership derivation, nothing else consulted.
+- **Revoke** = remove the item (E2E write). **No re-key** (agent never held K).
+- **Per-member authority** = the item's UIK signature IS the ownership/authority marker. The fold
+  (daemon) + the server write-gate verify the signer ∈ { the agent's owner-member, any owner }: a
+  member may add/modify/remove items only for their OWN agents; an owner overrides any. This REUSES
+  the existing owner-config signing machinery (§ config_sig) — no new crypto, no new fragility.
+- Writing the table needs **K** (unlocked session). One passkey unwraps the **per-account UIK**,
+  which unseals every vault's K → one gesture can write authz across multiple vaults.
+
+### 11.2 Auth = mutual mTLS (both hops) — §1 unchanged
+hop-A: sc presents AIK client cert; daemon verifies + checks pubkey ∈ the vault table.
+hop-B: daemon presents DIK; cloud verifies `dev_` ∈ authorized-devices (through a TLS-terminating
+host, realized as a DIK-signed request — the app-layer equivalent).
+
+### 11.3 The authz primitive surfaces at 4 natural moments (all write the same UIK-signed items)
+1. **Connect a new agent** (account · `/access`): intent = an agent for my account → default
+   authorize on **all my vaults** (multi = my vaults, default all). One passkey.
+2. **Install an agent on a vault** (a vault surface): intent = an agent here → authorize **this
+   vault only** (rides the current unlocked session; else one passkey).
+3. **Create OR join a vault**: offer "allow these agents to use this vault" = multi-select **my
+   agents, default all**, in the same passkey session as create/seal or join.
+4. **Agents tab**: the ongoing management grid (per-agent × per-vault; revoke / mask).
+
+### 11.4 Connect/install prompt + modal (build on the existing polished prompt)
+- The agent-run prompt is ~unchanged (pair device [skip if paired] · `sc agent add` mints the
+  identity env · persist skill + instructions · don't test). Only wording tweak: "three
+  SAFECLAW_* dotenv lines" → "your complete SafeClaw env" (now includes the identity-file path).
+- **Authorization is Console-side, NOT in the prompt.** Which vault(s) an agent lands on = which
+  entry the user used (§11.3); the Console performs the UIK-signed write automatically when it
+  detects the new agent in the roster (poll). The hard-won prompt stays lean.
+- Modal: a clean "keep this open while your agent connects — it authorizes automatically" hint;
+  on done, "✓ Connected and authorized on <scope>."
+- Edge (modal closed before the agent finished): the agent appears in the Agents tab as
+  "not authorized here · Authorize" — a one-click fallback, not the main path.
+
+### 11.5 Three orthogonal actions, kept separate but each a one-click intent
+1. register agent to account (mint · `sc agent add` · DIK channel · no K),
+2. authorize agent in vault(s) (E2E · UIK-signed · K-gated) — surfaced at the 4 moments above,
+3. point an agent at a vault (runtime config: vault id / `--vault`).
+Device pairing (`sc login`) is the separate device-level action; the prompt folds it in
+idempotently ("skip if paired").
+
+### 11.6 Build deltas vs the Phase-1 checkpoint on `feat/identity-wave`
+- Key the vault authz item by `ag_` pubkey (not api-key prefix); add `owner us_` + UIK signature;
+  fold/server verify signer authority. Drop `AgentAdmission` open/gated entirely (default is now
+  simply "not in the table = not authorized"; nothing bricks because the table ships WITH AIK —
+  the legacy api-key path is untouched until bearers retire).
+- Daemon authz consult reads ONLY the in-vault table (remove the derived/admission-mode logic).
+- Console: the authz primitive component (multi-select) at the 4 moments; modal keep-open hint;
+  vault-create/join multi-select "allow my agents (default all)."

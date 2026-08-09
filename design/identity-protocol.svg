@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 940" width="1240" height="940" role="img">
+  <title>SafeClaw identity protocol: UIK/AIK/DIK keypairs, mutual TLS on each hop, the in-vault authorized-agents table as the daemon's only authorization source, and where each verifier fetches the public key.</title>
+  <style>
+    text{font-family:-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',Roboto,Helvetica,Arial,sans-serif}
+    .cap{font-size:13px;letter-spacing:.16em;fill:#8f7a52;font-weight:700}
+    .zone{font-size:11px;letter-spacing:.14em;fill:#71717a;font-weight:600;text-anchor:middle}
+    .bt{font-size:16px;font-weight:700;fill:#e7e7ea}
+    .bd{font-size:12px;fill:#a1a1aa}
+    .bg2{font-size:12px;fill:#c9a96e}
+    .lb{font-size:11px;fill:#8a8a93}
+    .gl{font-size:11.5px;fill:#c9a96e}
+    .grn{font-size:11.5px;fill:#7fd1ae}
+    .dim{font-size:11px;fill:#6b6b74}
+    .mono{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace}
+    .code{font-size:11px;fill:#cdb488}
+    .num{font-size:11px;font-weight:700;fill:#c9a96e;text-anchor:middle}
+    .mid{text-anchor:middle}
+    .kt{font-size:11.5px;font-weight:800}
+  </style>
+  <defs>
+    <marker id="ag" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#c9a96e"/></marker>
+    <marker id="gg" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#6b6b74"/></marker>
+    <marker id="gn" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#7fd1ae"/></marker>
+    <marker id="bl" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#7aa2f7"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1240" height="940" rx="24" fill="#0b0b0d"/>
+  <text x="40" y="46" class="cap">SAFECLAW · 身份协议 (UIK · AIK · DIK) · mTLS 每一跳 · 库内授权表 = 唯一授权源</text>
+
+  <!-- key legend strip -->
+  <g transform="translate(40,66)">
+    <rect x="0" y="0" width="1160" height="46" rx="10" fill="#141417" stroke="#ffffff14"/>
+    <g transform="translate(16,17)">
+      <rect x="0" y="-11" width="66" height="22" rx="6" fill="#7aa2f71f" stroke="#7aa2f74d"/><text x="33" y="4" class="kt mid" fill="#7aa2f7">UIK us_</text>
+      <text x="76" y="4" class="bd">人 · 签 role/config/授权项 · K 用它公钥加密(封)</text>
+    </g>
+    <g transform="translate(470,17)">
+      <rect x="0" y="-11" width="64" height="22" rx="6" fill="#c9a96e1f" stroke="#c9a96e52"/><text x="32" y="4" class="kt mid" fill="#c9a96e">AIK ag_</text>
+      <text x="74" y="4" class="bd">agent · mTLS 客户端身份</text>
+    </g>
+    <g transform="translate(800,17)">
+      <rect x="0" y="-11" width="66" height="22" rx="6" fill="#7fd1ae1f" stroke="#7fd1ae4d"/><text x="33" y="4" class="kt mid" fill="#7fd1ae">DIK dev_</text>
+      <text x="76" y="4" class="bd">设备 · mTLS 客户端身份</text>
+    </g>
+    <text x="1150" y="21" class="dim" text-anchor="end">🔑 私钥 · 🔒 密文 · ✔ 验</text>
+  </g>
+
+  <!-- ============ MACHINE trust zone ============ -->
+  <rect x="40" y="140" width="880" height="440" rx="16" fill="none" stroke="#3a3a40" stroke-dasharray="5 5"/>
+  <text x="480" y="164" class="zone">本地机器 · 信任域(明文只在这里出现)</text>
+
+  <!-- Agent -->
+  <rect x="60" y="186" width="210" height="120" rx="13" fill="#161619" stroke="#ffffff12"/>
+  <text x="78" y="214" class="bt">Agent 进程</text>
+  <text x="78" y="238" class="bd">LLM + skills</text>
+  <text x="78" y="262" class="bd">用 proxy env,只见 phantom;</text>
+  <text x="78" y="280" class="bd">私钥永不进它的环境。</text>
+
+  <!-- sc -->
+  <rect x="330" y="186" width="230" height="120" rx="13" fill="#161619" stroke="#ffffff12"/>
+  <text x="348" y="214" class="bt">sc 传输 / sc run</text>
+  <text x="348" y="238" class="bd">传输侧持 <tspan class="mono code">AIK</tspan>,与 daemon</text>
+  <text x="348" y="256" class="bd">做 mTLS(出示客户端证书)。</text>
+  <rect x="348" y="270" width="86" height="22" rx="6" fill="#c9a96e1f" stroke="#c9a96e52"/><text x="391" y="285" class="kt mid" fill="#c9a96e">🔑 AIK ag_</text>
+
+  <!-- identity files (disk) -->
+  <rect x="330" y="330" width="230" height="106" rx="13" fill="#101013" stroke="#c9a96e33" stroke-dasharray="4 3"/>
+  <text x="348" y="354" class="bg2">身份文件 · 磁盘 0600</text>
+  <text x="348" y="377" class="code mono">agents/&lt;名&gt;/identity</text>
+  <text x="544" y="377" class="dim" text-anchor="end">AIK ag_</text>
+  <text x="348" y="397" class="code mono">device/identity</text>
+  <text x="544" y="397" class="dim" text-anchor="end">DIK dev_</text>
+  <text x="348" y="420" class="dim">sc 读 AIK · daemon 读 DIK</text>
+
+  <!-- daemon / broker -->
+  <rect x="620" y="186" width="280" height="230" rx="13" fill="#161619" stroke="#c9a96e40"/>
+  <text x="638" y="214" class="bt">本地 daemon · broker</text>
+  <text x="638" y="234" class="bg2">唯一见明文处</text>
+  <rect x="638" y="246" width="70" height="22" rx="6" fill="#b48ef01f" stroke="#b48ef04d"/><text x="673" y="261" class="kt mid" fill="#b48ef0">🔓 K</text>
+  <rect x="716" y="246" width="92" height="22" rx="6" fill="#7fd1ae1f" stroke="#7fd1ae4d"/><text x="762" y="261" class="kt mid" fill="#7fd1ae">🔑 DIK dev_</text>
+  <text x="638" y="292" class="bd">① 验 AIK 客户端证书(mTLS)</text>
+  <text x="638" y="312" class="bd">② ag_ pk ∈ 本库 authorized-agents 表?</text>
+  <text x="654" y="330" class="dim">(表在库内密文;daemon 只看它,不看 server)</text>
+  <text x="638" y="350" class="bd">③ 过该项里的连接 mask</text>
+  <text x="638" y="370" class="bd">④ 用 <tspan class="mono code">K</tspan> 解封真实凭证 → 注入出站</text>
+  <text x="638" y="396" class="dim">K 从云端拉密文,用 UIK 解出,仅驻内存</text>
+
+  <!-- service (outside zone) -->
+  <rect x="960" y="186" width="250" height="120" rx="13" fill="#161619" stroke="#ffffff12"/>
+  <text x="978" y="214" class="bt">第三方服务</text>
+  <text x="978" y="238" class="code mono">api.github.com · api.stripe.com …</text>
+  <text x="978" y="264" class="bd">收到注入了真实凭证的</text>
+  <text x="978" y="282" class="bd">普通请求。</text>
+
+  <!-- arrows row (y~246) -->
+  <line x1="270" y1="246" x2="326" y2="246" stroke="#6b6b74" stroke-width="2" marker-end="url(#gg)"/>
+  <circle cx="298" cy="230" r="9" fill="#0b0b0d" stroke="#c9a96e"/><text x="298" y="234" class="num">1</text>
+  <text x="298" y="212" class="lb mid">明文 phantom</text>
+
+  <line x1="560" y1="246" x2="616" y2="246" stroke="#c9a96e" stroke-width="2.5" marker-end="url(#ag)"/>
+  <circle cx="588" cy="230" r="9" fill="#0b0b0d" stroke="#c9a96e"/><text x="588" y="234" class="num">2</text>
+  <text x="588" y="212" class="gl mid">hop-A · mTLS</text>
+
+  <line x1="900" y1="246" x2="956" y2="246" stroke="#c9a96e" stroke-width="2.5" marker-end="url(#ag)"/>
+  <circle cx="928" cy="230" r="9" fill="#0b0b0d" stroke="#c9a96e"/><text x="928" y="234" class="num">3</text>
+  <text x="928" y="212" class="gl mid">注入真实凭证</text>
+
+  <!-- disk -> sc (read AIK) -->
+  <line x1="445" y1="330" x2="445" y2="308" stroke="#c9a96e" stroke-width="1.6" marker-end="url(#ag)"/>
+  <!-- disk -> daemon (read DIK) -->
+  <path d="M560 388 C 592 388, 600 300, 618 300" fill="none" stroke="#7fd1ae" stroke-width="1.6" marker-end="url(#gn)"/>
+
+  <!-- hop-A note -->
+  <text x="580" y="470" class="gl mid">② hop-A = mTLS:sc 出示 AIK 客户端证书 → daemon 验证书,再查 ag_ pk 是否在本库授权表。</text>
+  <text x="580" y="488" class="dim mid">sc 是传输(持 AIK);子进程照旧走 proxy,私钥不进它的环境、不上网。</text>
+
+  <!-- ============ hop-B down to cloud ============ -->
+  <path d="M760 416 C 760 470, 620 500, 620 616" fill="none" stroke="#7fd1ae" stroke-width="2.5" marker-end="url(#gn)"/>
+  <circle cx="686" cy="520" r="9" fill="#0b0b0d" stroke="#7fd1ae"/><text x="686" y="524" class="num" fill="#7fd1ae">4</text>
+  <text x="700" y="512" class="grn">hop-B = mTLS:daemon 出示 DIK</text>
+  <text x="700" y="530" class="dim">云端验 dev_ pk ∈ authorized-devices</text>
+  <text x="700" y="548" class="dim">(托管平台终结 TLS 时,实现为 DIK 签名请求)</text>
+
+  <!-- ============ CLOUD zone ============ -->
+  <rect x="330" y="616" width="590" height="286" rx="16" fill="none" stroke="#2f3a4a" stroke-dasharray="5 5"/>
+  <text x="625" y="640" class="zone">云端 · Cloud Backend(零信任,看不到 K/明文)</text>
+
+  <rect x="352" y="656" width="546" height="224" rx="13" fill="#12141a" stroke="#ffffff12"/>
+  <text x="372" y="684" class="bt">Cloud Backend · 只存密文 + 名册</text>
+  <text x="372" y="708" class="bd">🔒 <tspan fill="#e7e7ea">密文 blob</tspan>(E2E Vault)· daemon 拉后本地用 K 解;内含:</text>
+  <text x="388" y="730" class="bd">· membership:成员 <tspan class="mono code">us_</tspan>+role;K 已 HPKE <tspan fill="#b48ef0">封给各成员 UIK 公钥</tspan></text>
+  <text x="388" y="752" class="bd">· <tspan fill="#7fd1ae">authorized-agents 表</tspan>:ag_ pk + owner + mask,<tspan fill="#7aa2f7">成员 UIK 签</tspan></text>
+  <text x="404" y="770" class="dim">= daemon 的唯一授权源</text>
+  <text x="372" y="792" class="bd">🗂 <tspan fill="#e7e7ea">known-agents 名册</tspan> · authorized-devices(dev_ pk)<tspan class="dim"> — 管理用,非授权源</tspan></text>
+  <line x1="372" y1="806" x2="878" y2="806" stroke="#ffffff12"/>
+  <text x="372" y="828" class="grn">✔ 每个 daemon 请求先验 DIK(查 authorized-devices)</text>
+  <text x="372" y="848" class="bd">→ 通过才 同步密文 / 写审计;写 config 与 authorized-agents 另验 UIK 签名</text>
+  <text x="372" y="868" class="dim">(成员只能改自己签的 agent 项;owner 可覆盖) · 撤销设备 = 删其 dev_ pk</text>
+
+  <!-- ============ Console / browser ============ -->
+  <rect x="40" y="616" width="270" height="286" rx="16" fill="#161619" stroke="#7aa2f733"/>
+  <text x="60" y="644" class="bt">浏览器 · Console</text>
+  <rect x="60" y="656" width="88" height="22" rx="6" fill="#7aa2f71f" stroke="#7aa2f74d"/><text x="104" y="671" class="kt mid" fill="#7aa2f7">🔑 UIK us_</text>
+  <text x="60" y="700" class="bd">passkey WebAuthn(PRF)</text>
+  <text x="60" y="718" class="dim">→ 解 custody 包裹</text>
+  <text x="60" y="736" class="bd">→ 得 UIK 私钥 → 解封 <tspan fill="#b48ef0">K</tspan></text>
+  <text x="60" y="762" class="bd">授权 agent 进库(要 K):</text>
+  <text x="60" y="780" class="bd">写 authorized-agents 项</text>
+  <text x="60" y="798" class="bd">(UIK 签),可选「本库/我所有库」。</text>
+  <text x="60" y="824" class="dim">custody→UIK→K,层层解封;</text>
+  <text x="60" y="842" class="dim">私钥只在会话内。</text>
+
+  <!-- console -> cloud (E2E writes) -->
+  <line x1="310" y1="742" x2="348" y2="742" stroke="#7aa2f7" stroke-width="2" marker-end="url(#bl)"/>
+  <circle cx="329" cy="726" r="9" fill="#0b0b0d" stroke="#7aa2f7"/><text x="329" y="730" class="num" fill="#7aa2f7">5</text>
+  <text x="329" y="710" class="lb mid">E2E 写</text>
+
+  <!-- cloud -> daemon (pull ciphertext) thin -->
+  <path d="M700 656 C 720 560, 830 470, 840 416" fill="none" stroke="#6b6b74" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#gg)"/>
+  <text x="835" y="470" class="dim" text-anchor="end">拉密文↑</text>
+
+  <!-- ============ verify panel ============ -->
+  <rect x="940" y="616" width="260" height="286" rx="16" fill="#141417" stroke="#ffffff14"/>
+  <text x="960" y="644" class="cap" style="font-size:11px">谁来验 · 公钥从哪取</text>
+
+  <rect x="958" y="660" width="60" height="20" rx="6" fill="#c9a96e1f" stroke="#c9a96e52"/><text x="988" y="674" class="kt mid" fill="#c9a96e">AIK</text>
+  <text x="960" y="700" class="bd">本地 daemon 验 mTLS 证书。</text>
+  <text x="960" y="718" class="dim">ag_ pk 直接查本库</text>
+  <text x="960" y="734" class="dim">authorized-agents 表(E2E,</text>
+  <text x="960" y="750" class="dim">daemon 已持);不看 server。</text>
+
+  <rect x="958" y="766" width="60" height="20" rx="6" fill="#7fd1ae1f" stroke="#7fd1ae4d"/><text x="988" y="780" class="kt mid" fill="#7fd1ae">DIK</text>
+  <text x="960" y="806" class="bd">Cloud 验请求。</text>
+  <text x="960" y="822" class="dim">dev_ pk 取自 authorized-</text>
+  <text x="960" y="838" class="dim">devices;过了才动数据库。</text>
+
+  <rect x="958" y="852" width="60" height="20" rx="6" fill="#7aa2f71f" stroke="#7aa2f74d"/><text x="988" y="866" class="kt mid" fill="#7aa2f7">UIK</text>
+  <text x="1024" y="866" class="dim">fold 验 role/config/授权项;</text>
+  <text x="960" y="888" class="dim">us_ pk 取自 membership。K 用 UIK 公钥加密封存。</text>
+</svg>
