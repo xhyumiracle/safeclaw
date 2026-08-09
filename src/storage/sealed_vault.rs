@@ -713,6 +713,61 @@ fn unwrap_verified_config(
     }
 }
 
+/// §11.1 — verify AND authorize an **authorized-agents table** row body
+/// (design/agent-device-identity-mtls.md §11.1). Composes [`verify_config_sig`]
+/// (integrity + anti-server-forgery: the signer's pubkey MUST be a published
+/// keyset cred, i.e. a real member) with the agent-specific authorization rule: a
+/// signed row is honored iff the signer is EITHER the row's declared `owner` (a
+/// member authorizing their OWN agent) OR any owner (owner override). This REUSES
+/// the owner-config signing machinery — same crypto, one extra authz predicate,
+/// no new fragility.
+///
+/// Returns `Some((data, was_signed))`:
+///   - `was_signed == true` — a valid, authorized signature; the caller retains
+///     the original signed wrapper for lossless re-emit (the daemon holds only
+///     public keys and cannot re-sign).
+///   - `was_signed == false` — a legacy raw (unsigned) row, honored additively
+///     (pre-AIK vaults / NoUik keysets), no signer.
+/// Returns `None` — DROP the row: a bad/forged/unknown-signer signature, an
+/// [`MembershipTrust::Untrusted`] keyset, or a signer who is neither the row's
+/// `owner` nor an owner. A dropped row simply means that `ag_id` is not in the
+/// table (= not authorized), never a crash (A1.6 fault isolation).
+fn unwrap_verified_agent_grant(
+    body: serde_json::Value,
+    keyset: &Keyset,
+    vault_id: &str,
+    config_name: &str,
+    version: u64,
+    trust: &MembershipTrust,
+) -> Option<(serde_json::Value, bool)> {
+    match verify_config_sig(body, keyset, vault_id, config_name, version) {
+        None => None,
+        Some((data, signer)) => match trust {
+            // Anchor stripped: drop everything (fail-closed).
+            MembershipTrust::Untrusted => None,
+            // Legacy v1 keyset: integrity-only (additive; pre-AIK vaults).
+            MembershipTrust::NoUik => Some((data, signer.is_some())),
+            MembershipTrust::Verified(membership) => match signer {
+                // Legacy raw (unsigned) honored additively.
+                None => Some((data, false)),
+                Some(signer_id) => {
+                    let owner = data.get("owner").and_then(|v| v.as_str()).unwrap_or_default();
+                    let is_owner_override = membership.get(&signer_id)
+                        == Some(&crate::storage::plaintext::MemberRole::Owner);
+                    // self-service: the signer admits their OWN agent (the signer is
+                    // a real member — verify_config_sig pinned its pubkey to a keyset
+                    // cred); owner-override: any owner may admit/modify/revoke any.
+                    if is_owner_override || signer_id == owner {
+                        Some((data, true))
+                    } else {
+                        None
+                    }
+                }
+            },
+        },
+    }
+}
+
 /// Resolve the CURRENT root's Ed25519 signing pubkey AND the current `role_epoch` by
 /// walking the [`KeysetUik::root_succession`] chain from the TOFU-pinned GENESIS root
 /// (`creator_sig_pub`) (design/identity-uik-aik.md §4.3, delegation-log-impl-spec.md
@@ -1336,21 +1391,22 @@ impl PerItemVault {
         if let Some(days) = aux.audit_retention_days {
             out.push(("audit_retention_days".into(), serde_json::json!(days)));
         }
-        if let Some(mode) = aux.agent_admission {
-            out.push(("agent_admission".into(), serde_json::json!(mode)));
-        }
         if !aux.services.is_empty() {
             out.push((
                 "services".into(),
                 serde_json::to_value(&aux.services).map_err(AppError::from)?,
             ));
         }
-        // PER-AGENT items — `aux:agent/<id>`, one each.
+        // PER-AGENT items — one `aux:agent/<ag_id>` each (§11.1 authorized-agents
+        // table). A row folded from a UIK-signed wrapper is re-emitted VERBATIM
+        // (the daemon holds only public keys, so it cannot re-sign it); a legacy
+        // raw row serializes its fields directly.
         for (id, entry) in &aux.agents {
-            out.push((
-                format!("agent/{}", id),
-                serde_json::to_value(entry).map_err(AppError::from)?,
-            ));
+            let body = match &entry.signed_body {
+                Some(signed) => signed.clone(),
+                None => serde_json::to_value(entry).map_err(AppError::from)?,
+            };
+            out.push((format!("agent/{}", id), body));
         }
         Ok(out)
     }
@@ -1797,9 +1853,24 @@ impl PerItemVault {
                         aux.connecting.insert(name, c);
                     }
                     ItemNs::Agent => {
-                        let entry = serde_json::from_value(payload.body).map_err(|e| {
-                            AppError::Internal(format!("agent '{}' parse: {}", name, e))
-                        })?;
+                        let raw = payload.body.clone();
+                        let cfg = format!("agent/{}", name);
+                        let Some((data, was_signed)) = unwrap_verified_agent_grant(
+                            payload.body,
+                            &self.keyset,
+                            vault_id,
+                            &cfg,
+                            stored.version,
+                            &trust,
+                        ) else {
+                            tracing::warn!(vault = %vault_id, agent = %name, "fold: dropping agent grant — unauthorized/invalid signature");
+                            return Ok(());
+                        };
+                        let mut entry: crate::storage::plaintext::AgentEntry =
+                            serde_json::from_value(data).map_err(|e| {
+                                AppError::Internal(format!("agent '{}' parse: {}", name, e))
+                            })?;
+                        entry.signed_body = was_signed.then_some(raw);
                         aux.agents.insert(name, entry);
                     }
                     ItemNs::Policy => {
@@ -1954,23 +2025,33 @@ impl PerItemVault {
                                     &trust,
                                 )
                             }
-                            "agent_admission" => {
-                                // UNSIGNED E2E (like the per-agent grants it
-                                // governs, team §8.1). Parse directly; a bad or
-                                // tombstoned body folds to None = Open
-                                // (non-bricking — never fail an agent shut on
-                                // corrupt admission metadata).
-                                aux.agent_admission = serde_json::from_value(payload.body).ok();
-                            }
                             n => {
                                 if let Some(agent_id) = n.strip_prefix("agent/") {
-                                    let entry =
-                                        serde_json::from_value(payload.body).map_err(|e| {
+                                    // §11.1 authorized-agents table row — UIK-signed
+                                    // (or legacy raw). Verify + authorize; a bad /
+                                    // unauthorized row drops (that ag_id is simply
+                                    // not in the table). The verified signed wrapper
+                                    // is retained for lossless re-emit.
+                                    let raw = payload.body.clone();
+                                    let Some((data, was_signed)) = unwrap_verified_agent_grant(
+                                        payload.body,
+                                        &self.keyset,
+                                        vault_id,
+                                        n,
+                                        stored.version,
+                                        &trust,
+                                    ) else {
+                                        tracing::warn!(vault = %vault_id, agent = %agent_id, "fold: dropping agent grant — unauthorized/invalid signature");
+                                        return Ok(());
+                                    };
+                                    let mut entry: crate::storage::plaintext::AgentEntry =
+                                        serde_json::from_value(data).map_err(|e| {
                                             AppError::Internal(format!(
                                                 "agent '{}' parse: {}",
                                                 agent_id, e
                                             ))
                                         })?;
+                                    entry.signed_body = was_signed.then_some(raw);
                                     // Per-item row is authoritative for its id;
                                     // it overrides anything a legacy blob carried.
                                     aux.agents.insert(agent_id.to_string(), entry);
@@ -2451,6 +2532,7 @@ mod tests {
                 connections: AgentMask::Blocked {
                     deny: vec!["stripe".into()],
                 },
+                ..Default::default()
             },
         ); // blacklist
         aux.agents.insert("ag_bob".into(), AgentEntry::default()); // "all"
@@ -3239,6 +3321,112 @@ mod tests {
             ),
             None,
             "member-signed owner-config dropped (not an owner)",
+        );
+    }
+
+    #[test]
+    fn agent_grant_authz_self_owner_and_forged() {
+        // §11.1 authorized-agents table authorization: a row is honored iff its
+        // signer is the row's declared `owner` (a member admitting their OWN
+        // agent) OR any owner (override). A member admitting SOMEONE ELSE'S agent,
+        // an unknown signer, or a bad signature all drop; legacy raw (unsigned) is
+        // honored additively.
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        use base64::engine::general_purpose::STANDARD;
+
+        let (vault, creator, member, creator_id, member_id, mut pv) = role_fixture_creator_cred();
+        // Add a member cred (role=Member, creator-signed at gen 0).
+        let member_grant = creator.signing().sign(&crate::identity::role_grant_input(
+            vault, &member_id, "member", 0,
+        ));
+        pv.set_uik_cred(
+            "cid-member".into(),
+            member_id.clone(),
+            member.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Member,
+            member_grant.to_vec(),
+        );
+        let MembershipTrust::Verified(owner_set) = pv.resolve_membership_trust(vault) else {
+            panic!("pinned creator ⇒ Verified");
+        };
+        let trust = MembershipTrust::Verified(owner_set);
+        let outsider = UikRoot::from_root([0x99u8; 32]); // never published to the keyset
+
+        let cfg = "agent/ag_testagent";
+        let version = 3u64;
+        let grant_body = |owner_id: &str| -> serde_json::Value {
+            serde_json::json!({ "agent_pubkey": "cGs", "owner": owner_id, "connections": "all" })
+        };
+        let sign = |signer: &UikRoot, data: &serde_json::Value| -> serde_json::Value {
+            let sid = signer.user_id();
+            let canonical = crate::crypto::canonical::canonicalize(data);
+            let input =
+                crate::identity::config_sig_input(vault, cfg, version, Some(&canonical), &sid);
+            let sig = signer.signing().sign(&input);
+            serde_json::json!({
+                "data": data,
+                "uik_sig": STANDARD.encode(sig),
+                "uik_sign_pub": STANDARD.encode(signer.signing().public_bytes()),
+            })
+        };
+
+        // self-service: member admits their OWN agent → honored, signed.
+        let own = grant_body(&member_id);
+        assert_eq!(
+            unwrap_verified_agent_grant(sign(&member, &own), &pv.keyset, vault, cfg, version, &trust),
+            Some((own.clone(), true)),
+            "member admits own agent",
+        );
+        // owner override: creator admits the member's agent → honored, signed.
+        assert_eq!(
+            unwrap_verified_agent_grant(
+                sign(&creator, &own),
+                &pv.keyset,
+                vault,
+                cfg,
+                version,
+                &trust
+            ),
+            Some((own.clone(), true)),
+            "any owner may admit any agent",
+        );
+        // forged: member admits an agent it declares OWNED BY the creator (neither
+        // self nor an owner) → drop.
+        let other = grant_body(&creator_id);
+        assert_eq!(
+            unwrap_verified_agent_grant(
+                sign(&member, &other),
+                &pv.keyset,
+                vault,
+                cfg,
+                version,
+                &trust
+            ),
+            None,
+            "member cannot admit an agent owned by someone else",
+        );
+        // unknown signer (outsider, not a keyset cred) → drop.
+        assert_eq!(
+            unwrap_verified_agent_grant(
+                sign(&outsider, &own),
+                &pv.keyset,
+                vault,
+                cfg,
+                version,
+                &trust
+            ),
+            None,
+            "outsider signature dropped",
+        );
+        // legacy raw (unsigned) → honored additively, unsigned.
+        assert_eq!(
+            unwrap_verified_agent_grant(own.clone(), &pv.keyset, vault, cfg, version, &trust),
+            Some((own.clone(), false)),
+            "legacy raw honored, was_signed=false",
         );
     }
 

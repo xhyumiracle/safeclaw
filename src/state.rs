@@ -242,18 +242,15 @@ pub struct SecretsCache {
     /// per-connection (`policy.connections.<id>`), while the built-in rules it
     /// merges come from the shared service definition.
     pub connections: HashMap<String, crate::storage::plaintext::Connection>,
-    /// Per-agent reach masks (team §8.1), keyed by the agent api-key PREFIX —
-    /// the identity handle the daemon can derive from a presented Bearer (the
-    /// pubkey-derived agent id takes this slot when AIK ships; few rows, cheap
-    /// re-key). Snapshot of `view.aux.agents` at unlock/refresh. Absent entry
-    /// = admitted-with-`AgentMask::All` under [`AgentAdmission::Open`], DENIED
-    /// under `Gated` (see `agent_admission`).
+    /// The vault's **authorized-agents table** (design §11.1), keyed by `ag_id`
+    /// (`derive_id(Agent, pubkey)`). Snapshot of `view.aux.agents` at
+    /// unlock/refresh. **Presence = authorized**; an `ag_id` with no entry is not
+    /// in the table. Consulted ONLY on the AIK (mTLS) path where the daemon knows
+    /// the presented `ag_id`; the legacy Basic api-key path (dual-auth window)
+    /// carries an api-key prefix, which is never in this `ag_`-keyed table → the
+    /// mask lookup misses → the caller falls to the legacy allow (nothing bricks
+    /// until bearers retire).
     pub agents: std::collections::BTreeMap<String, crate::storage::plaintext::AgentEntry>,
-    /// Vault-wide agent admission mode (team §8.1). Snapshot of
-    /// `view.aux.agent_admission` at unlock/refresh. `Open` (default) = an agent
-    /// with no `agents` entry reaches everything; `Gated` = only agents with an
-    /// entry are admitted (a dropped grant is a clean vault-level revoke).
-    pub agent_admission: crate::storage::plaintext::AgentAdmission,
     /// Custom (per-vault `aux.services`) service definitions, validated at
     /// unlock. Wiped on lock (Default drop). A custom service folds into
     /// discovery like a compiled one and never shadows a built-in id.
@@ -1337,66 +1334,56 @@ impl AppState {
             .insert(vault_id.to_string(), shared);
     }
 
-    /// Does this vault's reach mask let `agent_prefix` use `connection_id`?
+    /// Does this vault's reach mask let `agent_id` use `connection_id`?
     /// (team §8.1 — ONE pipeline: the proxy deny, the registry annotation and
-    /// GET /vaults all read THIS.) Locked vault → `None` (caller renders its
-    /// usual locked answer). An agent with no grant entry is unrestricted under
-    /// [`AgentAdmission::Open`] and DENIED under `Gated` (fail-closed admission).
+    /// GET /vaults all read THIS.) The verdict:
+    ///   - `Some(false)` — the agent IS in the authorized-agents table and its
+    ///     mask denies this connection (the only denial the proxy acts on).
+    ///   - `Some(true)` — in the table, mask allows.
+    ///   - `None` — vault locked, OR `agent_id` is not in the `ag_`-keyed table.
+    ///     The caller treats `None` as "no mask restriction" (allow): this is the
+    ///     legacy Basic-auth path (api-key prefix, never in an `ag_`-keyed table)
+    ///     during the dual-auth window. True fail-closed ("not in table = deny")
+    ///     is enforced by the AIK proxy path once bearers retire (§11.6).
     pub fn agent_mask_allows(
         &self,
         vault_id: &str,
-        agent_prefix: &str,
+        agent_id: &str,
         connection_id: &str,
     ) -> Option<bool> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => {
-                Some(match cache.agents.get(agent_prefix) {
-                    Some(e) => e.connections.allows(connection_id),
-                    // No grant: reach everything under Open (personal parity);
-                    // reach nothing under Gated (not admitted → clean revoke).
-                    None => !matches!(
-                        cache.agent_admission,
-                        crate::storage::plaintext::AgentAdmission::Gated
-                    ),
-                })
-            }
+            Some(VaultState::Unlocked { cache, .. }) => cache
+                .agents
+                .get(agent_id)
+                .map(|e| e.connections.allows(connection_id)),
             _ => None,
         }
     }
 
     /// Which of `candidates` this agent is ALLOWED to reach in this vault —
-    /// evaluated through `AgentMask::allows` so the blacklist, the legacy
-    /// whitelist and `All` all resolve identically (team §8.1 ONE pipeline:
-    /// same verdict as the proxy deny). `None` = vault locked OR the agent is
-    /// unrestricted (no grant under [`AgentAdmission::Open`] → caller masks
-    /// nothing); `Some(set)` = the subset of `candidates` that stays reachable
-    /// (under `Gated`, an agent with no grant yields `Some(empty)` — admitted to
-    /// nothing). Used by the registry/vaults surfaces to annotate rows without N
-    /// lock round-trips.
+    /// evaluated through `AgentMask::allows` so the blacklist and `All` resolve
+    /// identically (team §8.1 ONE pipeline: same verdict as the proxy deny).
+    /// `Some(set)` = the subset of `candidates` reachable under this agent's mask;
+    /// `None` = vault locked OR `agent_id` is not in the authorized-agents table
+    /// (the caller masks nothing — the legacy allow of the dual-auth window, since
+    /// a legacy api-key prefix is never in the `ag_`-keyed table). Used by the
+    /// registry/vaults surfaces to annotate rows without N lock round-trips.
     pub fn agent_allowed_connections(
         &self,
         vault_id: &str,
-        agent_prefix: &str,
+        agent_id: &str,
         candidates: &[String],
     ) -> Option<Vec<String>> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => match cache.agents.get(agent_prefix) {
-                Some(entry) => Some(
-                    candidates
-                        .iter()
-                        .filter(|id| entry.connections.allows(id))
-                        .cloned()
-                        .collect(),
-                ),
-                // No grant: unrestricted under Open (None → caller masks
-                // nothing); admitted to nothing under Gated (empty set).
-                None => match cache.agent_admission {
-                    crate::storage::plaintext::AgentAdmission::Gated => Some(Vec::new()),
-                    _ => None,
-                },
-            },
+            Some(VaultState::Unlocked { cache, .. }) => cache.agents.get(agent_id).map(|entry| {
+                candidates
+                    .iter()
+                    .filter(|id| entry.connections.allows(id))
+                    .cloned()
+                    .collect()
+            }),
             _ => None,
         }
     }
