@@ -1,5 +1,12 @@
 # User & Agent Identity Keys (UIK / AIK) — RFC
 
+> **⛔ SUPERSEDED for AIK custody + op-binding (2026-08-09).** The AIK sections here
+> (daemon-custodied signing key at §1/§3.1, per-op proof-of-possession at §3.2) are REPLACED
+> by `agent-device-identity-mtls.md` (SSOT): AIK is **agent-side** (ssh-style identity file,
+> not daemon-custodied), verified by **mutual mTLS** on the connection (not a per-op signature),
+> and DIK (device identity) gets the symmetric treatment. Read that doc for the current AIK/DIK
+> design; this RFC is kept only for the UIK/crypto-derivation detail it still contributes.
+
 > **STATUS (2026-08-05): UIK scope + keyset schema SUPERSEDED by
 > `unified-identity-schema.md`** (target SSOT). UIK becomes ONE per person (this RFC/impl
 > currently mints one per vault); keysets normalize into `identities` / `credentials` /

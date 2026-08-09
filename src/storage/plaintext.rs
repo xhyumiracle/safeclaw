@@ -380,10 +380,31 @@ impl AgentMask {
 
 /// The body of an `agent:<agent_id>` item: today just the mask, kept as a
 /// struct so future per-agent fields land without re-addressing.
+///
+/// Presence of the entry IS admission (team §8.1): under [`AgentAdmission::Gated`]
+/// an agent reaches this vault ONLY if it has an entry here; the entry's
+/// [`AgentMask`] then narrows WHICH connections. So dropping the entry is a clean
+/// vault-level revoke (no re-key — the agent never held K).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentEntry {
     #[serde(default)]
     pub connections: AgentMask,
+}
+
+/// Vault-wide agent admission mode (team §8.1). Owner-controlled in the console;
+/// UNSIGNED E2E like the per-agent grants it governs (design
+/// `agent-device-identity-mtls.md` §3 — v1 grants are unsigned, bounded by
+/// agent ⊆ member). Sliced as the `aux:agent_admission` item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentAdmission {
+    /// Fail-OPEN: an agent with no grant reaches everything. The pre-admission
+    /// default and personal-vault parity. Absent field folds to this.
+    #[default]
+    Open,
+    /// Fail-CLOSED: only agents WITH a grant in `aux.agents` are admitted; an
+    /// agent with no entry is denied every connection. Dropping a grant revokes.
+    Gated,
 }
 
 /// `aux` payload — everything inside `ProtectedState.aux` for v4 vaults.
@@ -429,6 +450,12 @@ pub struct VaultAux {
     /// CAS, same pattern as connections). Team §8.1.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AgentEntry>,
+    /// Agent admission mode (team §8.1). Absent = [`AgentAdmission::Open`]
+    /// (fail-open, pre-admission default & personal-vault parity). `Gated` makes
+    /// admission fail-CLOSED so a dropped grant is a clean vault-level revoke.
+    /// Unsigned E2E; sliced as the `aux:agent_admission` item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_admission: Option<AgentAdmission>,
 }
 
 impl VaultAux {
@@ -455,6 +482,7 @@ impl VaultAux {
             audit_retention_days: None,
             services: BTreeMap::new(),
             agents: BTreeMap::new(),
+            agent_admission: None,
         }
     }
 }

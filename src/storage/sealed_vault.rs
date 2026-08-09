@@ -1336,6 +1336,9 @@ impl PerItemVault {
         if let Some(days) = aux.audit_retention_days {
             out.push(("audit_retention_days".into(), serde_json::json!(days)));
         }
+        if let Some(mode) = aux.agent_admission {
+            out.push(("agent_admission".into(), serde_json::json!(mode)));
+        }
         if !aux.services.is_empty() {
             out.push((
                 "services".into(),
@@ -1950,6 +1953,14 @@ impl PerItemVault {
                                     stored.version,
                                     &trust,
                                 )
+                            }
+                            "agent_admission" => {
+                                // UNSIGNED E2E (like the per-agent grants it
+                                // governs, team §8.1). Parse directly; a bad or
+                                // tombstoned body folds to None = Open
+                                // (non-bricking — never fail an agent shut on
+                                // corrupt admission metadata).
+                                aux.agent_admission = serde_json::from_value(payload.body).ok();
                             }
                             n => {
                                 if let Some(agent_id) = n.strip_prefix("agent/") {

@@ -116,6 +116,10 @@ pub enum IdKind {
     User,
     /// An agent principal (AIK). Prints as `ag_…`.
     Agent,
+    /// A device principal (DIK) — one machine's identity to the cloud. Prints as
+    /// `dev_…`. Symmetric with AIK (design/agent-device-identity-mtls.md §0);
+    /// replaces the bearer device pair token.
+    Device,
 }
 
 impl IdKind {
@@ -123,6 +127,7 @@ impl IdKind {
         match self {
             IdKind::User => "us",
             IdKind::Agent => "ag",
+            IdKind::Device => "dev",
         }
     }
 }

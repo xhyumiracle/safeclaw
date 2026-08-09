@@ -153,9 +153,27 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         .build()
         .map_err(|e| format!("http client init: {}", e))?;
 
+    // ── Device identity (DIK): reuse this machine's keypair or mint a fresh one
+    // (identity wave §5). Stable across re-logins so a device keeps one `dev_…`
+    // id. The private SEED stays on disk (0600, `~/.safeclaw/device/identity`);
+    // only the PUBLIC key is registered with the cloud (authorized-devices set),
+    // additive to the legacy device-key bearer that still authenticates
+    // daemon↔cloud during the dual-auth window (§7).
+    let dik_path = crate::identity_file::device_identity_path()?;
+    let (dik_seed, dev_id) = match crate::identity_file::load(&dik_path) {
+        Ok(loaded) if loaded.kind == crate::identity::IdKind::Device => (loaded.seed, loaded.id),
+        _ => crate::identity_file::mint(crate::identity::IdKind::Device),
+    };
+    let (dik, _) = crate::identity_file::resolve(crate::identity::IdKind::Device, &dik_seed);
+    let dik_pub = data_encoding::BASE64.encode(&dik.public_bytes());
+
     let body = json!({
         "pair_token": args.pair_token,
         "device_name": device_name,
+        // Additive: an older custodian ignores these; a current one records the
+        // pubkey for the authorized-devices set.
+        "device_id": dev_id,
+        "device_pubkey": dik_pub,
     });
 
     let url = format!("{}/api/pair-token/exchange", custodian);
@@ -211,6 +229,17 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     // ── Persist the device-key to ~/.safeclaw/device-key (0600) ──────────
     let key_path = device_key_path()?;
     write_device_key(&key_path, &parsed.device_key)?;
+
+    // ── Persist the DIK identity file (0600) after a successful exchange ──
+    // Idempotent when reused. The daemon reads this for the daemon↔cloud mTLS /
+    // signed-request path once hop-B ships; until then the device-key bearer
+    // above stays the active transport.
+    if let Err(e) = crate::identity_file::write(&dik_path, crate::identity::IdKind::Device, &dik_seed)
+    {
+        // Non-fatal: pairing succeeded; the DIK is an additive upgrade. Warn but
+        // don't strand the device on a write hiccup.
+        eprintln!("warning: could not persist device identity ({e}); device-key pairing still succeeded");
+    }
 
     // ── Persist active vault + cloud sync coordinates ────────────────────
     // The AGENT talks to the LOCAL daemon (active `custodian`), not the

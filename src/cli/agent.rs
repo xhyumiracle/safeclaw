@@ -67,10 +67,28 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         crate::config::PROXY_PORT
     );
 
+    // ── Mint this agent's AIK (possession-proven identity; identity wave §2) ──
+    // Ed25519 keypair, self-certifying `ag_…` id. The private SEED never leaves
+    // this disk (0600) and never enters the agent's env — only the PUBLIC key is
+    // registered with the cloud (which relays it to the authorized-agents set the
+    // daemon verifies once mTLS ships). Persisted only AFTER the cloud accepts
+    // the registration, so a failed create leaves no orphan file.
+    let (seed, ag_id) = crate::identity_file::mint(crate::identity::IdKind::Agent);
+    let (aik, _) = crate::identity_file::resolve(crate::identity::IdKind::Agent, &seed);
+    let aik_pub = data_encoding::BASE64.encode(&aik.public_bytes());
+    let identity_path = crate::identity_file::agent_identity_path(&args.name)?;
+
     let resp = client()?
         .post(format!("{}/api/vault/agents", cloud))
         .bearer_auth(&key)
-        .json(&serde_json::json!({ "label": args.name, "tier": "agent" }))
+        .json(&serde_json::json!({
+            "label": args.name,
+            "tier": "agent",
+            // Additive: an older backend ignores these; a current one records
+            // the pubkey for the AIK authorized-set (dual-auth window §7).
+            "agent_id": ag_id,
+            "agent_pubkey": aik_pub,
+        }))
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
@@ -82,12 +100,15 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         .await
         .map_err(|e| format!("parse response: {}", e))?;
 
+    crate::identity_file::write(&identity_path, crate::identity::IdKind::Agent, &seed)?;
+
     // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─
-    // Print the agent's env as two dotenv lines: the daemon's API face + the
-    // fresh key. The agent appends ONE command's stdout to its own `.env` —
-    // its SSOT from then on — and never assembles a value. STDOUT only; stderr
-    // guidance carries NO secret, so blind-capture keeps the key out of the
-    // agent's transcript (and out of the install prompt).
+    // Print the agent's env as dotenv lines: the daemon's API face, the AIK
+    // identity PATH (a path, not a secret — the possession-proven identity, the
+    // dual-auth target), and the legacy api-key (still the ACTIVE transport until
+    // mTLS flips; kept so nothing bricks — design §7). The agent appends ONE
+    // command's stdout to its own `.env` and never assembles a value. STDOUT
+    // only; stderr guidance carries NO secret.
     //
     // Deliberately NOT baked: a precomputed proxy URL (froze a host:port that a
     // moved daemon made stale — `sc run` rebuilds it live), and a vault id
@@ -95,6 +116,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // `sc vault use` forever — vault is per-call, not identity; see
     // design/vault-addressing.md). Identity-only env self-heals.
     println!("SAFECLAW_BROKER_URL={}", broker_url);
+    println!("SAFECLAW_AGENT_IDENTITY={}", identity_path.display());
     println!("SAFECLAW_API_KEY={}", r.token);
 
     let rm_name = if args.name.contains(char::is_whitespace) {

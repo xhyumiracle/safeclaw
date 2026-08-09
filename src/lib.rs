@@ -25,6 +25,7 @@ pub mod entry;
 pub mod error;
 mod generated_services;
 pub mod identity;
+pub mod identity_file;
 pub mod passkey;
 pub mod protocol;
 pub mod proxy;

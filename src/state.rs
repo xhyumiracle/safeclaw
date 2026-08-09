@@ -246,8 +246,14 @@ pub struct SecretsCache {
     /// the identity handle the daemon can derive from a presented Bearer (the
     /// pubkey-derived agent id takes this slot when AIK ships; few rows, cheap
     /// re-key). Snapshot of `view.aux.agents` at unlock/refresh. Absent entry
-    /// = `AgentMask::All` (personal parity).
+    /// = admitted-with-`AgentMask::All` under [`AgentAdmission::Open`], DENIED
+    /// under `Gated` (see `agent_admission`).
     pub agents: std::collections::BTreeMap<String, crate::storage::plaintext::AgentEntry>,
+    /// Vault-wide agent admission mode (team §8.1). Snapshot of
+    /// `view.aux.agent_admission` at unlock/refresh. `Open` (default) = an agent
+    /// with no `agents` entry reaches everything; `Gated` = only agents with an
+    /// entry are admitted (a dropped grant is a clean vault-level revoke).
+    pub agent_admission: crate::storage::plaintext::AgentAdmission,
     /// Custom (per-vault `aux.services`) service definitions, validated at
     /// unlock. Wiped on lock (Default drop). A custom service folds into
     /// discovery like a compiled one and never shadows a built-in id.
@@ -1334,7 +1340,8 @@ impl AppState {
     /// Does this vault's reach mask let `agent_prefix` use `connection_id`?
     /// (team §8.1 — ONE pipeline: the proxy deny, the registry annotation and
     /// GET /vaults all read THIS.) Locked vault → `None` (caller renders its
-    /// usual locked answer). An agent with no mask entry is unrestricted.
+    /// usual locked answer). An agent with no grant entry is unrestricted under
+    /// [`AgentAdmission::Open`] and DENIED under `Gated` (fail-closed admission).
     pub fn agent_mask_allows(
         &self,
         vault_id: &str,
@@ -1343,13 +1350,17 @@ impl AppState {
     ) -> Option<bool> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => Some(
-                cache
-                    .agents
-                    .get(agent_prefix)
-                    .map(|e| e.connections.allows(connection_id))
-                    .unwrap_or(true),
-            ),
+            Some(VaultState::Unlocked { cache, .. }) => {
+                Some(match cache.agents.get(agent_prefix) {
+                    Some(e) => e.connections.allows(connection_id),
+                    // No grant: reach everything under Open (personal parity);
+                    // reach nothing under Gated (not admitted → clean revoke).
+                    None => !matches!(
+                        cache.agent_admission,
+                        crate::storage::plaintext::AgentAdmission::Gated
+                    ),
+                })
+            }
             _ => None,
         }
     }
@@ -1357,10 +1368,12 @@ impl AppState {
     /// Which of `candidates` this agent is ALLOWED to reach in this vault —
     /// evaluated through `AgentMask::allows` so the blacklist, the legacy
     /// whitelist and `All` all resolve identically (team §8.1 ONE pipeline:
-    /// same verdict as the proxy deny). `None` = vault locked OR the agent has
-    /// no mask entry (unrestricted → caller masks nothing); `Some(set)` = the
-    /// subset of `candidates` that stays reachable. Used by the registry/vaults
-    /// surfaces to annotate rows without N lock round-trips.
+    /// same verdict as the proxy deny). `None` = vault locked OR the agent is
+    /// unrestricted (no grant under [`AgentAdmission::Open`] → caller masks
+    /// nothing); `Some(set)` = the subset of `candidates` that stays reachable
+    /// (under `Gated`, an agent with no grant yields `Some(empty)` — admitted to
+    /// nothing). Used by the registry/vaults surfaces to annotate rows without N
+    /// lock round-trips.
     pub fn agent_allowed_connections(
         &self,
         vault_id: &str,
@@ -1369,16 +1382,21 @@ impl AppState {
     ) -> Option<Vec<String>> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => {
-                let entry = cache.agents.get(agent_prefix)?; // absent = unrestricted
-                Some(
+            Some(VaultState::Unlocked { cache, .. }) => match cache.agents.get(agent_prefix) {
+                Some(entry) => Some(
                     candidates
                         .iter()
                         .filter(|id| entry.connections.allows(id))
                         .cloned()
                         .collect(),
-                )
-            }
+                ),
+                // No grant: unrestricted under Open (None → caller masks
+                // nothing); admitted to nothing under Gated (empty set).
+                None => match cache.agent_admission {
+                    crate::storage::plaintext::AgentAdmission::Gated => Some(Vec::new()),
+                    _ => None,
+                },
+            },
             _ => None,
         }
     }
