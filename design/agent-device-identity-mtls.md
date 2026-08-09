@@ -230,6 +230,27 @@ user's batch e2e. See `IDENTITY_WAVE_BUILD_LOG.md` (repo root) for the decision 
     binds the tunnel to `ag_id`, then the mask lookup key moves prefix→`ag_id` (state.rs:245
     already anticipates this).
 
+## 9.2 Build status (2026-08-10) — §11 authz model landed end-to-end
+
+**Step 1 (§11.6 authz-table refactor) DONE, all 3 layers green + committed on
+`feat/identity-wave` (unpushed):** core `c4e6e89` (`aux:agent/<ag_id>` = UIK-signed
+authorized-agents table via `unwrap_verified_agent_grant`, reuses the owner-config signing
+machinery; `AgentAdmission` open/gated deleted; consult keyed by `ag_id`, legacy prefix
+falls to legacy-allow so nothing bricks; +authz unit test; 378 lib tests green), FE `660a9f0`
+(`ConfigSigner.wrap` signs `agent/*` + auto-stamps `owner`=signer; fold blind-unwraps;
+re-key verify-then-resign; presence=authorized; Agents tab + Connections mask key by `ag_id`),
+BE `5b5e8b3` (roster serves `identity_id`+`sig_pub`; grants stay E2E + member-writable — the
+daemon fold IS the "server write-gate" the server can't do on sealed ct). Prompt wording
+`e36d3fd`.
+
+**Remaining focused passes** (deliberately NOT shipped blind — coupled, not e2e-testable
+here, would touch the LIVE sync path / auth core; per the §9.1 caution): the mTLS transport
+(hop-A shim + hop-B DIK-signed request), connect-time auto-authorize UX (§11.3 ①②③ — needs
+the one-passkey→many-vaults ceremony; today agents are allow-by-default on the legacy
+transport so this is future-facing), the fail-closed flip (AIK path only, in the proxy
+handler not the consult), and retiring bearers. Full plan = repo-root
+`IDENTITY_WAVE_BUILD_LOG.md` → "NEXT".
+
 --------------------------------------------------------------------------------
 ## 10. Non-goals (this wave)
 - A real issuing CA / PKI (SPIFFE-style) — optional enterprise layer later.
