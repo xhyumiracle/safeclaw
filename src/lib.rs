@@ -21,6 +21,7 @@ pub mod cli;
 pub mod config;
 pub mod core;
 pub mod crypto;
+pub mod device_auth;
 pub mod entry;
 pub mod error;
 mod generated_services;
