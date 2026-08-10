@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::cli::active::load as load_config;
 use crate::config::{AgentAddArgs, AgentRmArgs, AgentSubcommand};
+use crate::device_auth::DikRequestExt;
 
 pub async fn run(sub: AgentSubcommand) -> Result<(), String> {
     match sub {
@@ -78,17 +79,20 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     let aik_pub = data_encoding::BASE64.encode(&aik.public_bytes());
     let identity_path = crate::identity_file::agent_identity_path(&args.name)?;
 
+    let url = format!("{}/api/vault/agents", cloud);
+    let body = serde_json::json!({
+        "label": args.name,
+        "tier": "agent",
+        // Additive: an older backend ignores these; a current one records
+        // the pubkey for the AIK authorized-set (dual-auth window §7).
+        "agent_id": ag_id,
+        "agent_pubkey": aik_pub,
+    });
     let resp = client()?
-        .post(format!("{}/api/vault/agents", cloud))
+        .post(&url)
         .bearer_auth(&key)
-        .json(&serde_json::json!({
-            "label": args.name,
-            "tier": "agent",
-            // Additive: an older backend ignores these; a current one records
-            // the pubkey for the AIK authorized-set (dual-auth window §7).
-            "agent_id": ag_id,
-            "agent_pubkey": aik_pub,
-        }))
+        .dik_pop("POST", &url, &serde_json::to_vec(&body).unwrap_or_default())
+        .json(&body)
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
@@ -136,9 +140,11 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
 async fn fetch_agents(cloud: &str, key: &str) -> Result<Vec<ListKey>, String> {
     // `/api/vault/agents` is already tier-scoped server-side (agent|demo);
     // device-keys live under `/api/vault/devices`.
+    let url = format!("{}/api/vault/agents", cloud);
     let resp = client()?
-        .get(format!("{}/api/vault/agents", cloud))
+        .get(&url)
         .bearer_auth(key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
@@ -193,9 +199,11 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
             ))
         }
     };
+    let url = format!("{}/api/vault/agents/{}", cloud, id);
     let resp = client()?
-        .delete(format!("{}/api/vault/agents/{}", cloud, id))
+        .delete(&url)
         .bearer_auth(&key)
+        .dik_pop("DELETE", &url, &[])
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
