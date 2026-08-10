@@ -656,6 +656,57 @@ fn verify_config_sig(
     }
 }
 
+/// A1.2/A1.5 — verify a per-record **sidecar** signature (`StoredItem.sig`/`signer`)
+/// over the record's CIPHERTEXT, by a keyset MEMBER (a UIK — `us_…`). This is the
+/// daemon-side (trust wall) verification of the new signed-record scheme: unlike
+/// [`verify_config_sig`] (the sig lives INSIDE the sealed body and covers the
+/// plaintext), here the sig is a plaintext sidecar covering `record_signature_input`
+/// over the ciphertext — so the same signature a blind server verified at write is
+/// re-verified here. Returns the signer's `us_…` iff the signature verifies AND the
+/// signer's pubkey is a published keyset cred (the anti-server-forgery anchor); else
+/// `None` (drop). `item_id_raw` = the 32-byte blinded id; `status_live` = live vs
+/// tombstone. DIK (`dev_…`) signers are NOT resolved here (device pubkeys aren't in
+/// the keyset) — that path is served separately; this covers the UIK-signed
+/// owner-config + authorized-agents records.
+fn verify_record_sidecar_sig(
+    ct: &[u8],
+    keyset: &Keyset,
+    vault_id: &str,
+    item_id_raw: &[u8],
+    record_type: &str,
+    version: u64,
+    status_live: bool,
+    sig_b64: &str,
+    signer_id: &str,
+) -> Option<String> {
+    let sig_vec = decode_keys_data_field(sig_b64).ok()?;
+    let sig: [u8; 64] = sig_vec.as_slice().try_into().ok()?;
+    // Resolve the signer's pubkey from the published keyset creds and bind it to the
+    // claimed `signer_id` (self-certifying: id = fold of pubkey). A server-minted
+    // key isn't in the keyset (it can't add one with a valid K-seal) → rejected.
+    let uik = keyset.uik.as_ref()?;
+    let sign_pub_vec = uik.creds.values().map(|c| &c.sig_pub).find(|pk| {
+        <[u8; 32]>::try_from(pk.as_slice())
+            .map(|k| crate::identity::derive_id(crate::identity::IdKind::User, &k) == signer_id)
+            .unwrap_or(false)
+    })?;
+    let sign_pub: [u8; 32] = sign_pub_vec.as_slice().try_into().ok()?;
+    let input = crate::identity::record_signature_input(
+        record_type,
+        item_id_raw,
+        version,
+        vault_id,
+        ct,
+        status_live,
+        signer_id,
+    );
+    if crate::identity::verify(&sign_pub, &input, &sig) {
+        Some(signer_id.to_string())
+    } else {
+        None
+    }
+}
+
 /// The three-state trust an owner-config reader derives from the KEYSET's UIK
 /// anchor (design/identity-uik-aik.md §4.3, team-shared-vault-security-model.md
 /// §9). This REPLACES the old `Option<BTreeMap<..>>` membership signal, which
@@ -3461,6 +3512,45 @@ mod tests {
             unwrap_verified_agent_grant(own.clone(), &pv.keyset, vault, cfg, version, &trust),
             Some((own.clone(), false)),
             "legacy raw honored, was_signed=false",
+        );
+    }
+
+    #[test]
+    fn verify_record_sidecar_sig_accept_and_reject() {
+        // A1.2 sidecar verify: a keyset member signs record_signature_input over the
+        // record's ciphertext; the daemon re-verifies from the wire sig+signer.
+        use crate::crypto::vault_key::UikRoot;
+        use base64::engine::general_purpose::STANDARD;
+        let (vault, creator, _member, creator_id, _member_id, pv) = role_fixture_creator_cred();
+        let outsider = UikRoot::from_root([0x77u8; 32]); // not a keyset cred
+        let ct = b"pretend-sealed-ciphertext-bytes";
+        let id_raw = [0x09u8; 32];
+        let sign = |signer: &UikRoot, ty: &str, body: &[u8]| -> String {
+            let input = crate::identity::record_signature_input(
+                ty, &id_raw, 4, vault, body, true, &signer.user_id());
+            STANDARD.encode(signer.signing().sign(&input))
+        };
+        // Valid: creator (a keyset member) signs "policy" over ct → signer id back.
+        let good = sign(&creator, "policy", ct);
+        assert_eq!(
+            verify_record_sidecar_sig(ct, &pv.keyset, vault, &id_raw, "policy", 4, true, &good, &creator_id),
+            Some(creator_id.clone()),
+        );
+        // Tampered type: signed "policy", verified as "secret" → reject.
+        assert_eq!(
+            verify_record_sidecar_sig(ct, &pv.keyset, vault, &id_raw, "secret", 4, true, &good, &creator_id),
+            None, "record_type is bound",
+        );
+        // Tampered ct: signature was over `ct`, verify over a different body → reject.
+        assert_eq!(
+            verify_record_sidecar_sig(b"other-ct", &pv.keyset, vault, &id_raw, "policy", 4, true, &good, &creator_id),
+            None, "ciphertext is bound",
+        );
+        // Outsider (not a keyset cred) → reject even with a valid self-signature.
+        let bad = sign(&outsider, "policy", ct);
+        assert_eq!(
+            verify_record_sidecar_sig(ct, &pv.keyset, vault, &id_raw, "policy", 4, true, &bad, &outsider.user_id()),
+            None, "non-member signer rejected",
         );
     }
 
