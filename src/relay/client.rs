@@ -10,6 +10,7 @@ use base64::{
 };
 use serde_json::{json, Value};
 
+use crate::device_auth::DikRequestExt;
 use crate::state::AppState;
 
 /// Poll cadence (v1.1, mode-dependent). The wait between polls is
@@ -113,10 +114,12 @@ pub fn spawn_cancel(state: Arc<AppState>, vault_id: String, op_id: String) {
             Ok(c) => c,
             Err(_) => return,
         };
+        let cancel_body = json!({ "daemon_pubkey": daemon_pubkey });
         match client
             .post(&url)
             .bearer_auth(&auth_token)
-            .json(&json!({ "daemon_pubkey": daemon_pubkey }))
+            .dik_pop("POST", &url, &serde_json::to_vec(&cancel_body).unwrap_or_default())
+            .json(&cancel_body)
             .send()
             .await
         {
@@ -183,17 +186,19 @@ async fn run(
     let op_summary = STANDARD.encode(serde_json::to_vec(op).unwrap_or_default());
     let passkeys = fetch_passkeys(&client, state.config.port, vault_id).await;
     let reg_url = format!("{}/v/{}/op/relay/register", base, vault_id);
+    let reg_body = json!({
+        "op_id": op_id,
+        "daemon_pubkey": daemon_pubkey,
+        "op_summary": op_summary,
+        "passkeys": passkeys,
+        "r": r,
+        "expires_at": expires_at,
+    });
     let reg = client
         .post(&reg_url)
         .bearer_auth(auth_token)
-        .json(&json!({
-            "op_id": op_id,
-            "daemon_pubkey": daemon_pubkey,
-            "op_summary": op_summary,
-            "passkeys": passkeys,
-            "r": r,
-            "expires_at": expires_at,
-        }))
+        .dik_pop("POST", &reg_url, &serde_json::to_vec(&reg_body).unwrap_or_default())
+        .json(&reg_body)
         .send()
         .await
         .map_err(|e| format!("relay register: {}", e))?;
@@ -211,7 +216,13 @@ async fn run(
             return Ok(()); // op expired; stop quietly
         }
         let last_poll = tokio::time::Instant::now();
-        let resp = match client.get(&poll_url).bearer_auth(auth_token).send().await {
+        let resp = match client
+            .get(&poll_url)
+            .bearer_auth(auth_token)
+            .dik_pop("GET", &poll_url, &[])
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(op = %op_id, "relay poll transient error: {}", e);

@@ -13,8 +13,9 @@
 //! not-yet-upgraded or not-yet-migrated backend simply ignores. Nothing bricks in
 //! any upgrade order. This module is dormant until `sync.rs` attaches the headers.
 
-use crate::identity::{device_request_signature_input, SigningIdentity};
+use crate::identity::{device_request_signature_input, IdKind, SigningIdentity};
 use data_encoding::BASE64;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The `dev_…` self-id of the signing device (tells the backend which registered
 /// pubkey to check).
@@ -74,6 +75,72 @@ impl DeviceRequestSigner {
     }
 }
 
+/// Load the device's DIK signer from its on-disk identity file, mirroring
+/// [`crate::sync::device_key`] (per-call, best-effort, no cache). `None` when the
+/// DIK hasn't been minted yet (a device paired before P2, or an fmt1 box) — the
+/// caller then signs with the bearer only (dual-auth). Per-call load matches how
+/// the daemon already reads the device-key; the DIK can also appear AFTER the
+/// daemon started (a later `sc login`), so caching would risk a stale `None`.
+pub fn device_signer() -> Option<DeviceRequestSigner> {
+    let path = crate::identity_file::device_identity_path().ok()?;
+    let loaded = crate::identity_file::load(&path).ok()?;
+    if loaded.kind != IdKind::Device {
+        return None;
+    }
+    Some(DeviceRequestSigner::new(loaded.identity, loaded.id))
+}
+
+/// Current unix-seconds wall clock for the request timestamp. Saturates to 0 if
+/// the clock is before the epoch (never in practice).
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The on-wire path+query of a full URL — exactly what the Node backend sees as
+/// `req.url` (path, `?`, query; no scheme/host). Both sides sign THIS so the PoP
+/// verifies. `None` if the URL doesn't parse (caller then skips signing rather
+/// than sign bytes the backend can't reproduce).
+fn path_and_query(full_url: &str) -> Option<String> {
+    let u = reqwest::Url::parse(full_url).ok()?;
+    Some(match u.query() {
+        Some(q) => format!("{}?{}", u.path(), q),
+        None => u.path().to_string(),
+    })
+}
+
+/// Attach the DIK proof-of-possession headers to a daemon→cloud request,
+/// ALONGSIDE the `.bearer_auth(device_key)` already set — never in place of it
+/// (dual-auth: hop-B is additive, the bearer stays the live auth). A no-op when
+/// no DIK exists or the URL doesn't parse, so it can never break an existing
+/// request; it only ever adds three headers a pre-hop-B backend ignores.
+pub trait DikRequestExt {
+    /// `method` = the uppercase HTTP method; `full_url` = the request URL (its
+    /// path+query is extracted for the signature); `body` = the EXACT bytes the
+    /// request will send (`&[]` for a bodyless GET/DELETE; for a `.json(&v)` body
+    /// pass `&serde_json::to_vec(&v)` — reqwest serializes with the same
+    /// `serde_json::to_vec`, so the bytes match).
+    fn dik_pop(self, method: &str, full_url: &str, body: &[u8]) -> Self;
+}
+
+impl DikRequestExt for reqwest::RequestBuilder {
+    fn dik_pop(self, method: &str, full_url: &str, body: &[u8]) -> Self {
+        let Some(signer) = device_signer() else {
+            return self;
+        };
+        let Some(path) = path_and_query(full_url) else {
+            return self;
+        };
+        let mut rb = self;
+        for (k, v) in signer.headers(method, &path, now_unix(), body) {
+            rb = rb.header(k, v);
+        }
+        rb
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +176,20 @@ mod tests {
             s.device_id(),
         );
         assert!(verify(&pub_bytes, &input, &sig), "PoP verifies");
+    }
+
+    #[test]
+    fn path_and_query_matches_backend_req_url() {
+        // Node's http `req.url` = path (+ ?query), never scheme/host — sign that.
+        assert_eq!(
+            path_and_query("https://api.example.com/v/abc/blob?since=5").as_deref(),
+            Some("/v/abc/blob?since=5")
+        );
+        assert_eq!(
+            path_and_query("https://api.example.com/api/vault/agents/hashes").as_deref(),
+            Some("/api/vault/agents/hashes")
+        );
+        assert_eq!(path_and_query("not a url"), None);
     }
 
     #[test]

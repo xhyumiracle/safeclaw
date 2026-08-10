@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify};
 
+use crate::device_auth::DikRequestExt;
+
 // ── Tunables (each one traces to a rule in design/sse-sync.md) ─────────
 
 /// Backend `SSE_MAX_VIDS`. The route 400s the WHOLE request on any excess or
@@ -892,8 +894,15 @@ async fn run_stream(
     } else {
         CONNECT_HEADERS_BUDGET
     };
-    let resp = match tokio::time::timeout(headers_budget, client.get(&url).bearer_auth(dk).send())
-        .await
+    let resp = match tokio::time::timeout(
+        headers_budget,
+        client
+            .get(&url)
+            .bearer_auth(dk)
+            .dik_pop("GET", &url, &[])
+            .send(),
+    )
+    .await
     {
         Err(_) => {
             return StreamEnd::Failed(ConnectFail::Transient(

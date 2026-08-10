@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cli::active;
+use crate::device_auth::DikRequestExt;
 use crate::state::AppState;
 use crate::storage::sealed_vault::{self, SealedVault};
 use crate::sync_stream::{Mode, StreamHealth, VaultStatus, WakeCell, Work};
@@ -280,10 +281,12 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
     let cloud = cloud.trim_end_matches('/');
     if let Some(ids) = has_ids {
         let url = format!("{}/v/{}/config-ids", cloud, vault_id);
+        let body = serde_json::json!({ "ids": ids });
         match client
             .post(&url)
             .bearer_auth(&dk)
-            .json(&serde_json::json!({ "ids": ids }))
+            .dik_pop("POST", &url, &serde_json::to_vec(&body).unwrap_or_default())
+            .json(&body)
             .send()
             .await
         {
@@ -299,10 +302,12 @@ async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
     }
     if has_format {
         let url = format!("{}/v/{}/format", cloud, vault_id);
+        let body = serde_json::json!({ "format": 2 });
         match client
             .patch(&url)
             .bearer_auth(&dk)
-            .json(&serde_json::json!({ "format": 2 }))
+            .dik_pop("PATCH", &url, &serde_json::to_vec(&body).unwrap_or_default())
+            .json(&body)
             .send()
             .await
         {
@@ -437,6 +442,7 @@ async fn pull(
     let resp = client
         .get(&url)
         .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
@@ -837,7 +843,14 @@ pub async fn push_blob_best_effort(state: &Arc<AppState>, vault_id: &str) {
             let base_version = read_local_version(&state.config.state_dir, vault_id);
             serde_json::json!({ "blob": blob, "base_version": base_version })
         };
-        let resp = match client.put(&url).bearer_auth(&dk).json(&body).send().await {
+        let resp = match client
+            .put(&url)
+            .bearer_auth(&dk)
+            .dik_pop("PUT", &url, &serde_json::to_vec(&body).unwrap_or_default())
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(vault = %vault_id, "push-back: PUT failed: {}", e);
@@ -942,7 +955,13 @@ async fn fetch_agent_key_hashes(
     device_key: &str,
 ) -> Option<std::collections::HashSet<String>> {
     let url = format!("{}/api/vault/agents/hashes", cloud.trim_end_matches('/'));
-    let resp = client.get(&url).bearer_auth(device_key).send().await.ok()?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -1225,10 +1244,12 @@ async fn ship_vault_audit(
         }
         let events: Vec<AuditEventWire> = rows.iter().map(event_from_row).collect();
         let url = format!("{}/v/{}/audit", cloud, vault);
+        let body = serde_json::json!({ "events": events });
         let resp = client
             .post(&url)
             .bearer_auth(device_key)
-            .json(&serde_json::json!({ "events": events }))
+            .dik_pop("POST", &url, &serde_json::to_vec(&body).unwrap_or_default())
+            .json(&body)
             .send()
             .await;
         match resp {
@@ -1592,7 +1613,11 @@ pub async fn watch_loop(
         // ── Fallback shapes: the pre-SSE long-poll rounds, unchanged ──────
         let local_ver = read_local_version(&state_dir, &vault);
         let blob_url = format!("{}/v/{}/blob/wait?since={}", cloud, vault, local_ver);
-        let blob_fut = client.get(&blob_url).bearer_auth(&dk).send();
+        let blob_fut = client
+            .get(&blob_url)
+            .bearer_auth(&dk)
+            .dik_pop("GET", &blob_url, &[])
+            .send();
         // The content channel only exists once the vault has a per-item store
         // (its cursor lives there). Reading the store each round is a small
         // local file parse — negligible against a 25s park.
@@ -1604,7 +1629,11 @@ pub async fn watch_loop(
         let wake = match items_since {
             Some(seq) => {
                 let items_url = format!("{}/v/{}/items/wait?since={}", cloud, vault, seq);
-                let items_fut = client.get(&items_url).bearer_auth(&dk).send();
+                let items_fut = client
+                    .get(&items_url)
+                    .bearer_auth(&dk)
+                    .dik_pop("GET", &items_url, &[])
+                    .send();
                 // Whichever channel answers first wins; the loser is dropped
                 // mid-hold (the server notices the close) and re-armed next
                 // round. Worst case that's one extra request per ~25s window.
@@ -1962,6 +1991,7 @@ async fn probe_blob_and_handle(
     let resp = client
         .get(&url)
         .bearer_auth(dk)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| ProbeError::Other(format!("reach {}: {}", cloud, e)))?;
@@ -2146,6 +2176,7 @@ pub async fn pull_items(
     let resp = client
         .get(&url)
         .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
@@ -2216,6 +2247,7 @@ pub async fn push_item(
     let resp = client
         .put(&url)
         .bearer_auth(device_key)
+        .dik_pop("PUT", &url, &serde_json::to_vec(&body).unwrap_or_default())
         .json(&body)
         .send()
         .await
@@ -2266,6 +2298,7 @@ pub async fn gc_item(
     let resp = client
         .delete(&url)
         .bearer_auth(device_key)
+        .dik_pop("DELETE", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
@@ -2545,6 +2578,7 @@ pub async fn pull_keys(
     let resp = client
         .get(&url)
         .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
@@ -2607,6 +2641,7 @@ async fn pull_membership(
     let resp = client
         .get(&url)
         .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
@@ -3303,6 +3338,7 @@ async fn fetch_key_versions(
     let resp = client
         .get(&url)
         .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
@@ -3349,6 +3385,7 @@ async fn push_key(
     let resp = client
         .put(&url)
         .bearer_auth(device_key)
+        .dik_pop("PUT", &url, &serde_json::to_vec(&body).unwrap_or_default())
         .json(&body)
         .send()
         .await
