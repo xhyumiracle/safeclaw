@@ -347,6 +347,16 @@ impl BrokerHandler {
                 .into()
             }
         };
+        // Daemon too old for this vault's format (cloud returned SC_UPGRADE_REQUIRED
+        // for its sync, design 甲) → fail LOUDLY so the agent runs `sc upgrade`,
+        // instead of a silent parked-sync mystery the agent works around or calls a bug.
+        if self.state.is_vault_upgrade_required(&vault_id) {
+            return err_response(
+                ScCode::UpgradeRequired,
+                "SafeClaw needs an update to use this vault — run `sc upgrade`",
+            )
+            .into();
+        }
         if self.state.is_vault_locked(&vault_id) {
             return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG).into();
         }

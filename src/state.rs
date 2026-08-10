@@ -308,6 +308,12 @@ pub struct AppState {
     /// only, repopulated on each pull — same restart-softness as `cloud_contact`,
     /// which the offline lease already accepts (it is a soft backstop).
     pub vault_shared: Mutex<HashMap<String, bool>>,
+    /// Vaults whose cloud sync returned `SC_UPGRADE_REQUIRED` — this daemon is too
+    /// old for their (newer) item format (design 甲). While set, the broker refuses
+    /// with [`crate::error::ScCode::UpgradeRequired`] so the AGENT gets an actionable
+    /// "run `sc upgrade`" instead of a silent parked-sync failure. In-memory only,
+    /// (re)set by the sync path; cleared when a sync succeeds again.
+    pub vault_upgrade_required: Mutex<std::collections::HashSet<String>>,
     /// Team-edition extension hooks (team-edition §9 open/closed split). The
     /// open build leaves the [`crate::team_hooks::NoopHooks`] default (no team
     /// policy); the closed `safeclaw-ee` overlay injects real ones via
@@ -465,6 +471,7 @@ impl AppState {
             vaults,
             cloud_contact: Mutex::new(HashMap::new()),
             vault_shared: Mutex::new(HashMap::new()),
+            vault_upgrade_required: Mutex::new(std::collections::HashSet::new()),
             team: std::sync::Arc::new(crate::team_hooks::NoopHooks),
             pending_format_mark: Mutex::new(std::collections::HashSet::new()),
             pending_config_ids: Mutex::new(HashMap::new()),
@@ -1332,6 +1339,27 @@ impl AppState {
             .lock()
             .unwrap()
             .insert(vault_id.to_string(), shared);
+    }
+
+    /// Mark (or clear) a vault as needing a daemon upgrade — the cloud returned
+    /// `SC_UPGRADE_REQUIRED` for its sync (design 甲). Set by the sync path on that
+    /// signal, cleared on a successful sync. The broker reads it to fail loudly with
+    /// an actionable "run `sc upgrade`" to the agent.
+    pub fn set_vault_upgrade_required(&self, vault_id: &str, required: bool) {
+        let mut set = self.vault_upgrade_required.lock().unwrap();
+        if required {
+            set.insert(vault_id.to_string());
+        } else {
+            set.remove(vault_id);
+        }
+    }
+
+    /// Is this vault flagged `SC_UPGRADE_REQUIRED` (daemon too old for its format)?
+    pub fn is_vault_upgrade_required(&self, vault_id: &str) -> bool {
+        self.vault_upgrade_required
+            .lock()
+            .unwrap()
+            .contains(vault_id)
     }
 
     /// Does this vault's reach mask let `agent_id` use `connection_id`?

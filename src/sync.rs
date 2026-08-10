@@ -1649,6 +1649,9 @@ pub async fn watch_loop(
                 200 => {
                     backoff = Duration::from_secs(2);
                     consec_errs = 0;
+                    // A successful sync means our version is accepted — clear any
+                    // stale SC_UPGRADE_REQUIRED flag (design 甲).
+                    state.set_vault_upgrade_required(&vault, false);
                     let body: serde_json::Value = match resp.json().await {
                         Ok(b) => b,
                         Err(_) => {
@@ -1692,15 +1695,34 @@ pub async fn watch_loop(
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 401 | 403 => {
-                    // Park, don't die: a transient 403 (backend deploy, auth
-                    // migration) must not end this device's sync until daemon
-                    // restart. See AUTH_RETRY.
-                    tracing::warn!(
-                        vault = %vault,
-                        "cloud sync watch: auth rejected (HTTP {}); retrying in {}s",
-                        resp.status(),
-                        AUTH_RETRY.as_secs()
-                    );
+                    // Distinguish a FORCED UPGRADE (`SC_UPGRADE_REQUIRED`: this daemon
+                    // is too old for the vault's item format, design 甲) from a
+                    // transient 403. On the former, flag the vault so the broker fails
+                    // loudly with `sc upgrade` to the agent (not a silent park); else
+                    // it's transient — park, don't die (backend deploy / auth
+                    // migration). See AUTH_RETRY.
+                    let status = resp.status();
+                    let upgrade = resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|b| {
+                            b.get("code")
+                                .and_then(|v| v.as_str())
+                                .map(|c| c == "SC_UPGRADE_REQUIRED")
+                        })
+                        .unwrap_or(false);
+                    state.set_vault_upgrade_required(&vault, upgrade);
+                    if upgrade {
+                        tracing::warn!(vault = %vault, "cloud sync: SC_UPGRADE_REQUIRED — this daemon is too old for the vault format; run `sc upgrade`");
+                    } else {
+                        tracing::warn!(
+                            vault = %vault,
+                            "cloud sync watch: auth rejected (HTTP {}); retrying in {}s",
+                            status,
+                            AUTH_RETRY.as_secs()
+                        );
+                    }
                     tokio::time::sleep(AUTH_RETRY).await;
                 }
                 _ => {
