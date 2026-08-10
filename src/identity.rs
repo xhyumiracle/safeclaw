@@ -86,6 +86,15 @@ pub const DS_SERVER_ENVELOPE: &[u8] = b"safeclaw/v1/server-envelope";
 /// [`contact_token_input`].
 pub const DS_CONTACT_TOKEN: &[u8] = b"safeclaw/v1/contact-token";
 
+/// Domain tag for the **per-record signature** (SUDP extension A1.2/A1.3,
+/// `design/sudp-identity-signing-revision.md`). This is the SUDP-protocol-layer
+/// record signature — hence the `sudp/v1/*` family (C.4 domain decision) rather
+/// than `safeclaw/v1/*` — even though the primitive lives here in core (the sudp
+/// crate stays a pure codec, §B). It signs the CIPHERTEXT hash + the plaintext
+/// `type`/`status`, so BOTH a blind server (write-gate / clean state) and every
+/// reader (the trust wall) can verify without decrypting.
+pub const DS_ITEM_SIG: &[u8] = b"sudp/v1/item-sig";
+
 /// HKDF `info` deriving an agent's Ed25519 identity seed from its root seed.
 const AIK_IDENTITY_INFO: &[u8] = b"safeclaw/v1/agent-identity";
 
@@ -294,6 +303,49 @@ pub fn config_sig_input(
     out.push(status);
     push_lp(&mut out, &body_hash);
     push_lp(&mut out, signer_id.as_bytes());
+    out
+}
+
+/// Signing input for a **per-record signature** (SUDP extension A1.2/A1.3,
+/// `design/sudp-identity-signing-revision.md`): a principal's signature over one
+/// sealed record, binding its plaintext `type`/`status` to the sealed body.
+///
+/// ```text
+/// lp(DS_ITEM_SIG) ‖ lp(record_type) ‖ lp(item_id) ‖ u64_be(version)
+///   ‖ lp(vault_id) ‖ status(1) ‖ lp(SHA-256(sealed_body)) ‖ lp(principal_id)
+/// ```
+///
+/// Crucially the hash is over the **sealed body (ciphertext)**, not the plaintext
+/// — so a blind server AND every reader can verify the signature WITHOUT the key
+/// (the server does the write-gate for clean state; the reader is the trust wall,
+/// A1.5). `record_type` is the plaintext ns token (`secret`/`connection`/`policy`/
+/// `agent`/…) that the server gates on (A1.4 role×type) and the reader cross-binds
+/// to the decrypted record. `status` = `1` live / `0` tombstone (a delete is a
+/// signed record state; the signer+type decide who may delete). `item_id` is the
+/// blinded HMAC id (unchanged addressing). `principal_id` = the signer's self-id
+/// (`us_`/`dev_`/`ag_`) — a UIK for human writes, the DIK/AIK for automatic
+/// (daemon/agent) writes (A2). One signature does all three jobs: authorization
+/// (role×type), integrity/author identity, and rollback resistance (version is
+/// bound + the caller keeps version monotone).
+pub fn record_signature_input(
+    record_type: &str,
+    item_id: &[u8],
+    version: u64,
+    vault_id: &str,
+    sealed_body: &[u8],
+    status_live: bool,
+    principal_id: &str,
+) -> Vec<u8> {
+    let body_hash = sha256(sealed_body);
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_ITEM_SIG);
+    push_lp(&mut out, record_type.as_bytes());
+    push_lp(&mut out, item_id);
+    out.extend_from_slice(&version.to_be_bytes());
+    push_lp(&mut out, vault_id.as_bytes());
+    out.push(if status_live { 1 } else { 0 });
+    push_lp(&mut out, &body_hash);
+    push_lp(&mut out, principal_id.as_bytes());
     out
 }
 
@@ -629,6 +681,50 @@ mod tests {
         let a = config_sig_input("ab", "c", 1, Some(b"x"), "s");
         let b = config_sig_input("a", "bc", 1, Some(b"x"), "s");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn record_signature_input_every_field_binds() {
+        let base = record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", true, "us_a");
+        assert_ne!(base, record_signature_input("connection", b"\x01\x02", 3, "v1", b"ct", true, "us_a"), "type binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x03", 3, "v1", b"ct", true, "us_a"), "item_id binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 4, "v1", b"ct", true, "us_a"), "version binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v2", b"ct", true, "us_a"), "vault binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", false, "us_a"), "status (live/tombstone) binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"CT", true, "us_a"), "sealed body binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", true, "dev_a"), "principal binds");
+        assert_eq!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", true, "us_a"), "deterministic");
+    }
+
+    #[test]
+    fn record_signature_input_lp_ambiguity_resolved() {
+        // ("ab","c") vs ("a","bc") for (type, item_id) would collide without
+        // length prefixes; with them the inputs differ.
+        let a = record_signature_input("ab", b"c", 1, "v", b"x", true, "s");
+        let b = record_signature_input("a", b"bc", 1, "v", b"x", true, "s");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn record_signature_roundtrip_and_type_tamper() {
+        // A principal signs a record; the daemon/server verify over the SAME
+        // input (built from the plaintext type + the ciphertext hash). Swapping
+        // the plaintext type to bypass the write-gate breaks verification —
+        // the signature binds type↔sealed content (A1.3, kills type-class 越权).
+        let uik = SigningIdentity::from_seed(&UIK_SEED);
+        let input = record_signature_input("agent", b"\xaa\xbb\xcc", 2, "vault-x", b"sealed-ct", true, &uik.user_id());
+        let sig = uik.sign(&input);
+        assert!(verify(&uik.public_bytes(), &input, &sig), "own signature verifies");
+        let swapped = record_signature_input("secret", b"\xaa\xbb\xcc", 2, "vault-x", b"sealed-ct", true, &uik.user_id());
+        assert!(!verify(&uik.public_bytes(), &swapped, &sig), "a swapped plaintext type must not verify");
+    }
+
+    #[test]
+    fn pinned_record_signature_input() {
+        // K-vector: type "secret", id 0x0102, version 7, vault "vault-7",
+        // sealed body b"ct", live, principal "us_owner". Mirror pins the same.
+        let input = record_signature_input("secret", b"\x01\x02", 7, "vault-7", b"ct", true, "us_owner");
+        assert_eq!(hex(&input), "00000010737564702f76312f6974656d2d736967000000067365637265740000000201020000000000000007000000077661756c742d370100000020f8dcb34308e5c69f46a33cafa62bd922476b18c78a114eb144e34a5e374f7d600000000875735f6f776e6572");
     }
 
     // ── Pinned cross-language vectors ───────────────────────────────────────
