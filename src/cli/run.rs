@@ -8,12 +8,15 @@
 
 use std::path::Path;
 
+use crate::agent_pop::AgentProxyPopSigner;
 use crate::cli::active::{api_face_root, load as load_config, resolve_active};
+use crate::cli::agent_shim::{self, ShimConfig};
 use crate::cli::env::shell_quote;
 use crate::cli::proxy_env::{
     build_bundle, control_plane_up, proxy_url_for_vault, resident_ca_bundle_path, resident_ca_path,
 };
 use crate::config::RunArgs;
+use crate::identity::IdKind;
 
 pub async fn run(args: RunArgs) -> Result<(), String> {
     // clap already makes --export-env and a command mutually exclusive; require
@@ -58,13 +61,96 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     bundle.push(("SAFECLAW_VAULT_ID".to_string(), vid.clone()));
 
     if args.export_env {
+        // --export-env stays on the direct path: a printed env can't own a
+        // process-lifetime shim, so hop-A's shim only wraps the managed
+        // `sc run -- cmd` form below.
         for (k, v) in &bundle {
             println!("export {}={}", k, shell_quote(v));
         }
         return Ok(());
     }
 
+    // hop-A (design/agent-device-identity-mtls.md §9.1): if this shell carries an
+    // AIK identity (`SAFECLAW_AGENT_IDENTITY` → an agent identity file), route the
+    // child through the sc-transport shim so NO credential lands in the child env
+    // — the shim holds the AIK (mints a per-CONNECT PoP) and the api-key (injected
+    // as the api-face Bearer), and we strip the inherited key from the child.
+    // ADDITIVE / dual-auth: with no AIK identity file this is skipped entirely and
+    // the child takes today's direct exec path, so nothing changes for existing
+    // agents (none set `SAFECLAW_AGENT_IDENTITY`).
+    if let Some(signer) = load_agent_signer() {
+        return run_via_shim(&args.cmd, &vid, &ca_str, parent_count, signer).await;
+    }
+
     exec_child(&args.cmd, &bundle)
+}
+
+/// Load the agent's AIK signer from `SAFECLAW_AGENT_IDENTITY` (a PATH to the
+/// agent identity file, per the locked naming — NOT a secret). `None` when unset
+/// or not an agent identity, so `sc run` falls back to the direct path.
+fn load_agent_signer() -> Option<AgentProxyPopSigner> {
+    let path = std::env::var_os("SAFECLAW_AGENT_IDENTITY").filter(|p| !p.is_empty())?;
+    let loaded = crate::identity_file::load(Path::new(&path)).ok()?;
+    if loaded.kind != IdKind::Agent {
+        return None;
+    }
+    Some(AgentProxyPopSigner::new(loaded.identity, loaded.id))
+}
+
+/// The `host:port` authority of a URL (scheme + path stripped) — where the shim
+/// forwards to (the real daemon proxy, the same face the child dials today).
+fn authority_of(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+/// Run the child through the sc-transport shim (hop-A). Starts the shim on an
+/// ephemeral loopback port, points the child's `*_PROXY` at it with NO creds in
+/// the URL, STRIPS the inherited `SAFECLAW_API_KEY` from the child env (the shim
+/// holds it now), then SPAWNS (not execs) the child so the shim task keeps
+/// serving in this process, waits, and propagates the exit code.
+async fn run_via_shim(
+    cmd: &[String],
+    vid: &str,
+    ca_str: &str,
+    parent_count: Option<u32>,
+    signer: AgentProxyPopSigner,
+) -> Result<(), String> {
+    let cfg = load_config().unwrap_or_default();
+    let daemon_authority = authority_of(&api_face_root(&cfg));
+    let api_key = std::env::var("SAFECLAW_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let (port, shim) = agent_shim::start(ShimConfig {
+        vid: vid.to_string(),
+        daemon_authority,
+        signer,
+        api_key,
+    })
+    .await
+    .map_err(|e| format!("start sc transport: {}", e))?;
+
+    // Child proxy → the shim, NO creds in the URL (the shim injects them).
+    let shim_url = format!("http://127.0.0.1:{}", port);
+    let mut bundle = build_bundle(&shim_url, ca_str, parent_count);
+    bundle.push(("SAFECLAW_VAULT_ID".to_string(), vid.to_string()));
+
+    let (prog, rest) = cmd.split_first().ok_or("no command to run")?;
+    let mut c = tokio::process::Command::new(prog);
+    c.args(rest);
+    // The whole point of hop-A: the injectable api-key must NOT be in the child
+    // env. The parent shell exported it (that's how `sc run` reads it); the shim
+    // holds it now, so strip it from what the child inherits.
+    c.env_remove("SAFECLAW_API_KEY");
+    for (k, v) in &bundle {
+        c.env(k, v);
+    }
+    let status = c
+        .status()
+        .await
+        .map_err(|e| format!("spawn {}: {}", prog, e))?;
+    shim.abort();
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// The proxy URL the child's `HTTPS_PROXY` gets (CREDENTIAL_BROKER.md §14).
