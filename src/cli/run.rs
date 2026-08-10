@@ -40,6 +40,10 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
         );
     }
 
+    if !args.export_env {
+        warn_git_url_specific_proxy(&args.cmd);
+    }
+
     // Hand the child a bundle = broker root + OS trust-store roots (not the
     // broker-only `ca.pem`), so tools without a compiled system-CApath fallback
     // (cargo) can still verify passthrough public hosts. Falls back to the
@@ -65,6 +69,37 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     }
 
     exec_child(&args.cmd, &bundle)
+}
+
+/// A URL-specific `http.<url>.proxy` in a gitconfig FILE outranks even the
+/// command-scope `http.proxy` pin the bundle carries (git's URL matching
+/// prefers specificity over scope), so git traffic to those URLs bypasses the
+/// broker and a phantom reaches the upstream unswapped. That can't be won from
+/// the environment — name the keys so the user can scope or drop them.
+fn warn_git_url_specific_proxy(cmd: &[String]) {
+    let is_git = cmd
+        .first()
+        .map(|p| Path::new(p).file_stem().is_some_and(|s| s == "git"))
+        .unwrap_or(false);
+    if !is_git {
+        return;
+    }
+    let Ok(out) = std::process::Command::new("git")
+        .args(["config", "--get-regexp", r"^http\..+\.proxy$"])
+        .output()
+    else {
+        return; // no git on PATH / config unreadable — nothing to say
+    };
+    let found = String::from_utf8_lossy(&out.stdout);
+    let found = found.trim();
+    if found.is_empty() {
+        return;
+    }
+    eprintln!(
+        "note: your git config sets URL-specific proxies — git traffic to those URLs \
+         bypasses SafeClaw, so credential substitution won't happen there:\n{found}\n\
+         Drop the key (`git config --unset <key>`) if that host should be brokered."
+    );
 }
 
 /// The proxy URL the child's `HTTPS_PROXY` gets (CREDENTIAL_BROKER.md §14).

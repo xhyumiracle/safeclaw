@@ -161,7 +161,7 @@ pub fn build_bundle(
     // git's per-process config env (no gitconfig writes): register our helper at
     // the next free index. `!` is git's shell-command marker.
     let idx = parent_git_config_count.unwrap_or(0);
-    b.push(("GIT_CONFIG_COUNT".to_string(), (idx + 1).to_string()));
+    b.push(("GIT_CONFIG_COUNT".to_string(), (idx + 2).to_string()));
     b.push((
         format!("GIT_CONFIG_KEY_{}", idx),
         "credential.helper".to_string(),
@@ -169,6 +169,20 @@ pub fn build_bundle(
     b.push((
         format!("GIT_CONFIG_VALUE_{}", idx),
         "!sc git-credential".to_string(),
+    ));
+    // A gitconfig-file `http.proxy` outranks the `*_PROXY` env (git prefers its
+    // own config), silently routing git around the broker — the phantom then
+    // reaches the upstream unswapped as a literal. Command-scope config outranks
+    // every file scope, so pin git to the proxy the env already carries. A
+    // URL-specific `http.<url>.proxy` is still more specific and wins; `sc run`
+    // preflight warns on those.
+    b.push((
+        format!("GIT_CONFIG_KEY_{}", idx + 1),
+        "http.proxy".to_string(),
+    ));
+    b.push((
+        format!("GIT_CONFIG_VALUE_{}", idx + 1),
+        proxy_url.to_string(),
     ));
     b
 }
@@ -277,9 +291,13 @@ mod tests {
         ] {
             assert_eq!(get(k).unwrap(), "/x/ca.pem");
         }
-        assert_eq!(get("GIT_CONFIG_COUNT").unwrap(), "1");
+        assert_eq!(get("GIT_CONFIG_COUNT").unwrap(), "2");
         assert_eq!(get("GIT_CONFIG_KEY_0").unwrap(), "credential.helper");
         assert_eq!(get("GIT_CONFIG_VALUE_0").unwrap(), "!sc git-credential");
+        // git must be pinned to the SAME proxy the env carries — a gitconfig
+        // file's `http.proxy` would otherwise outrank the env and bypass it.
+        assert_eq!(get("GIT_CONFIG_KEY_1").unwrap(), "http.proxy");
+        assert_eq!(get("GIT_CONFIG_VALUE_1"), get("HTTPS_PROXY"));
     }
 
     #[test]
@@ -344,9 +362,11 @@ mod tests {
         let proxy = proxy_url_for_vault("http://127.0.0.1:23294", "abc", Some("k1"));
         let b = build_bundle(&proxy, "/x/ca.pem", Some(2));
         let get = |k: &str| b.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-        assert_eq!(get("GIT_CONFIG_COUNT").unwrap(), "3");
+        assert_eq!(get("GIT_CONFIG_COUNT").unwrap(), "4");
         assert_eq!(get("GIT_CONFIG_KEY_2").unwrap(), "credential.helper");
         assert_eq!(get("GIT_CONFIG_VALUE_2").unwrap(), "!sc git-credential");
+        assert_eq!(get("GIT_CONFIG_KEY_3").unwrap(), "http.proxy");
+        assert_eq!(get("GIT_CONFIG_VALUE_3"), get("HTTPS_PROXY"));
         // We do NOT touch the parent's lower indices.
         assert!(get("GIT_CONFIG_KEY_0").is_none());
     }
