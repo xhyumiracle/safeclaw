@@ -707,6 +707,51 @@ fn verify_record_sidecar_sig(
     }
 }
 
+/// Fold one authorized-agents row, PREFERRING the new sidecar item-sig (A1.2) and
+/// falling back to the legacy in-body config-sig during the migration batch. The
+/// sidecar path verifies `record_signature_input` (type `"agent"`, the blinded
+/// `item_id` disambiguating WHICH agent) over the ciphertext, then applies the §11
+/// authz (signer is the row's `owner` OR any owner). Returns `(data, was_signed)`
+/// to honor, or `None` to drop. `body` is the raw row for the sidecar path (no
+/// wrapper) or the `{data,uik_sig}` wrapper for the config-sig fallback.
+#[allow(clippy::too_many_arguments)]
+fn fold_agent_record(
+    stored_sig: Option<&str>,
+    stored_signer: Option<&str>,
+    ct: &[u8],
+    keyset: &Keyset,
+    vault_id: &str,
+    item_id_raw: &[u8],
+    config_name: &str,
+    version: u64,
+    body: serde_json::Value,
+    trust: &MembershipTrust,
+) -> Option<(serde_json::Value, bool)> {
+    let Some(sig) = stored_sig else {
+        // No sidecar → legacy in-body config-sig path (unchanged).
+        return unwrap_verified_agent_grant(body, keyset, vault_id, config_name, version, trust);
+    };
+    let signer = stored_signer?;
+    let sid = verify_record_sidecar_sig(
+        ct, keyset, vault_id, item_id_raw, "agent", version, true, sig, signer,
+    )?;
+    match trust {
+        MembershipTrust::Untrusted => None,
+        // Legacy v1 keyset: integrity-only (the sig already verified above).
+        MembershipTrust::NoUik => Some((body, true)),
+        MembershipTrust::Verified(membership) => {
+            let owner = body.get("owner").and_then(|v| v.as_str()).unwrap_or_default();
+            let is_owner = membership.get(&sid)
+                == Some(&crate::storage::plaintext::MemberRole::Owner);
+            if is_owner || sid == owner {
+                Some((body, true))
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// The three-state trust an owner-config reader derives from the KEYSET's UIK
 /// anchor (design/identity-uik-aik.md §4.3, team-shared-vault-security-model.md
 /// §9). This REPLACES the old `Option<BTreeMap<..>>` membership signal, which
@@ -1938,14 +1983,18 @@ impl PerItemVault {
                         aux.connecting.insert(name, c);
                     }
                     ItemNs::Agent => {
-                        let raw = payload.body.clone();
+                        let raw_body = payload.body.clone();
                         let cfg = format!("agent/{}", name);
-                        let Some((data, was_signed)) = unwrap_verified_agent_grant(
-                            payload.body,
+                        let Some((data, was_signed)) = fold_agent_record(
+                            stored.sig.as_deref(),
+                            stored.signer.as_deref(),
+                            &stored.ct,
                             &self.keyset,
                             vault_id,
+                            &raw,
                             &cfg,
                             stored.version,
+                            payload.body,
                             &trust,
                         ) else {
                             tracing::warn!(vault = %vault_id, agent = %name, "fold: dropping agent grant — unauthorized/invalid signature");
@@ -1955,7 +2004,7 @@ impl PerItemVault {
                             serde_json::from_value(data).map_err(|e| {
                                 AppError::Internal(format!("agent '{}' parse: {}", name, e))
                             })?;
-                        entry.signed_body = was_signed.then_some(raw);
+                        entry.signed_body = was_signed.then_some(raw_body);
                         aux.agents.insert(name, entry);
                     }
                     ItemNs::Policy => {
@@ -2112,18 +2161,23 @@ impl PerItemVault {
                             }
                             n => {
                                 if let Some(agent_id) = n.strip_prefix("agent/") {
-                                    // §11.1 authorized-agents table row — UIK-signed
-                                    // (or legacy raw). Verify + authorize; a bad /
+                                    // §11.1 authorized-agents table row — sidecar
+                                    // item-sig (A1.2) preferred, in-body config-sig
+                                    // fallback. Verify + authorize; a bad /
                                     // unauthorized row drops (that ag_id is simply
-                                    // not in the table). The verified signed wrapper
-                                    // is retained for lossless re-emit.
-                                    let raw = payload.body.clone();
-                                    let Some((data, was_signed)) = unwrap_verified_agent_grant(
-                                        payload.body,
+                                    // not in the table). The verified signed body is
+                                    // retained for lossless re-emit.
+                                    let raw_body = payload.body.clone();
+                                    let Some((data, was_signed)) = fold_agent_record(
+                                        stored.sig.as_deref(),
+                                        stored.signer.as_deref(),
+                                        &stored.ct,
                                         &self.keyset,
                                         vault_id,
+                                        &raw,
                                         n,
                                         stored.version,
+                                        payload.body,
                                         &trust,
                                     ) else {
                                         tracing::warn!(vault = %vault_id, agent = %agent_id, "fold: dropping agent grant — unauthorized/invalid signature");
@@ -2136,7 +2190,7 @@ impl PerItemVault {
                                                 agent_id, e
                                             ))
                                         })?;
-                                    entry.signed_body = was_signed.then_some(raw);
+                                    entry.signed_body = was_signed.then_some(raw_body);
                                     // Per-item row is authoritative for its id;
                                     // it overrides anything a legacy blob carried.
                                     aux.agents.insert(agent_id.to_string(), entry);
