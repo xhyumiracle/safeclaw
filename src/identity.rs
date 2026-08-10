@@ -86,6 +86,13 @@ pub const DS_SERVER_ENVELOPE: &[u8] = b"safeclaw/v1/server-envelope";
 /// [`contact_token_input`].
 pub const DS_CONTACT_TOKEN: &[u8] = b"safeclaw/v1/contact-token";
 
+/// A device's per-request proof-of-possession over a daemon→cloud request (the
+/// DIK half of mutual mTLS, hop-B). Railway terminates TLS, so hop-B can't be a
+/// real client-cert handshake — instead the daemon signs each request with its
+/// DIK and the Node backend verifies the signature against the device's
+/// registered `dev_` pubkey. See [`device_request_signature_input`].
+pub const DS_DEVICE_REQ: &[u8] = b"safeclaw/v1/device-req";
+
 /// Domain tag for the **per-record signature** (SUDP extension A1.2/A1.3,
 /// `design/sudp-identity-signing-revision.md`). This is the SUDP-protocol-layer
 /// record signature — hence the `sudp/v1/*` family (C.4 domain decision) rather
@@ -346,6 +353,49 @@ pub fn record_signature_input(
     out.push(if status_live { 1 } else { 0 });
     push_lp(&mut out, &body_hash);
     push_lp(&mut out, principal_id.as_bytes());
+    out
+}
+
+/// Signing input for a **device request proof-of-possession** (hop-B of the
+/// mutual-mTLS transport, `design/agent-device-identity-mtls.md` §9.1). The
+/// daemon signs every cloud request with its DIK so the Node backend can verify
+/// "this request really came from an authorized device" WITHOUT a client-cert
+/// handshake (Railway terminates TLS before the app ever sees the connection).
+///
+/// ```text
+/// lp(DS_DEVICE_REQ) ‖ lp(method) ‖ lp(path) ‖ u64_be(timestamp)
+///   ‖ lp(SHA-256(body)) ‖ lp(device_id)
+/// ```
+///
+/// Every field binds so a captured signature can't be replayed onto a different
+/// request: `method`+`path` pin the endpoint (pass `path` including the query
+/// string, exactly as it appears on the wire, so it matches byte-for-byte at the
+/// verifier), `timestamp` (unix seconds) bounds the replay window, the body hash
+/// pins the payload (use `&[]` for a bodyless GET — its SHA-256 is a fixed
+/// constant both sides compute), and `device_id` (the `dev_…` self-id) tells the
+/// verifier which registered pubkey to check. This is a SafeClaw transport-auth
+/// concern, not part of the SUDP sealed-record protocol, so it lives in the
+/// `safeclaw/v1/*` domain (unlike the `sudp/v1/item-sig` record signature).
+///
+/// hop-B is ADDITIVE: the daemon keeps sending its bearer device-key too, so an
+/// un-upgraded backend (that ignores the signature header) still authenticates,
+/// and a backend that has not yet migrated the device pubkey column verifies
+/// nothing and falls back to the bearer. Nothing bricks in any upgrade order.
+pub fn device_request_signature_input(
+    method: &str,
+    path: &str,
+    timestamp: u64,
+    body: &[u8],
+    device_id: &str,
+) -> Vec<u8> {
+    let body_hash = sha256(body);
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_DEVICE_REQ);
+    push_lp(&mut out, method.as_bytes());
+    push_lp(&mut out, path.as_bytes());
+    out.extend_from_slice(&timestamp.to_be_bytes());
+    push_lp(&mut out, &body_hash);
+    push_lp(&mut out, device_id.as_bytes());
     out
 }
 
@@ -717,6 +767,49 @@ mod tests {
         assert!(verify(&uik.public_bytes(), &input, &sig), "own signature verifies");
         let swapped = record_signature_input("secret", b"\xaa\xbb\xcc", 2, "vault-x", b"sealed-ct", true, &uik.user_id());
         assert!(!verify(&uik.public_bytes(), &swapped, &sig), "a swapped plaintext type must not verify");
+    }
+
+    #[test]
+    fn device_request_signature_input_every_field_binds() {
+        let base = device_request_signature_input("GET", "/p", 1, b"body", "dev_a");
+        assert_ne!(base, device_request_signature_input("PUT", "/p", 1, b"body", "dev_a"), "method binds");
+        assert_ne!(base, device_request_signature_input("GET", "/q", 1, b"body", "dev_a"), "path binds");
+        assert_ne!(base, device_request_signature_input("GET", "/p", 2, b"body", "dev_a"), "timestamp binds");
+        assert_ne!(base, device_request_signature_input("GET", "/p", 1, b"BODY", "dev_a"), "body binds");
+        assert_ne!(base, device_request_signature_input("GET", "/p", 1, b"body", "dev_b"), "device_id binds");
+        assert_eq!(base, device_request_signature_input("GET", "/p", 1, b"body", "dev_a"), "deterministic");
+    }
+
+    #[test]
+    fn device_request_signature_input_lp_ambiguity_resolved() {
+        // ("GET","/p") vs ("GE","T/p") for (method, path) would collide without
+        // length prefixes; with them the inputs differ.
+        let a = device_request_signature_input("GET", "/p", 1, b"", "d");
+        let b = device_request_signature_input("GE", "T/p", 1, b"", "d");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn device_request_roundtrip_and_path_tamper() {
+        // The daemon signs a request with its DIK; the backend verifies over the
+        // SAME input rebuilt from the wire (method/path/ts/body/device_id).
+        // Replaying the signature onto a different path must fail — the DIK
+        // signature binds the request, not just the device.
+        let dik = SigningIdentity::from_seed(&UIK_SEED);
+        let dev_id = derive_id(IdKind::Device, &dik.public_bytes());
+        let input = device_request_signature_input("PUT", "/v/vault-x/membership", 1_700_000_000, b"{}", &dev_id);
+        let sig = dik.sign(&input);
+        assert!(verify(&dik.public_bytes(), &input, &sig), "own signature verifies");
+        let tampered = device_request_signature_input("PUT", "/v/vault-y/membership", 1_700_000_000, b"{}", &dev_id);
+        assert!(!verify(&dik.public_bytes(), &tampered, &sig), "a swapped path must not verify");
+    }
+
+    #[test]
+    fn pinned_device_request_signature_input() {
+        // K-vector: GET, path "/api/vault/agents/hashes", ts 1700000000, empty
+        // body, device "dev_box". The Node backend mirror pins the same bytes.
+        let input = device_request_signature_input("GET", "/api/vault/agents/hashes", 1_700_000_000, b"", "dev_box");
+        assert_eq!(hex(&input), "0000001673616665636c61772f76312f6465766963652d72657100000003474554000000182f6170692f7661756c742f6167656e74732f686173686573000000006553f10000000020e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855000000076465765f626f78");
     }
 
     #[test]
