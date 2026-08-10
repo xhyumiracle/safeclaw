@@ -245,7 +245,7 @@ pub struct SecretsCache {
     /// The vault's **authorized-agents table** (design §11.1), keyed by `ag_id`
     /// (`derive_id(Agent, pubkey)`). Snapshot of `view.aux.agents` at
     /// unlock/refresh. **Presence = authorized**; an `ag_id` with no entry is not
-    /// in the table. Consulted ONLY on the AIK (mTLS) path where the daemon knows
+    /// in the table. Consulted ONLY on the AIK (PoP) path where the daemon knows
     /// the presented `ag_id`; the legacy Basic api-key path (dual-auth window)
     /// carries an api-key prefix, which is never in this `ag_`-keyed table → the
     /// mask lookup misses → the caller falls to the legacy allow (nothing bricks

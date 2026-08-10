@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 940" width="1240" height="940" role="img">
-  <title>SafeClaw identity protocol: UIK/AIK/DIK keypairs, mutual TLS on each hop, the in-vault authorized-agents table as the daemon's only authorization source, and where each verifier fetches the public key.</title>
+  <title>SafeClaw identity protocol: UIK/AIK/DIK keypairs, app-layer proof-of-possession (PoP, DPoP-style) signature on each hop, the in-vault authorized-agents table as the daemon's only authorization source, and where each verifier fetches the public key.</title>
   <style>
     text{font-family:-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',Roboto,Helvetica,Arial,sans-serif}
     .cap{font-size:13px;letter-spacing:.16em;fill:#8f7a52;font-weight:700}
@@ -25,7 +25,7 @@
   </defs>
 
   <rect x="0" y="0" width="1240" height="940" rx="24" fill="#0b0b0d"/>
-  <text x="40" y="46" class="cap">SAFECLAW · 身份协议 (UIK · AIK · DIK) · mTLS 每一跳 · 库内授权表 = 唯一授权源</text>
+  <text x="40" y="46" class="cap">SAFECLAW · 身份协议 (UIK · AIK · DIK) · PoP 签名每一跳 · 库内授权表 = 唯一授权源</text>
 
   <!-- key legend strip -->
   <g transform="translate(40,66)">
@@ -36,11 +36,11 @@
     </g>
     <g transform="translate(470,17)">
       <rect x="0" y="-11" width="64" height="22" rx="6" fill="#c9a96e1f" stroke="#c9a96e52"/><text x="32" y="4" class="kt mid" fill="#c9a96e">AIK ag_</text>
-      <text x="74" y="4" class="bd">agent · mTLS 客户端身份</text>
+      <text x="74" y="4" class="bd">agent · PoP 签名身份</text>
     </g>
     <g transform="translate(800,17)">
       <rect x="0" y="-11" width="66" height="22" rx="6" fill="#7fd1ae1f" stroke="#7fd1ae4d"/><text x="33" y="4" class="kt mid" fill="#7fd1ae">DIK dev_</text>
-      <text x="76" y="4" class="bd">设备 · mTLS 客户端身份</text>
+      <text x="76" y="4" class="bd">设备 · PoP 签名身份</text>
     </g>
     <text x="1150" y="21" class="dim" text-anchor="end">🔑 私钥 · 🔒 密文 · ✔ 验</text>
   </g>
@@ -60,7 +60,7 @@
   <rect x="330" y="186" width="230" height="120" rx="13" fill="#161619" stroke="#ffffff12"/>
   <text x="348" y="214" class="bt">sc 传输 / sc run</text>
   <text x="348" y="238" class="bd">传输侧持 <tspan class="mono code">AIK</tspan>,与 daemon</text>
-  <text x="348" y="256" class="bd">做 mTLS(出示客户端证书)。</text>
+  <text x="348" y="256" class="bd">做 PoP(每连接现签令牌)。</text>
   <rect x="348" y="270" width="86" height="22" rx="6" fill="#c9a96e1f" stroke="#c9a96e52"/><text x="391" y="285" class="kt mid" fill="#c9a96e">🔑 AIK ag_</text>
 
   <!-- identity files (disk) -->
@@ -78,7 +78,7 @@
   <text x="638" y="234" class="bg2">唯一见明文处</text>
   <rect x="638" y="246" width="70" height="22" rx="6" fill="#b48ef01f" stroke="#b48ef04d"/><text x="673" y="261" class="kt mid" fill="#b48ef0">🔓 K</text>
   <rect x="716" y="246" width="92" height="22" rx="6" fill="#7fd1ae1f" stroke="#7fd1ae4d"/><text x="762" y="261" class="kt mid" fill="#7fd1ae">🔑 DIK dev_</text>
-  <text x="638" y="292" class="bd">① 验 AIK 客户端证书(mTLS)</text>
+  <text x="638" y="292" class="bd">① 验 AIK 签名令牌(PoP)</text>
   <text x="638" y="312" class="bd">② ag_ pk ∈ 本库 authorized-agents 表?</text>
   <text x="654" y="330" class="dim">(表在库内密文;daemon 只看它,不看 server)</text>
   <text x="638" y="350" class="bd">③ 过该项里的连接 mask</text>
@@ -99,7 +99,7 @@
 
   <line x1="560" y1="246" x2="616" y2="246" stroke="#c9a96e" stroke-width="2.5" marker-end="url(#ag)"/>
   <circle cx="588" cy="230" r="9" fill="#0b0b0d" stroke="#c9a96e"/><text x="588" y="234" class="num">2</text>
-  <text x="588" y="212" class="gl mid">hop-A · mTLS</text>
+  <text x="588" y="212" class="gl mid">hop-A · PoP</text>
 
   <line x1="900" y1="246" x2="956" y2="246" stroke="#c9a96e" stroke-width="2.5" marker-end="url(#ag)"/>
   <circle cx="928" cy="230" r="9" fill="#0b0b0d" stroke="#c9a96e"/><text x="928" y="234" class="num">3</text>
@@ -111,15 +111,15 @@
   <path d="M560 388 C 592 388, 600 300, 618 300" fill="none" stroke="#7fd1ae" stroke-width="1.6" marker-end="url(#gn)"/>
 
   <!-- hop-A note -->
-  <text x="580" y="470" class="gl mid">② hop-A = mTLS:sc 出示 AIK 客户端证书 → daemon 验证书,再查 ag_ pk 是否在本库授权表。</text>
+  <text x="580" y="470" class="gl mid">② hop-A = PoP:sc 在 Proxy-Auth 现签 AIK 令牌 → daemon 验签,再查 ag_ pk 是否在本库授权表。</text>
   <text x="580" y="488" class="dim mid">sc 是传输(持 AIK);子进程照旧走 proxy,私钥不进它的环境、不上网。</text>
 
   <!-- ============ hop-B down to cloud ============ -->
   <path d="M760 416 C 760 470, 620 500, 620 616" fill="none" stroke="#7fd1ae" stroke-width="2.5" marker-end="url(#gn)"/>
   <circle cx="686" cy="520" r="9" fill="#0b0b0d" stroke="#7fd1ae"/><text x="686" y="524" class="num" fill="#7fd1ae">4</text>
-  <text x="700" y="512" class="grn">hop-B = mTLS:daemon 出示 DIK</text>
+  <text x="700" y="512" class="grn">hop-B = PoP:daemon 用 DIK 签请求</text>
   <text x="700" y="530" class="dim">云端验 dev_ pk ∈ authorized-devices</text>
-  <text x="700" y="548" class="dim">(托管平台终结 TLS 时,实现为 DIK 签名请求)</text>
+  <text x="700" y="548" class="dim">(Ed25519 签请求摘要 + 时间戳;托管平台终结 TLS)</text>
 
   <!-- ============ CLOUD zone ============ -->
   <rect x="330" y="616" width="590" height="286" rx="16" fill="none" stroke="#2f3a4a" stroke-dasharray="5 5"/>
@@ -164,7 +164,7 @@
   <text x="960" y="644" class="cap" style="font-size:11px">谁来验 · 公钥从哪取</text>
 
   <rect x="958" y="660" width="60" height="20" rx="6" fill="#c9a96e1f" stroke="#c9a96e52"/><text x="988" y="674" class="kt mid" fill="#c9a96e">AIK</text>
-  <text x="960" y="700" class="bd">本地 daemon 验 mTLS 证书。</text>
+  <text x="960" y="700" class="bd">本地 daemon 验 AIK 签名。</text>
   <text x="960" y="718" class="dim">ag_ pk 直接查本库</text>
   <text x="960" y="734" class="dim">authorized-agents 表(E2E,</text>
   <text x="960" y="750" class="dim">daemon 已持);不看 server。</text>

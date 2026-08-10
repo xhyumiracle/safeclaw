@@ -4,7 +4,7 @@
 //! (`design/agent-device-identity-mtls.md` §5): same JSON shape, same 0600
 //! discipline, same "the seed is the secret, the id is the derived handle"
 //! contract. This is the identity-wave's Phase 2 foundation — minting + on-disk
-//! custody — consumed by the mTLS transport (Phase 3) and by `sc agent add` /
+//! custody — consumed by the app-layer PoP transport (Phase 3) and by `sc agent add` /
 //! `sc login`.
 //!
 //! Paths (§5):

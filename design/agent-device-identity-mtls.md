@@ -5,6 +5,27 @@ One coherent wave: replace the two BEARER credentials (agent api-key, device pai
 possession-proven **keypair identities**, verified by **mutual mTLS**, symmetric in naming /
 paths / lifecycle. No loose ends, no half-migration. Code AFTER this doc.
 
+> ⚠️ **BUILT AS application-layer PoP, NOT a TLS client-cert handshake (realized 2026-08-10).**
+> This doc (and its name) frame the mechanism as "mutual mTLS" — that is the design abstraction and
+> the intended *property*. What was actually IMPLEMENTED on **both** hops is an application-layer
+> **proof-of-possession (PoP)** signature — the DPoP pattern (RFC 9449): a fresh keypair-signed token
+> in the standard auth header, not a TLS client-cert handshake. mTLS is the transport-layer form of
+> the same "prove you hold the private key" property; we ship the app-layer form because the TLS
+> client-cert channel isn't available on either hop.
+> - **hop-A (agent→daemon):** the AIK signs a per-CONNECT token carried in `Proxy-Authorization`
+>   (`identity::agent_proxy_pop_input` → `scpop1.<pub>.<ts>.<sig>`), verified against the E2E
+>   authorized-agents table. A standard client can't present a client cert to a forward proxy (and
+>   hudsucker's inbound can't surface one to its authz handler), so the §1/§4/§9.1 "present the
+>   cert / mTLS-wrapping shim" wording is the SUPERSEDED plan — see the decision-log reversal below.
+>   Built = `agent_pop` + `proxy/handler` PoP verify + the `sc`-transport shim (`cli/agent_shim`).
+> - **hop-B (daemon→cloud):** the DIK signs each request (`identity::device_request_signature_input`),
+>   verified by the Node backend against the device's registered pubkey (Railway terminates TLS, so no
+>   client cert reaches the app). This doc's decision-log already recorded hop-B as a signed request.
+>
+> Read every "mTLS / client cert" below as "PoP signature" for the built system. The **authz** model
+> (§11 authorized-agents table) is unchanged and fully current — only the *auth transport* is PoP,
+> not mTLS. Code refs: `design/sudp-identity-signing-revision.md` is a different (甲) wave.
+
 **Status update 2026-08-10:** the agent-authorization model was reworked to its simplest stable
 form. **GROUND TRUTH = §11 (LOCKED 2026-08-10)** for authz + connect/install flows; §1/§4/§5/§6/§7/§8
 still hold for mTLS / multi-agent / naming / migration / threat model; **§2/§3 admission framing is
@@ -16,6 +37,7 @@ SUPERSEDED by §11.** Diagram: `design/identity-protocol.svg`. Post-compact exec
 - **Auth = mutual mTLS both hops** (AIK client cert to daemon; DIK to cloud) · a big-co reviewer named requestor-identity-check = mTLS · not a bearer, not per-op signing.
 - **hop-A needs the `sc` transport to present the cert** (generic HTTP clients can't client-cert an HTTPS proxy via env) · faithful to "sc transport does the mTLS" · NOT a data-path change the agent sees.
 - **hop-B realized as a DIK-signed request** when the cloud sits behind TLS-terminating hosting · same mutual-auth outcome · literal TLS-client-cert not available there.
+- **hop-A ALSO realized as a signed token, NOT a client cert** (2026-08-10, REVERSAL of the "present the cert" line above) · a forward proxy exposes no client-cert channel to a generic client, and hudsucker's inbound can't surface a client cert to its authz handler · so the AIK signs a per-CONNECT `Proxy-Authorization` PoP token (DPoP-style, RFC 9449), verified against the authorized-agents table — same "possession-proven, not a bearer" outcome. **Both hops = app-layer PoP; see the top banner.**
 - **Authz = explicit in-vault authorized-agents TABLE, UIK-signed; daemon reads ONLY it** (§11) · one server-blind source, no trust in a server agent→account map · REVERSED two earlier tries: "presence = admitted grant" (Phase-1) and "membership-derived admission" (interim) — both needed a mode/join; the table is simpler + stable.
 - **Dropped open/gated modes** · a permanent two-state toggle to solve a one-time migration is complexity-for-nothing · the table ships WITH AIK so the legacy api-key path is untouched → nothing bricks.
 - **Account known-agents roster = management/discovery only, NOT authz** · keeps machine identity in one place (agent≡api-key) · does not entangle the daemon's authz decision.

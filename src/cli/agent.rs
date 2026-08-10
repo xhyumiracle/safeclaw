@@ -4,7 +4,9 @@
 //! key; the cloud stores only its hash; the key works on ANY of the account's
 //! paired devices (the daemon syncs the hash-set + validates locally). Auth is
 //! this device's device-key (account-scoped), so `sc agent` works on any
-//! paired machine. See [[project_vault_agent_architecture_2026_06_25]].
+//! paired machine. As of the identity wave each agent ALSO mints an AIK keypair
+//! (hop-A PoP identity) here; the api-key stays as the dual-auth legacy path.
+//! See [[project_vault_agent_architecture_2026_06_25]].
 
 use std::time::Duration;
 
@@ -71,9 +73,11 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // ── Mint this agent's AIK (possession-proven identity; identity wave §2) ──
     // Ed25519 keypair, self-certifying `ag_…` id. The private SEED never leaves
     // this disk (0600) and never enters the agent's env — only the PUBLIC key is
-    // registered with the cloud (which relays it to the authorized-agents set the
-    // daemon verifies once mTLS ships). Persisted only AFTER the cloud accepts
-    // the registration, so a failed create leaves no orphan file.
+    // registered with the cloud (for the known-agents roster / discovery; the
+    // daemon's real authz source is the E2E authorized-agents table). hop-A
+    // verifies the AIK per-CONNECT via a Proxy-Authorization PoP token
+    // (DPoP-style), NOT mTLS. Persisted only AFTER the cloud accepts the
+    // registration, so a failed create leaves no orphan file.
     let (seed, ag_id) = crate::identity_file::mint(crate::identity::IdKind::Agent);
     let (aik, _) = crate::identity_file::resolve(crate::identity::IdKind::Agent, &seed);
     let aik_pub = data_encoding::BASE64.encode(&aik.public_bytes());
@@ -83,8 +87,9 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     let body = serde_json::json!({
         "label": args.name,
         "tier": "agent",
-        // Additive: an older backend ignores these; a current one records
-        // the pubkey for the AIK authorized-set (dual-auth window §7).
+        // Additive: an older backend ignores these; a current one records the
+        // pubkey in the known-agents roster (management/discovery — the daemon's
+        // authz is the E2E authorized-agents table, not this server record).
         "agent_id": ag_id,
         "agent_pubkey": aik_pub,
     });
@@ -110,7 +115,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // Print the agent's env as dotenv lines: the daemon's API face, the AIK
     // identity PATH (a path, not a secret — the possession-proven identity, the
     // dual-auth target), and the legacy api-key (still the ACTIVE transport until
-    // mTLS flips; kept so nothing bricks — design §7). The agent appends ONE
+    // the AIK PoP path is enforced; kept so nothing bricks — design §7). The agent appends ONE
     // command's stdout to its own `.env` and never assembles a value. STDOUT
     // only; stderr guidance carries NO secret.
     //
