@@ -317,6 +317,18 @@ pub struct StoredItem {
     /// pre-upgrade row reads as live — harmless, it only affects push order).
     #[serde(default)]
     pub tombstone: bool,
+    /// The per-record Ed25519 signature (A1.2, `record_signature_input` over the
+    /// CIPHERTEXT), base64url-nopad — `None` for a legacy unsigned record (pre-team
+    /// fmt1 personal / NoUik, honored additively). Carried on the wire
+    /// (`vault_items.sig`) so a blind server can gate + every reader can verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
+    /// The signing principal's self-id (`us_`/`dev_`) — a UIK for human writes, the
+    /// DIK for automatic (daemon/OAuth) writes (A2). `None` iff unsigned. Wire:
+    /// `vault_items.signer`. The reader maps it to a pubkey (keyset UIK / authorized
+    /// devices) to verify + to a role for the role×type gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
 }
 
 /// The v2 (UIK) material carried alongside one credential (device) row — the
@@ -1024,6 +1036,20 @@ impl PerItemVault {
     /// false: an adopted row is clean and never re-pushed, so its push-order
     /// flag is never consulted (and we hold no K here to open the ct anyway).
     pub fn put_raw(&mut self, item_id_b64: String, version: u64, ct: Vec<u8>) {
+        self.put_raw_signed(item_id_b64, version, ct, None, None)
+    }
+
+    /// Like [`Self::put_raw`] but carrying the per-record signature fields pulled
+    /// from the cloud row (`vault_items.sig`/`signer`, A1.2). Legacy rows pass
+    /// `None`/`None` (unsigned; honored additively on NoUik).
+    pub fn put_raw_signed(
+        &mut self,
+        item_id_b64: String,
+        version: u64,
+        ct: Vec<u8>,
+        sig: Option<String>,
+        signer: Option<String>,
+    ) {
         self.items.insert(
             item_id_b64,
             StoredItem {
@@ -1031,6 +1057,8 @@ impl PerItemVault {
                 ct,
                 synced_version: version,
                 tombstone: false,
+                sig,
+                signer,
             },
         );
     }
@@ -1273,6 +1301,10 @@ impl PerItemVault {
         // is by definition not on the cloud yet) — the row is dirty until pushed.
         let synced_version = self.items.get(&id).map(|s| s.synced_version).unwrap_or(0);
         let tombstone = payload.is_tombstone();
+        // B2a: seal-level writers land UNSIGNED (sig/signer None) — signing is done
+        // by the write ORCHESTRATION (B2b), which knows the principal (the DIK for
+        // the daemon's automatic writes). A `None` here is honored additively on a
+        // NoUik (fmt1 personal) vault and is the pre-cutover state for team writes.
         self.items.insert(
             id.clone(),
             StoredItem {
@@ -1280,6 +1312,8 @@ impl PerItemVault {
                 ct,
                 synced_version,
                 tombstone,
+                sig: None,
+                signer: None,
             },
         );
         Ok(id)
