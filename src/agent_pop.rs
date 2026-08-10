@@ -5,9 +5,15 @@
 //! A standard client can't present a client cert to a forward proxy — its only
 //! client-auth channel is the `Proxy-Authorization` header on each `CONNECT`. So
 //! hop-A (like hop-B under Railway) carries the AIK identity as an application-
-//! layer signature in that header, not as TLS mutual auth. This is the exact
-//! shape used at scale elsewhere (AWS SigV4, Kerberos/Negotiate proxy tokens):
-//! a fresh signed credential in the standard auth slot.
+//! layer proof-of-possession (PoP): a fresh signed credential in the standard
+//! auth header. This is a well-trodden pattern — its closest named standard is
+//! OAuth **DPoP (RFC 9449, "Demonstrating Proof of Possession")**, which likewise
+//! puts a per-request key-signed token in an HTTP header; cf. also RFC 9421 (HTTP
+//! Message Signatures) and AWS SigV4. mTLS is the *transport-layer* PoP; this is
+//! the *application-layer* one, chosen because a forward proxy exposes no
+//! client-cert channel (see the module CONNECT note below). We use a compact
+//! bespoke token rather than a DPoP JWT only to reuse hop-B's signing primitive
+//! and save bytes; the shape is DPoP-style.
 //!
 //! The `sc` transport (which holds the AIK, keeping it OUT of the agent's env)
 //! signs one token per CONNECT with [`AgentProxyPopSigner`]; the daemon parses +

@@ -1389,6 +1389,24 @@ impl AppState {
         }
     }
 
+    /// Is `agent_id` present in this vault's authorized-agents table (§11)?
+    /// Presence = authorized: the UIK-signed `ag_`-keyed table is the daemon's
+    /// only authz source, and dropping a row is the revoke. Used by the hop-A AIK
+    /// PoP proxy path to decide whether a crypto-verified `ag_…` may use this
+    /// vault at all — distinct from [`agent_mask_allows`], which only restricts
+    /// WHICH connections an already-authorized agent may reach. `false` when the
+    /// vault is locked or the agent isn't in the table (fail-closed — the AIK path
+    /// is opt-in and dual-authed with the legacy api-key, so this never bricks a
+    /// legacy agent, whose api-key prefix simply isn't an `ag_` and takes the
+    /// hash-set path instead).
+    pub fn agent_is_authorized(&self, vault_id: &str, agent_id: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.agents.contains_key(agent_id),
+            _ => false,
+        }
+    }
+
     /// Which of `candidates` this agent is ALLOWED to reach in this vault —
     /// evaluated through `AgentMask::allows` so the blacklist and `All` resolve
     /// identically (team §8.1 ONE pipeline: same verdict as the proxy deny).

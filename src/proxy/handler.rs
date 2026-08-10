@@ -54,6 +54,14 @@ pub struct BrokerHandler {
     /// (§8) — the agent's identity, verified in `pipeline` before any phantom
     /// substitution. Inherited by inner-request clones alongside `vid`.
     pub key: Option<String>,
+    /// The `ag_…` id of a CRYPTO-VERIFIED agent PoP token (hop-A), resolved at
+    /// CONNECT time in `should_intercept` (that's where the CONNECT authority the
+    /// token binds is available) and inherited by inner-request clones. `Some`
+    /// only when the `Proxy-Authorization` password was a valid, fresh `scpop1…`
+    /// token for this vault+target; `None` for the legacy Basic api-key path. The
+    /// authorization check (this `ag_` ∈ the vault's authorized-agents table) is
+    /// still done in `pipeline` — this field is only "who proved possession".
+    pub agent_id: Option<String>,
     /// Set on the allow/forward path; consumed by `handle_response`.
     pub pending: Option<AuditPending>,
 }
@@ -64,6 +72,7 @@ impl BrokerHandler {
             state,
             vid: None,
             key: None,
+            agent_id: None,
             pending: None,
         }
     }
@@ -78,6 +87,24 @@ impl HttpHandler for BrokerHandler {
         let (vid, key) = creds_from_proxy_auth(req);
         self.vid = vid;
         self.key = key;
+        // hop-A: if the Proxy-Auth password is an agent PoP token (`scpop1…`),
+        // crypto-verify it HERE — the CONNECT authority it binds (`host:port`) is
+        // only available at CONNECT time (the inner-request pipeline sees a bare
+        // host). A valid, fresh token for THIS vault + target resolves the `ag_`
+        // id; the authorization check (`ag_` ∈ the vault's authorized-agents
+        // table) happens in `pipeline`. Dual-auth: a non-PoP password (a legacy
+        // Basic api-key) leaves `agent_id` None and takes the hash-set path, so
+        // nothing bricks. Only the crypto (signature + freshness) is checked here.
+        self.agent_id = match (self.vid.as_deref(), self.key.as_deref(), req.uri().authority()) {
+            (Some(vid), Some(key), Some(authority)) => crate::agent_pop::verify_agent_proxy_pop(
+                key,
+                vid,
+                authority.as_str(),
+                now_unix(),
+                crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
+            ),
+            _ => None,
+        };
         // Absent Proxy-Auth (no vid) → non-participating traffic: blind-tunnel it
         // (§8; a stray phantom then reaches upstream literally → clean 401, never
         // a leak). A creds-less CONNECT to a host we DO anchor was already met
@@ -169,8 +196,29 @@ impl BrokerHandler {
     /// — before injecting any credential. Same membership check the control
     /// plane + API face use, via the pure `check_token`.
     fn key_is_valid(&self) -> bool {
+        // hop-A path: a crypto-verified agent PoP (resolved in `should_intercept`)
+        // is valid iff its `ag_` is in THIS vault's authorized-agents table
+        // (§11 presence = authorized). Dual-auth: if there's no PoP, or it isn't
+        // authorized for this vault, fall back to the legacy synced api-key
+        // hash-set — so a legacy Basic api-key keeps working unchanged.
+        if let (Some(ag), Some(vid)) = (self.agent_id.as_deref(), self.vid.as_deref()) {
+            if self.state.agent_is_authorized(vid, ag) {
+                return true;
+            }
+        }
         let hashes = self.state.agent_key_hashes.lock().unwrap();
         crate::api_key::check_token(&hashes, self.key.as_deref()).is_ok()
+    }
+
+    /// Stable attribution id for the current agent — used for audit rows, the
+    /// mask lookup, and the grant cache key. For a hop-A PoP agent it's the
+    /// resolved `ag_` (so approvals cache + replay correctly, and mask is
+    /// ag_-keyed per §11); for the legacy Basic path it's the api-key prefix
+    /// (never the full key/token). One helper so all three surfaces agree.
+    fn agent_attribution(&self) -> Option<String> {
+        self.agent_id
+            .clone()
+            .or_else(|| legacy_key_prefix(self.key.as_deref()))
     }
 
     async fn pipeline(&mut self, ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
@@ -366,11 +414,10 @@ impl BrokerHandler {
         // `locked` in the registry, and a named use gets THIS explicit,
         // actionable refusal — never a silent 404, never a policy prompt.
         {
-            let mask_agent = self
-                .key
-                .as_deref()
-                .map(crate::audit::agent_key_prefix)
-                .unwrap_or_default();
+            // Mask lookup key = the agent's attribution id (resolved `ag_` for a
+            // hop-A PoP agent — table+mask are ag_-keyed since §11 — else the
+            // legacy api-key prefix for the dual-auth Basic path).
+            let mask_agent = self.agent_attribution().unwrap_or_default();
             if self.state.agent_mask_allows(&vault_id, &mask_agent, &conn) == Some(false) {
                 return err_response(
                     ScCode::MaskNotEnabled,
@@ -493,11 +540,7 @@ impl BrokerHandler {
         let body_for_policy = body_text.as_deref();
         // Op-agent binding: every approval/grant surface below keys on the
         // requesting agent (the pipeline validated self.key before secrets).
-        let agent_prefix = self
-            .key
-            .as_deref()
-            .map(crate::audit::agent_key_prefix)
-            .unwrap_or_default();
+        let agent_prefix = self.agent_attribution().unwrap_or_default();
         let decision = self.state.evaluate_request_policy(
             &vault_id,
             &agent_prefix,
@@ -529,7 +572,7 @@ impl BrokerHandler {
                     service: service_id.clone(),
                     method: method.clone(),
                     path: path.clone(),
-                    agent_prefix: self.key.as_deref().map(crate::audit::agent_key_prefix),
+                    agent_prefix: self.agent_attribution(),
                 },
                 0,
             );
@@ -751,7 +794,7 @@ impl BrokerHandler {
             service: service_id,
             method,
             path,
-            agent_prefix: self.key.as_deref().map(crate::audit::agent_key_prefix),
+            agent_prefix: self.agent_attribution(),
         });
         Request::from_parts(parts, out_body).into()
     }
@@ -884,7 +927,7 @@ impl BrokerHandler {
         // THIS agent" — swapping agents invalidates the grant. The grant page
         // can render it as the requester line. Enforcement reads the record's
         // copy (ApprovalRecord.agent_prefix), not this.
-        if let Some(prefix) = self.key.as_deref().map(crate::audit::agent_key_prefix) {
+        if let Some(prefix) = self.agent_attribution() {
             scope["agent"] = serde_json::Value::String(prefix);
         }
         // Phase 2: fold the bound `[requests]` scope-field VALUES and the consent
@@ -938,7 +981,7 @@ impl BrokerHandler {
             op,
             Some(pc),
             ip,
-            self.key.as_deref().map(crate::audit::agent_key_prefix),
+            self.agent_attribution(),
         ) {
             Ok((op_id, _r, expires_at)) => {
                 let approve_url = crate::cli::active::grant_url(&op_id);
@@ -1007,7 +1050,7 @@ impl BrokerHandler {
             "etld1": etld1(host),
         });
         // Same signed agent stamp as the credential-use op above.
-        if let Some(prefix) = self.key.as_deref().map(crate::audit::agent_key_prefix) {
+        if let Some(prefix) = self.agent_attribution() {
             scope["agent"] = serde_json::Value::String(prefix);
         }
         let op = Operation {
@@ -1030,7 +1073,7 @@ impl BrokerHandler {
             op,
             None,
             ip,
-            self.key.as_deref().map(crate::audit::agent_key_prefix),
+            self.agent_attribution(),
         ) {
             Ok((op_id, _r, exp)) => {
                 let approve_url = crate::cli::active::grant_url(&op_id);
@@ -1135,6 +1178,23 @@ fn merge_phantoms(acc: &mut Vec<Phantom>, more: Vec<Phantom>) {
             acc.push(p);
         }
     }
+}
+
+/// The legacy Basic api-key attribution prefix (never the full key). Factored out
+/// of [`BrokerHandler::agent_attribution`] so that helper can reference it without
+/// the raw-prefix expression appearing at the call sites (all of which now go
+/// through `agent_attribution` so PoP `ag_` and legacy prefixes resolve uniformly).
+fn legacy_key_prefix(key: Option<&str>) -> Option<String> {
+    key.map(crate::audit::agent_key_prefix)
+}
+
+/// Current unix-seconds wall clock — the freshness reference for an agent PoP
+/// token (hop-A). Saturates to 0 before the epoch (never in practice).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Read `(vid, api-key)` from a CONNECT's `Proxy-Authorization: Basic
