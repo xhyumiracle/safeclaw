@@ -2045,6 +2045,12 @@ struct ItemRow {
     seq: u64,
     /// base64url-nopad of `suite‖nonce‖ct‖tag`.
     ct: String,
+    /// A1.2 per-record signature (base64url, over the ciphertext) + the signer's
+    /// self-id. Absent on legacy/unsigned rows (fmt1 personal / pre-migration).
+    #[serde(default)]
+    sig: Option<String>,
+    #[serde(default)]
+    signer: Option<String>,
 }
 
 /// Load the per-item store for a vault, or `None` if it doesn't exist yet.
@@ -2086,7 +2092,7 @@ fn adopt_item_rows(pv: &mut PerItemVault, rows: &[ItemRow], max_seq: u64) -> Res
         let ct = URL_SAFE_NO_PAD
             .decode(row.ct.as_bytes())
             .map_err(|e| format!("item ct not base64url: {}", e))?;
-        pv.put_raw(row.item_id.clone(), row.version, ct);
+        pv.put_raw_signed(row.item_id.clone(), row.version, ct, row.sig.clone(), row.signer.clone());
         adopted += 1;
     }
     if max_seq > pv.items_seq {
@@ -3393,6 +3399,8 @@ mod peritem_tests {
             version: 1,
             seq: 5,
             ct: "AAAA".into(),
+            sig: None,
+            signer: None,
         };
         let n = adopt_item_rows(&mut pv, std::slice::from_ref(&stale), 5).unwrap();
         assert_eq!(n, 0, "stale version ignored");
@@ -3408,6 +3416,8 @@ mod peritem_tests {
             version: 3,
             seq: 9,
             ct: newer_ct,
+            sig: None,
+            signer: None,
         };
         let n = adopt_item_rows(&mut pv, std::slice::from_ref(&newer), 9).unwrap();
         assert_eq!(n, 1);
