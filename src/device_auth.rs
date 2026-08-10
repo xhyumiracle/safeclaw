@@ -14,8 +14,8 @@
 //! any upgrade order. This module is dormant until `sync.rs` attaches the headers.
 
 use crate::identity::{device_request_signature_input, IdKind, SigningIdentity};
+use crate::util::now_unix;
 use data_encoding::BASE64;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The `dev_…` self-id of the signing device (tells the backend which registered
 /// pubkey to check).
@@ -88,15 +88,6 @@ pub fn device_signer() -> Option<DeviceRequestSigner> {
         return None;
     }
     Some(DeviceRequestSigner::new(loaded.identity, loaded.id))
-}
-
-/// Current unix-seconds wall clock for the request timestamp. Saturates to 0 if
-/// the clock is before the epoch (never in practice).
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// The on-wire path+query of a full URL — exactly what the Node backend sees as

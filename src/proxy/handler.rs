@@ -100,7 +100,7 @@ impl HttpHandler for BrokerHandler {
                 key,
                 vid,
                 authority.as_str(),
-                now_unix(),
+                crate::util::now_unix(),
                 crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
             ),
             _ => None,
@@ -1186,15 +1186,6 @@ fn merge_phantoms(acc: &mut Vec<Phantom>, more: Vec<Phantom>) {
 /// through `agent_attribution` so PoP `ag_` and legacy prefixes resolve uniformly).
 fn legacy_key_prefix(key: Option<&str>) -> Option<String> {
     key.map(crate::audit::agent_key_prefix)
-}
-
-/// Current unix-seconds wall clock — the freshness reference for an agent PoP
-/// token (hop-A). Saturates to 0 before the epoch (never in practice).
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Read `(vid, api-key)` from a CONNECT's `Proxy-Authorization: Basic

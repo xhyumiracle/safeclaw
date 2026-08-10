@@ -27,13 +27,13 @@
 //! key-in-the-proxy-URL env, so nothing bricks.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::agent_pop::AgentProxyPopSigner;
+use crate::util::now_unix;
 
 /// What the child asked the shim to do, parsed from the first request line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,13 +117,6 @@ pub fn head_end(buf: &[u8]) -> Option<usize> {
 /// Cap on the request head we buffer before giving up (a malformed/hostile client
 /// must not drive unbounded memory). Heads are tiny; 64 KiB is generous.
 const MAX_HEAD: usize = 64 * 1024;
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// Everything the shim needs to authenticate one child's traffic. Built once by
 /// `sc run` from the resolved vault + the loaded AIK + (dual-auth window) the
