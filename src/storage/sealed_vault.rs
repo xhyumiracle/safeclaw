@@ -752,6 +752,44 @@ fn fold_agent_record(
     }
 }
 
+/// Fold one owner-config singleton, PREFERRING the sidecar item-sig (A1.2) and
+/// falling back to the in-body config-sig during migration. `config_name` doubles
+/// as the plaintext record type for the sidecar (owner-config ns == its name:
+/// `policy`/`stores`/…). Owner-only: the sidecar signer must be an owner. Returns
+/// the raw `data` to honor (the daemon then parses it) or `None` to drop.
+#[allow(clippy::too_many_arguments)]
+fn fold_owner_config_record(
+    stored_sig: Option<&str>,
+    stored_signer: Option<&str>,
+    ct: &[u8],
+    keyset: &Keyset,
+    vault_id: &str,
+    item_id_raw: &[u8],
+    config_name: &str,
+    version: u64,
+    body: serde_json::Value,
+    trust: &MembershipTrust,
+) -> Option<serde_json::Value> {
+    let Some(sig) = stored_sig else {
+        return unwrap_verified_config(body, keyset, vault_id, config_name, version, trust);
+    };
+    let signer = stored_signer?;
+    let sid = verify_record_sidecar_sig(
+        ct, keyset, vault_id, item_id_raw, config_name, version, true, sig, signer,
+    )?;
+    match trust {
+        MembershipTrust::Untrusted => None,
+        MembershipTrust::NoUik => Some(body),
+        MembershipTrust::Verified(membership) => {
+            if membership.get(&sid) == Some(&crate::storage::plaintext::MemberRole::Owner) {
+                Some(body)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// The three-state trust an owner-config reader derives from the KEYSET's UIK
 /// anchor (design/identity-uik-aik.md §4.3, team-shared-vault-security-model.md
 /// §9). This REPLACES the old `Option<BTreeMap<..>>` membership signal, which
@@ -2008,12 +2046,16 @@ impl PerItemVault {
                         aux.agents.insert(name, entry);
                     }
                     ItemNs::Policy => {
-                        let Some(data) = unwrap_verified_config(
-                            payload.body,
+                        let Some(data) = fold_owner_config_record(
+                            stored.sig.as_deref(),
+                            stored.signer.as_deref(),
+                            &stored.ct,
                             &self.keyset,
                             vault_id,
+                            &raw,
                             "policy",
                             stored.version,
+                            payload.body,
                             &trust,
                         ) else {
                             tracing::warn!(vault = %vault_id, "fold: dropping policy — unauthorized/invalid owner signature");
@@ -2026,12 +2068,16 @@ impl PerItemVault {
                         seen_new.policy = true;
                     }
                     ItemNs::Stores => {
-                        let Some(data) = unwrap_verified_config(
-                            payload.body,
+                        let Some(data) = fold_owner_config_record(
+                            stored.sig.as_deref(),
+                            stored.signer.as_deref(),
+                            &stored.ct,
                             &self.keyset,
                             vault_id,
+                            &raw,
                             "stores",
                             stored.version,
+                            payload.body,
                             &trust,
                         ) else {
                             tracing::warn!(vault = %vault_id, "fold: dropping stores — unauthorized/invalid owner signature");
@@ -2042,12 +2088,16 @@ impl PerItemVault {
                         seen_new.stores = true;
                     }
                     ItemNs::StoreOrder => {
-                        let Some(data) = unwrap_verified_config(
-                            payload.body,
+                        let Some(data) = fold_owner_config_record(
+                            stored.sig.as_deref(),
+                            stored.signer.as_deref(),
+                            &stored.ct,
                             &self.keyset,
                             vault_id,
+                            &raw,
                             "store_order",
                             stored.version,
+                            payload.body,
                             &trust,
                         ) else {
                             tracing::warn!(vault = %vault_id, "fold: dropping store_order — unauthorized/invalid owner signature");
@@ -2058,12 +2108,16 @@ impl PerItemVault {
                         seen_new.store_order = true;
                     }
                     ItemNs::AuditRetentionDays => {
-                        let Some(data) = unwrap_verified_config(
-                            payload.body,
+                        let Some(data) = fold_owner_config_record(
+                            stored.sig.as_deref(),
+                            stored.signer.as_deref(),
+                            &stored.ct,
                             &self.keyset,
                             vault_id,
+                            &raw,
                             "audit_retention_days",
                             stored.version,
+                            payload.body,
                             &trust,
                         ) else {
                             tracing::warn!(vault = %vault_id, "fold: dropping audit_retention_days — unauthorized/invalid owner signature");
@@ -2075,12 +2129,16 @@ impl PerItemVault {
                         seen_new.retention = true;
                     }
                     ItemNs::Services => {
-                        let Some(data) = unwrap_verified_config(
-                            payload.body,
+                        let Some(data) = fold_owner_config_record(
+                            stored.sig.as_deref(),
+                            stored.signer.as_deref(),
+                            &stored.ct,
                             &self.keyset,
                             vault_id,
+                            &raw,
                             "services",
                             stored.version,
+                            payload.body,
                             &trust,
                         ) else {
                             tracing::warn!(vault = %vault_id, "fold: dropping services — unauthorized/invalid owner signature");
@@ -2110,52 +2168,72 @@ impl PerItemVault {
                         // A legacy `aux:members` blob is ignored (membership retired).
                         match name.as_str() {
                             "stores" => {
-                                legacy_stores = unwrap_verified_config(
-                                    payload.body,
+                                legacy_stores = fold_owner_config_record(
+                                    stored.sig.as_deref(),
+                                    stored.signer.as_deref(),
+                                    &stored.ct,
                                     &self.keyset,
                                     vault_id,
+                                    &raw,
                                     "stores",
                                     stored.version,
+                                    payload.body,
                                     &trust,
                                 )
                             }
                             "store_order" => {
-                                legacy_store_order = unwrap_verified_config(
-                                    payload.body,
+                                legacy_store_order = fold_owner_config_record(
+                                    stored.sig.as_deref(),
+                                    stored.signer.as_deref(),
+                                    &stored.ct,
                                     &self.keyset,
                                     vault_id,
+                                    &raw,
                                     "store_order",
                                     stored.version,
+                                    payload.body,
                                     &trust,
                                 )
                             }
                             "policy" => {
-                                legacy_policy = unwrap_verified_config(
-                                    payload.body,
+                                legacy_policy = fold_owner_config_record(
+                                    stored.sig.as_deref(),
+                                    stored.signer.as_deref(),
+                                    &stored.ct,
                                     &self.keyset,
                                     vault_id,
+                                    &raw,
                                     "policy",
                                     stored.version,
+                                    payload.body,
                                     &trust,
                                 )
                             }
                             "audit_retention_days" => {
-                                legacy_retention = unwrap_verified_config(
-                                    payload.body,
+                                legacy_retention = fold_owner_config_record(
+                                    stored.sig.as_deref(),
+                                    stored.signer.as_deref(),
+                                    &stored.ct,
                                     &self.keyset,
                                     vault_id,
+                                    &raw,
                                     "audit_retention_days",
                                     stored.version,
+                                    payload.body,
                                     &trust,
                                 )
                             }
                             "services" => {
-                                legacy_services = unwrap_verified_config(
-                                    payload.body,
+                                legacy_services = fold_owner_config_record(
+                                    stored.sig.as_deref(),
+                                    stored.signer.as_deref(),
+                                    &stored.ct,
                                     &self.keyset,
                                     vault_id,
+                                    &raw,
                                     "services",
                                     stored.version,
+                                    payload.body,
                                     &trust,
                                 )
                             }
