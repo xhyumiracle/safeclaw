@@ -93,6 +93,12 @@ pub const DS_CONTACT_TOKEN: &[u8] = b"safeclaw/v1/contact-token";
 /// registered `dev_` pubkey. See [`device_request_signature_input`].
 pub const DS_DEVICE_REQ: &[u8] = b"safeclaw/v1/device-req";
 
+/// An agent's per-CONNECT proof-of-possession over the local forward proxy (the
+/// AIK half of mutual mTLS, hop-A). A standard client can't present a client cert
+/// to a forward proxy, so the AIK identity rides a signed token in the
+/// `Proxy-Authorization` header instead. See [`agent_proxy_pop_input`].
+pub const DS_AGENT_PROXY_POP: &[u8] = b"safeclaw/v1/agent-proxy-pop";
+
 /// Domain tag for the **per-record signature** (SUDP extension A1.2/A1.3,
 /// `design/sudp-identity-signing-revision.md`). This is the SUDP-protocol-layer
 /// record signature — hence the `sudp/v1/*` family (C.4 domain decision) rather
@@ -396,6 +402,43 @@ pub fn device_request_signature_input(
     out.extend_from_slice(&timestamp.to_be_bytes());
     push_lp(&mut out, &body_hash);
     push_lp(&mut out, device_id.as_bytes());
+    out
+}
+
+/// Signing input for an **agent proxy-connect proof-of-possession** (hop-A of the
+/// mutual-mTLS transport, `design/agent-device-identity-mtls.md` §9.1). An agent
+/// reaches the daemon through a standard forward proxy (`HTTP_PROXY`), whose only
+/// client-auth channel is the `Proxy-Authorization` header on each `CONNECT` — a
+/// standard client cannot present a client cert to a forward proxy, so hop-A (like
+/// hop-B under Railway) rides an application-layer signature, not TLS mutual auth.
+/// The `sc` transport signs this with the agent's AIK per CONNECT; the daemon
+/// verifies it against the vault's authorized-agents table.
+///
+/// ```text
+/// lp(DS_AGENT_PROXY_POP) ‖ lp(vault_id) ‖ lp(target) ‖ u64_be(timestamp) ‖ lp(agent_id)
+/// ```
+///
+/// `vault_id` = the CONNECT's proxy-auth username (which vault the agent is using),
+/// `target` = the CONNECT authority `host:port` the tunnel opens to (binds the
+/// token to that destination so a captured one can't be replayed elsewhere within
+/// the window), `timestamp` = unix seconds (freshness/replay window), `agent_id` =
+/// the AIK self-id (`ag_…`). The daemon rebuilds this from the CONNECT context +
+/// the token's carried pubkey (deriving `agent_id`) and verifies the signature,
+/// then checks `agent_id ∈` the authorized-agents table. Per-CONNECT, not
+/// per-request: one CONNECT opens a reused tunnel, and the proxy only sees
+/// `Proxy-Authorization` at CONNECT time.
+pub fn agent_proxy_pop_input(
+    vault_id: &str,
+    target: &str,
+    timestamp: u64,
+    agent_id: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_AGENT_PROXY_POP);
+    push_lp(&mut out, vault_id.as_bytes());
+    push_lp(&mut out, target.as_bytes());
+    out.extend_from_slice(&timestamp.to_be_bytes());
+    push_lp(&mut out, agent_id.as_bytes());
     out
 }
 
@@ -810,6 +853,38 @@ mod tests {
         // body, device "dev_box". The Node backend mirror pins the same bytes.
         let input = device_request_signature_input("GET", "/api/vault/agents/hashes", 1_700_000_000, b"", "dev_box");
         assert_eq!(hex(&input), "0000001673616665636c61772f76312f6465766963652d72657100000003474554000000182f6170692f7661756c742f6167656e74732f686173686573000000006553f10000000020e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855000000076465765f626f78");
+    }
+
+    #[test]
+    fn agent_proxy_pop_input_every_field_binds() {
+        let base = agent_proxy_pop_input("v1", "api.x.com:443", 1, "ag_a");
+        assert_ne!(base, agent_proxy_pop_input("v2", "api.x.com:443", 1, "ag_a"), "vault binds");
+        assert_ne!(base, agent_proxy_pop_input("v1", "api.y.com:443", 1, "ag_a"), "target binds");
+        assert_ne!(base, agent_proxy_pop_input("v1", "api.x.com:443", 2, "ag_a"), "timestamp binds");
+        assert_ne!(base, agent_proxy_pop_input("v1", "api.x.com:443", 1, "ag_b"), "agent_id binds");
+        assert_eq!(base, agent_proxy_pop_input("v1", "api.x.com:443", 1, "ag_a"), "deterministic");
+    }
+
+    #[test]
+    fn agent_proxy_pop_roundtrip_and_target_tamper() {
+        // The sc transport signs a CONNECT with the AIK; the daemon rebuilds the
+        // input from the CONNECT context (vid + target + ts + derived ag_id) and
+        // verifies. Replaying the signature onto a different target must fail —
+        // the token binds the destination, not just the agent.
+        let aik = SigningIdentity::from_seed(&UIK_SEED);
+        let ag = derive_id(IdKind::Agent, &aik.public_bytes());
+        let input = agent_proxy_pop_input("vault-x", "api.openai.com:443", 1_700_000_000, &ag);
+        let sig = aik.sign(&input);
+        assert!(verify(&aik.public_bytes(), &input, &sig), "own signature verifies");
+        let elsewhere = agent_proxy_pop_input("vault-x", "evil.example:443", 1_700_000_000, &ag);
+        assert!(!verify(&aik.public_bytes(), &elsewhere, &sig), "a swapped target must not verify");
+    }
+
+    #[test]
+    fn pinned_agent_proxy_pop_input() {
+        // K-vector: vault "vault-7", target "api.x:443", ts 1700000000, agent "ag_a".
+        let input = agent_proxy_pop_input("vault-7", "api.x:443", 1_700_000_000, "ag_a");
+        assert_eq!(hex(&input), "0000001b73616665636c61772f76312f6167656e742d70726f78792d706f70000000077661756c742d37000000096170692e783a343433000000006553f1000000000461675f61");
     }
 
     #[test]

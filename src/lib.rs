@@ -13,6 +13,7 @@ pub fn build_version() -> &'static str {
     }
 }
 
+pub mod agent_pop;
 pub mod api_key;
 pub mod approval;
 pub mod audit;
