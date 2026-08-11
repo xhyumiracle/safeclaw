@@ -1407,6 +1407,21 @@ impl AppState {
         }
     }
 
+    /// Is `agent_id` present in the authorized-agents table of ANY currently
+    /// UNLOCKED vault this daemon holds (§11)? The ACCOUNT-scoped check for the
+    /// api-face reads (registry / op-poll / `/vaults`) — those aren't tied to a
+    /// single vault, so a hop-A AIK PoP that proves possession of `ag_…` is a
+    /// valid agent of this account for those cross-vault reads iff it's
+    /// authorized on at least one vault. `false` if no unlocked vault authorizes
+    /// it (fail-closed; dual-auth with the legacy api-key covers the transition).
+    pub fn agent_is_authorized_any(&self, agent_id: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        states.values().any(|s| match s {
+            VaultState::Unlocked { cache, .. } => cache.agents.contains_key(agent_id),
+            _ => false,
+        })
+    }
+
     /// Which of `candidates` this agent is ALLOWED to reach in this vault —
     /// evaluated through `AgentMask::allows` so the blacklist and `All` resolve
     /// identically (team §8.1 ONE pipeline: same verdict as the proxy deny).
