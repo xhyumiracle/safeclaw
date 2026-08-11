@@ -107,8 +107,9 @@ fn authority_of(url: &str) -> String {
 /// Run the child through the sc-transport shim (hop-A). Starts the shim on an
 /// ephemeral loopback port, points the child's `*_PROXY` at it with NO creds in
 /// the URL, STRIPS the inherited `SAFECLAW_API_KEY` from the child env (the shim
-/// holds it now), then SPAWNS (not execs) the child so the shim task keeps
-/// serving in this process, waits, and propagates the exit code.
+/// authenticates by AIK PoP, so the child needs — and gets — no credential at
+/// all), then SPAWNS (not execs) the child so the shim task keeps serving in this
+/// process, waits, and propagates the exit code.
 async fn run_via_shim(
     cmd: &[String],
     vid: &str,
@@ -118,14 +119,10 @@ async fn run_via_shim(
 ) -> Result<(), String> {
     let cfg = load_config().unwrap_or_default();
     let daemon_authority = authority_of(&api_face_root(&cfg));
-    let api_key = std::env::var("SAFECLAW_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty());
     let (port, shim) = agent_shim::start(ShimConfig {
         vid: vid.to_string(),
         daemon_authority,
         signer,
-        api_key,
     })
     .await
     .map_err(|e| format!("start sc transport: {}", e))?;
@@ -139,8 +136,9 @@ async fn run_via_shim(
     let mut c = tokio::process::Command::new(prog);
     c.args(rest);
     // The whole point of hop-A: the injectable api-key must NOT be in the child
-    // env. The parent shell exported it (that's how `sc run` reads it); the shim
-    // holds it now, so strip it from what the child inherits.
+    // env. The parent shell exported it (that's how a legacy agent authenticates);
+    // the shim authenticates by AIK PoP instead, so strip the key from what the
+    // child inherits — the child carries no credential at all.
     c.env_remove("SAFECLAW_API_KEY");
     for (k, v) in &bundle {
         c.env(k, v);

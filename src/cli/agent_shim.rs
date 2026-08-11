@@ -1,30 +1,39 @@
-//! The `sc`-transport shim — hop-A of the mutual-mTLS transport
-//! (`design/agent-device-identity-mtls.md` §9.1), slice 3.
+//! The `sc`-transport shim — hop-A of the identity transport
+//! (`design/agent-device-identity-mtls.md` §9.1).
 //!
 //! `sc run` starts this tiny local forward proxy on loopback and points the
 //! child's `*_PROXY` env at IT (not the daemon directly). The shim HOLDS the
-//! agent's credentials (the AIK, and — during the dual-auth window — the api-key)
-//! so the child's env carries NONE: that closes the injectable-env-bearer gap,
-//! which is hop-A's core local value. Per connection it:
+//! agent's AIK so the child's env carries NO credential at all — no api-key, no
+//! key — which closes the injectable-env-bearer gap, hop-A's core local value.
+//! Every daemon-bound channel authenticates by a FRESH AIK proof-of-possession
+//! ([`crate::agent_pop`]); the shim never carries the api-key. Per connection:
 //!
-//!   - **CONNECT `host:port`** (an https tunnel) → mints a FRESH per-CONNECT AIK
-//!     proof-of-possession token ([`crate::agent_pop::AgentProxyPopSigner`]) and
-//!     forwards the CONNECT to the daemon proxy with
-//!     `Proxy-Authorization: Basic base64("<vid>:<token>")`, then relays bytes.
+//!   - **CONNECT `host:port`** (an https tunnel) → mint a fresh per-CONNECT PoP
+//!     over the target and forward with `Proxy-Authorization: Basic
+//!     base64("<vid>:<token>")`, then relay bytes.
 //!   - **origin-form** (`GET /v/{vid}/registry …`) → the daemon's api-face
-//!     (registry / op-poll / health / ca), authed by `Authorization: Bearer`.
-//!     The shim injects the api-key Bearer and forwards. (A later slice can move
-//!     this channel to PoP too; for now the api-key just moves OUT of the child
-//!     env into the shim, which already closes the env-bearer gap.)
+//!     (registry / op-poll / health / ca). Mint a fresh PoP over the request-line
+//!     target (`apiface:<path+query>`, account-scoped) and forward it as
+//!     `Authorization: Bearer <token>` (safe: the api-face is daemon-terminated).
+//!   - **absolute-form plain-HTTP** (`GET http://host/… `) → a non-brokered
+//!     UPSTREAM passthrough (the daemon substitutes NO phantom over plain HTTP —
+//!     it refuses one — so there's nothing to authenticate). Forward with NO
+//!     SafeClaw credential; only force `Connection: close` and strip any stray
+//!     hop-by-hop `Proxy-Authorization`. The child's own headers (incl. its
+//!     Authorization to the origin) pass through untouched.
 //!
 //! This module is the PURE wire logic (classification + head rewriting), unit-
 //! tested here because that's where a subtle byte can break a tunnel. The async
-//! accept-loop + relay and the `sc run` wiring are slice 3b; the relay itself is
-//! a thin `tokio::io::copy_bidirectional` over the classified streams.
+//! accept-loop + relay is a thin `tokio::io::copy_bidirectional` over the
+//! classified streams.
 //!
-//! ADDITIVE / dual-auth: `sc run` only routes through the shim when an AIK
-//! identity file exists; with no AIK it falls back to today's direct
-//! key-in-the-proxy-URL env, so nothing bricks.
+//! ADDITIVE: `sc run` only routes through the shim when an AIK identity file
+//! exists; with no AIK it falls back to today's direct key-in-the-proxy-URL env.
+//! Note the shim's CONNECT was already PoP-only (the api-key never rode it), so
+//! an `ag_` must be authorized on the vault for the shim path to work at all —
+//! moving api-face to PoP imposes no NEW requirement. The api-key hash-set stays
+//! on the daemon only for LEGACY DIRECT (non-shim) agents, until the forced
+//! upgrade retires it (`design/compat-sunset.md` #2).
 
 use std::sync::Arc;
 
@@ -43,16 +52,17 @@ pub enum ShimReq {
     /// verbatim so the daemon's PoP verify (rebuilt from its own CONNECT
     /// authority) matches byte-for-byte. Proxy-Auth PoP; opaque relay.
     Connect { authority: String },
-    /// Absolute-form plain-HTTP (`GET http://host/… HTTP/1.1`) — bound for a real
-    /// UPSTREAM through the daemon proxy. The daemon credential MUST ride
-    /// `Proxy-Authorization` (hop-by-hop; the proxy strips it before the upstream
-    /// hop), NEVER `Authorization` — the latter would be forwarded to the origin,
-    /// leaking the api-key to a third party. `authority` = the target `host[:port]`.
+    /// Absolute-form plain-HTTP (`GET http://host/… HTTP/1.1`) — a non-brokered
+    /// UPSTREAM passthrough. The daemon substitutes no phantom over plain HTTP, so
+    /// there's nothing to authenticate: the shim forwards with NO SafeClaw
+    /// credential (only `Connection: close` + stray `Proxy-Authorization` strip).
+    /// `authority` = the target `host[:port]` (kept for classification/tests).
     Forward { authority: String },
     /// Origin-form (`GET /… HTTP/1.1`) — terminates at the daemon's own api-face
-    /// (registry / op-poll / health / ca), never forwarded upstream. Authed with
-    /// `Authorization: Bearer` (safe: daemon-terminated).
-    ApiFace,
+    /// (registry / op-poll / health / ca), never forwarded upstream. Authed with a
+    /// fresh AIK PoP as `Authorization: Bearer <token>` (safe: daemon-terminated).
+    /// `target` = the exact request-line target (path + query) the PoP binds.
+    ApiFace { target: String },
 }
 
 /// Classify the FIRST request line (`first_line` = the bytes before the first
@@ -75,8 +85,11 @@ pub fn classify_request_line(first_line: &str) -> Option<ShimReq> {
         });
     }
     if target.starts_with('/') {
-        // origin-form → the daemon's own api-face (daemon-terminated).
-        return Some(ShimReq::ApiFace);
+        // origin-form → the daemon's own api-face (daemon-terminated). Carry the
+        // exact target so the PoP binds the same path+query the shim sends.
+        return Some(ShimReq::ApiFace {
+            target: target.to_string(),
+        });
     }
     // absolute-form (scheme://authority/…) → forwarded to an upstream.
     authority_from_absolute(target).map(|authority| ShimReq::Forward { authority })
@@ -104,16 +117,17 @@ pub fn daemon_connect_head(authority: &str, vid: &str, pop_token: &str) -> Strin
     )
 }
 
-/// Rewrite an origin-form request head so it carries the api-key as
-/// `Authorization: Bearer <key>` (the daemon api-face channel) — moving the
-/// credential OUT of the child env into the shim. Any `Authorization` /
+/// Rewrite an origin-form (api-face) request head so it carries a FRESH AIK PoP
+/// as `Authorization: Bearer <token>` — the daemon api-face detects the `scpop1…`
+/// token and verifies it (safe here because the api-face is daemon-terminated, so
+/// the token is never forwarded to any origin). Any `Authorization` /
 /// `Proxy-Authorization` the child set is dropped (the shim owns auth), and
-/// `Connection` is forced to `close`: the shim injects auth per CONNECTION, so
+/// `Connection` is forced to `close`: the shim mints one PoP per CONNECTION, so
 /// one api-face request per connection means a keep-alive follow-up can't slip
 /// through the raw relay un-authed. Every other header is preserved verbatim,
 /// including the terminating blank line. `head` is the full request head up to
 /// and including the CRLFCRLF.
-pub fn inject_bearer(head: &str, key: &str) -> String {
+pub fn inject_bearer(head: &str, token: &str) -> String {
     let (req_line, rest) = head.split_once("\r\n").unwrap_or((head, ""));
     // `split_inclusive` keeps each line's trailing CRLF, so the tail (headers +
     // the empty line) reconstructs byte-for-byte minus the dropped lines.
@@ -126,29 +140,27 @@ pub fn inject_bearer(head: &str, key: &str) -> String {
                 || l.starts_with("connection:"))
         })
         .collect();
-    format!("{req_line}\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n{preserved}")
+    format!("{req_line}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n{preserved}")
 }
 
-/// Rewrite an UPSTREAM-bound (absolute-form) request head to carry the daemon
-/// credential in `Proxy-Authorization: Basic base64("<vid>:<key>")` — hop-by-hop,
-/// so the daemon proxy strips it before the upstream hop and it NEVER reaches the
-/// origin (unlike `Authorization`, which would leak the api-key). Drops any
-/// client-set Authorization/Proxy-Authorization/Connection and forces
-/// `Connection: close`. hop-A PoP is CONNECT-only, so plain-HTTP forwards ride
-/// the legacy api-key here (dual-auth), exactly like today's plain-HTTP flow.
-pub fn inject_proxy_basic(head: &str, vid: &str, key: &str) -> String {
+/// Rewrite an UPSTREAM-bound (absolute-form) plain-HTTP request head for a
+/// non-brokered passthrough: inject NO SafeClaw credential (the daemon
+/// substitutes no phantom over plain HTTP, so there's nothing to authenticate).
+/// Strip only a stray hop-by-hop `Proxy-Authorization` (the child's `*_PROXY` has
+/// no creds, so it shouldn't set one; drop it if it did) and force `Connection:
+/// close` so the raw relay can't carry a second, un-reclassified request. The
+/// child's OWN `Authorization` (its credential to the origin) passes through
+/// untouched — it's the child's header, never a SafeClaw secret.
+pub fn forward_head(head: &str) -> String {
     let (req_line, rest) = head.split_once("\r\n").unwrap_or((head, ""));
     let preserved: String = rest
         .split_inclusive("\r\n")
         .filter(|line| {
             let l = line.to_ascii_lowercase();
-            !(l.starts_with("authorization:")
-                || l.starts_with("proxy-authorization:")
-                || l.starts_with("connection:"))
+            !(l.starts_with("proxy-authorization:") || l.starts_with("connection:"))
         })
         .collect();
-    let cred = STANDARD.encode(format!("{}:{}", vid, key).as_bytes());
-    format!("{req_line}\r\nProxy-Authorization: Basic {cred}\r\nConnection: close\r\n{preserved}")
+    format!("{req_line}\r\nConnection: close\r\n{preserved}")
 }
 
 /// Index just PAST the first CRLFCRLF in `buf` (the end of the request head), or
@@ -164,19 +176,16 @@ pub fn head_end(buf: &[u8]) -> Option<usize> {
 const MAX_HEAD: usize = 64 * 1024;
 
 /// Everything the shim needs to authenticate one child's traffic. Built once by
-/// `sc run` from the resolved vault + the loaded AIK + (dual-auth window) the
-/// api-key, then shared across connections.
+/// `sc run` from the resolved vault + the loaded AIK, then shared across
+/// connections. Holds NO api-key: every daemon-bound channel authenticates by a
+/// fresh AIK PoP (or, for a plain-HTTP passthrough, nothing at all).
 pub struct ShimConfig {
-    /// Vault id — the proxy-auth username, and part of every PoP signature.
+    /// Vault id — the proxy-auth username, and part of every CONNECT PoP signature.
     pub vid: String,
     /// `host:port` of the real daemon proxy the shim forwards to.
     pub daemon_authority: String,
-    /// Holds the AIK; mints a fresh PoP token per CONNECT.
+    /// Holds the AIK; mints a fresh PoP token per CONNECT and per api-face request.
     pub signer: AgentProxyPopSigner,
-    /// The api-key injected as a Bearer on api-face (origin-form) requests during
-    /// the dual-auth window, so it too stays OUT of the child env. `None` once the
-    /// api-face moves to PoP / the key retires.
-    pub api_key: Option<String>,
 }
 
 /// Read a request head (up to and including CRLFCRLF) from `s`, returning the
@@ -238,33 +247,30 @@ async fn handle_conn(mut child: TcpStream, cfg: Arc<ShimConfig>) -> std::io::Res
             }
             tokio::io::copy_bidirectional(&mut child, &mut daemon).await?;
         }
-        Some(ShimReq::ApiFace) => {
+        Some(ShimReq::ApiFace { target }) => {
             // origin-form → the daemon's OWN api-face (daemon-terminated, never
-            // forwarded upstream). Inject the api-key Bearer (+ Connection: close).
-            // Safe to use Authorization here precisely because it terminates at the
-            // daemon. No key → nothing to auth with → close.
-            let Some(key) = cfg.api_key.as_deref() else {
-                return Ok(());
-            };
+            // forwarded upstream). Mint a fresh PoP bound to this request-line
+            // target (account-scoped vault="") and inject it as Bearer. Safe to
+            // use Authorization here precisely because it terminates at the daemon.
+            let token = cfg
+                .signer
+                .token("", &crate::agent_pop::apiface_target(&target), now_unix());
             let mut daemon = TcpStream::connect(&cfg.daemon_authority).await?;
-            daemon.write_all(inject_bearer(&head, key).as_bytes()).await?;
+            daemon.write_all(inject_bearer(&head, &token).as_bytes()).await?;
             if !leftover.is_empty() {
                 daemon.write_all(&leftover).await?;
             }
             tokio::io::copy_bidirectional(&mut child, &mut daemon).await?;
         }
         Some(ShimReq::Forward { .. }) => {
-            // absolute-form → the daemon FORWARDS this upstream. The credential
-            // must ride Proxy-Authorization (stripped hop-by-hop), NEVER
-            // Authorization (which the daemon would forward to the origin =
-            // api-key leak). Rides the legacy api-key (PoP is CONNECT-only).
-            let Some(key) = cfg.api_key.as_deref() else {
-                return Ok(());
-            };
+            // absolute-form → the daemon FORWARDS this upstream. A phantom over
+            // plain HTTP is refused by the daemon (it can only substitute inside
+            // TLS), so this is a non-brokered passthrough with NOTHING to
+            // authenticate: forward with no SafeClaw credential (Connection: close
+            // + stray Proxy-Authorization strip only). The child's own headers,
+            // including any Authorization to the origin, pass through untouched.
             let mut daemon = TcpStream::connect(&cfg.daemon_authority).await?;
-            daemon
-                .write_all(inject_proxy_basic(&head, &cfg.vid, key).as_bytes())
-                .await?;
+            daemon.write_all(forward_head(&head).as_bytes()).await?;
             if !leftover.is_empty() {
                 daemon.write_all(&leftover).await?;
             }
@@ -327,10 +333,11 @@ mod tests {
             classify_request_line("connect x:443 HTTP/1.1"),
             Some(ShimReq::Connect { authority: "x:443".to_string() })
         );
-        // origin-form (path) → the daemon api-face (daemon-terminated).
+        // origin-form (path) → the daemon api-face (daemon-terminated); the exact
+        // target rides along so the PoP binds it.
         assert_eq!(
-            classify_request_line("GET /v/abc/registry HTTP/1.1"),
-            Some(ShimReq::ApiFace)
+            classify_request_line("GET /v/abc/registry?x=1 HTTP/1.1"),
+            Some(ShimReq::ApiFace { target: "/v/abc/registry?x=1".to_string() })
         );
         // absolute-form plain-HTTP → forwarded UPSTREAM (must NOT get the api-key
         // in Authorization — the whole point of the Forward split).
@@ -348,20 +355,22 @@ mod tests {
     }
 
     #[test]
-    fn upstream_bound_never_carries_the_api_key_in_authorization() {
-        // The leak guard: an absolute-form (upstream) request must put the daemon
-        // credential in Proxy-Authorization (stripped hop-by-hop), NEVER in
-        // Authorization (which the daemon forwards to the origin).
-        let head = "GET http://api.example.com/v1 HTTP/1.1\r\nHost: api.example.com\r\nAccept: */*\r\n\r\n";
-        let out = inject_proxy_basic(head, "vault-7", "sc_agent_k9");
-        assert!(!out.contains("Authorization: Bearer"), "api-key must not ride Authorization upstream");
-        let b64 = out
-            .lines()
-            .find_map(|l| l.strip_prefix("Proxy-Authorization: Basic "))
-            .expect("has proxy-auth");
-        assert_eq!(String::from_utf8(STANDARD.decode(b64).unwrap()).unwrap(), "vault-7:sc_agent_k9");
+    fn forward_carries_no_safeclaw_credential_and_preserves_child_auth() {
+        // A plain-HTTP passthrough must inject NO SafeClaw credential (the daemon
+        // brokers nothing over plain HTTP). The child's OWN Authorization to the
+        // origin passes through; only a stray Proxy-Authorization is stripped and
+        // Connection is forced to close.
+        let head = "GET http://api.example.com/v1 HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer child-own-token\r\nProxy-Authorization: Basic stray\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n";
+        let out = forward_head(head);
+        // No SafeClaw credential injected anywhere.
+        assert!(!out.contains("Basic "), "no injected Basic credential");
+        assert!(!out.contains("stray"), "stray Proxy-Authorization stripped");
+        assert!(!out.contains("keep-alive"));
+        // The child's own upstream Authorization survives untouched.
+        assert!(out.contains("Authorization: Bearer child-own-token\r\n"));
         assert!(out.contains("Connection: close\r\n"));
-        assert!(out.contains("Host: api.example.com\r\n")); // request line + host preserved
+        assert!(out.contains("Host: api.example.com\r\n"));
+        assert!(out.contains("Accept: */*\r\n"));
         assert!(out.ends_with("\r\n\r\n"));
     }
 
@@ -383,11 +392,12 @@ mod tests {
 
     #[test]
     fn inject_bearer_replaces_auth_preserves_rest() {
+        // The api-face Bearer now carries a fresh AIK PoP token (scpop1…).
         let head = "GET /v/abc/registry HTTP/1.1\r\nHost: 127.0.0.1:23294\r\nAccept: */*\r\n\r\n";
-        let out = inject_bearer(head, "sc_agent_k9");
+        let out = inject_bearer(head, "scpop1.aaa.1.bbb");
         assert_eq!(
             out,
-            "GET /v/abc/registry HTTP/1.1\r\nAuthorization: Bearer sc_agent_k9\r\nConnection: close\r\nHost: 127.0.0.1:23294\r\nAccept: */*\r\n\r\n"
+            "GET /v/abc/registry HTTP/1.1\r\nAuthorization: Bearer scpop1.aaa.1.bbb\r\nConnection: close\r\nHost: 127.0.0.1:23294\r\nAccept: */*\r\n\r\n"
         );
     }
 
@@ -397,8 +407,8 @@ mod tests {
         // the shim owns the credential — and its Connection is forced to close so
         // a keep-alive follow-up can't slip past the raw relay un-authed.
         let head = "GET /x HTTP/1.1\r\nAuthorization: Bearer stale\r\nProxy-Authorization: Basic zzz\r\nConnection: keep-alive\r\nHost: h\r\n\r\n";
-        let out = inject_bearer(head, "real");
-        assert!(out.contains("Authorization: Bearer real\r\n"));
+        let out = inject_bearer(head, "scpop1.real.2.tok");
+        assert!(out.contains("Authorization: Bearer scpop1.real.2.tok\r\n"));
         assert!(out.contains("Connection: close\r\n"));
         assert!(!out.contains("stale"));
         assert!(!out.contains("keep-alive"));
