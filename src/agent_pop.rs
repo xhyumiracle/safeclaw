@@ -43,6 +43,17 @@ pub const TOKEN_PREFIX: &str = "scpop1";
 /// captured token goes stale fast (it's also bound to one vault+target).
 pub const DEFAULT_MAX_SKEW_SECS: u64 = 300;
 
+/// Build the hop-A PoP `target` for the daemon's **api-face** (origin-form reads:
+/// `/v/{vid}/registry`, `/op/{id}`, `/vaults`). Namespaced by the `apiface:`
+/// prefix so a token minted for a read can't be replayed as a CONNECT tunnel
+/// (whose target is a raw `host:port`) or a plain-http forward. The shim signs
+/// this over the exact request-line target it sends; the daemon rebuilds it from
+/// `req.uri().path_and_query()` — the two MUST match byte-for-byte, so both sides
+/// go through THIS one builder.
+pub fn apiface_target(path_and_query: &str) -> String {
+    format!("apiface:{}", path_and_query)
+}
+
 /// Signs one proxy-connect PoP token per CONNECT. Holds the agent's AIK and its
 /// `ag_…` self-id. Lives in the `sc` transport, never in the agent's env.
 pub struct AgentProxyPopSigner {
@@ -158,6 +169,23 @@ mod tests {
         assert!(verify_agent_proxy_pop(&tok, "vault-x", "api.openai.com:443", 1_700_000_301, 300).is_none());
         // within window (299s) → ok.
         assert!(verify_agent_proxy_pop(&tok, "vault-x", "api.openai.com:443", 1_700_000_299, 300).is_some());
+    }
+
+    #[test]
+    fn apiface_token_binds_path_and_cant_replay_as_connect() {
+        let s = signer();
+        // A token minted for an api-face read (target = apiface:<pq>, account-
+        // scoped vault="") verifies only for that exact path…
+        let tok = s.token("", &apiface_target("/v/abc/registry"), 1_700_000_000);
+        assert_eq!(
+            verify_agent_proxy_pop(&tok, "", &apiface_target("/v/abc/registry"), 1_700_000_000, 300).as_deref(),
+            Some(s.agent_id())
+        );
+        // …not another api-face path…
+        assert!(verify_agent_proxy_pop(&tok, "", &apiface_target("/v/other/registry"), 1_700_000_000, 300).is_none());
+        // …and never as a CONNECT tunnel to some host:port (cross-channel replay).
+        assert!(verify_agent_proxy_pop(&tok, "vault-x", "api.openai.com:443", 1_700_000_000, 300).is_none());
+        assert!(verify_agent_proxy_pop(&tok, "", "/v/abc/registry", 1_700_000_000, 300).is_none());
     }
 
     #[test]
