@@ -139,20 +139,12 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
          displaying them. Works on any paired device; revoke: `sc agent rm {}`.",
         args.name, rm_name
     );
-    // One more step, or the agent can broker nothing: its AIK identity must be
-    // AUTHORIZED on the vault(s) it will use (design §11 — the daemon's authz is
-    // the in-vault authorized-agents table, not this account registration). Until
-    // then `sc run` refuses with `agent_not_authorized`. Authorization is a
-    // Console action (K-gated); point the user at it. Only a cloud/paired setup
-    // has a console — a local-only self-host has no `frontend_origin`, so skip it.
-    if let Some(origin) = crate::cli::active::frontend_origin() {
-        eprintln!(
-            "\nOne more step: authorize '{}' on the vault(s) it should use, or it can \
-             broker nothing (`sc run` will refuse with \"not authorized\"). In the \
-             SafeClaw console, open a vault → Agents, and toggle it on:\n  {}",
-            args.name, origin
-        );
-    }
+    // Deliberately NO "go authorize it" nudge here: authorizing is a Console action
+    // that normally completes AUTOMATICALLY (the connect-agent modal detects the new
+    // agent in the roster and writes the UIK-signed grant with K, §11.4). A premature
+    // link every add would front-run that. If authorization DIDN'T happen (console
+    // closed / vault locked), the agent's end-of-setup access check surfaces the
+    // daemon's precise `agent_not_authorized` — the honest, in-context nudge.
     Ok(())
 }
 
