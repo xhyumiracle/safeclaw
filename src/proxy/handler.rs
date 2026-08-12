@@ -372,6 +372,23 @@ impl BrokerHandler {
         // miss with a key PRESENT, refresh the hash-set once (debounced): a key
         // minted seconds ago by `sc agent add` must not 407 for the 30s loop.
         if !self.key_is_valid() {
+            // A cryptographically-VALID AIK PoP (agent_id resolved in
+            // should_intercept) that isn't authorized on THIS vault is a distinct
+            // case from a bad/absent credential: `agent_id.is_some()` here means the
+            // signature + freshness checked out but `ag_ ∉` the vault's
+            // authorized-agents table. The api-key hash-set refresh can't help (the
+            // password slot is a `scpop1…` token, never a key), and calling it "bad
+            // key" sends the user debugging the wrong thing. Fail LOUDLY with the
+            // real fix: authorize it in the Console (Agents tab), then retry (the
+            // grant syncs into the vault's agents table within seconds).
+            if self.agent_id.is_some() {
+                return err_response(
+                    ScCode::AgentNotAuthorized,
+                    "this agent isn't authorized on this vault yet — authorize it in \
+                     the SafeClaw console (Agents tab), then retry",
+                )
+                .into();
+            }
             let refreshed =
                 self.key.is_some() && crate::sync::refresh_agent_keys_on_miss(&self.state).await;
             if !refreshed || !self.key_is_valid() {

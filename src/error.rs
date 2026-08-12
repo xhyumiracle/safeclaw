@@ -26,6 +26,13 @@ pub enum ScCode {
     CaUnavailable,
     // ── proxy plane (credential pipeline) ────────────────────────────────
     AgentKey,
+    /// A cryptographically-VALID agent AIK proof-of-possession whose `ag_` is NOT
+    /// in this vault's authorized-agents table (design §11): the agent proved its
+    /// identity but the user hasn't authorized it here yet. DISTINCT from
+    /// `AgentKey` (no / invalid credential) — the fix is a one-click Console
+    /// authorize (Agents tab), not a credential change, so it must NEVER read as
+    /// "bad key" (that sends the user debugging the wrong thing).
+    AgentNotAuthorized,
     AmbiguousPhantom,
     ApprovalNeeded,
     ApprovalRegister,
@@ -92,6 +99,13 @@ impl ScCode {
             Internal => (500, "internal", "Internal error", "retry", "internal"),
             CaUnavailable => (500, "ca_unavailable", "CA unavailable", "retry", "internal"),
             AgentKey => (407, "agent_key", "Agent key invalid", "configure", "auth"),
+            AgentNotAuthorized => (
+                403,
+                "agent_not_authorized",
+                "Agent not authorized on this vault",
+                "none",
+                "auth",
+            ),
             AmbiguousPhantom => (
                 400,
                 "ambiguous_phantom",
@@ -374,6 +388,7 @@ mod tests {
             Internal,
             CaUnavailable,
             AgentKey,
+            AgentNotAuthorized,
             AmbiguousPhantom,
             ApprovalNeeded,
             ApprovalRegister,

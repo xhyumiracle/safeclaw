@@ -203,17 +203,30 @@ async fn require_agent(
     if let Some(tok) = token.as_deref() {
         if tok.starts_with(&format!("{}.", crate::agent_pop::TOKEN_PREFIX)) {
             let target = crate::agent_pop::apiface_target(pq);
-            let ag = crate::agent_pop::verify_agent_proxy_pop(
+            return match crate::agent_pop::verify_agent_proxy_pop(
                 tok,
                 "",
                 &target,
                 crate::util::now_unix(),
                 crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
-            )
-            .filter(|ag| state.agent_is_authorized_any(ag));
-            return ag.ok_or_else(|| {
-                problem(ScCode::Unauthorized, "missing or invalid agent api key")
-            });
+            ) {
+                // Verified AIK, authorized on some unlocked vault → attribution.
+                Some(ag) if state.agent_is_authorized_any(&ag) => Ok(ag),
+                // Verified AIK but NOT authorized anywhere yet: distinct from a bad
+                // credential — the fix is a Console authorize (Agents tab), not a
+                // key change (same fail-loudly posture as the proxy path).
+                Some(_) => Err(problem(
+                    ScCode::AgentNotAuthorized,
+                    "this agent isn't authorized on any of your vaults yet — \
+                     authorize it in the SafeClaw console (Agents tab)",
+                )),
+                // Not a valid/fresh PoP at all → generic 401 (no api-key fallback:
+                // a `scpop1…` string is never a hash-set member).
+                None => Err(problem(
+                    ScCode::Unauthorized,
+                    "missing or invalid agent api key",
+                )),
+            };
         }
     }
     // Legacy Bearer api-key (dual-auth) — unchanged, incl. the debounced refresh.
