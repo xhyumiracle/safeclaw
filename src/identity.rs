@@ -86,6 +86,28 @@ pub const DS_SERVER_ENVELOPE: &[u8] = b"safeclaw/v1/server-envelope";
 /// [`contact_token_input`].
 pub const DS_CONTACT_TOKEN: &[u8] = b"safeclaw/v1/contact-token";
 
+/// A device's per-request proof-of-possession over a daemon→cloud request (the
+/// DIK half of mutual mTLS, hop-B). Railway terminates TLS, so hop-B can't be a
+/// real client-cert handshake — instead the daemon signs each request with its
+/// DIK and the Node backend verifies the signature against the device's
+/// registered `dev_` pubkey. See [`device_request_signature_input`].
+pub const DS_DEVICE_REQ: &[u8] = b"safeclaw/v1/device-req";
+
+/// An agent's per-CONNECT proof-of-possession over the local forward proxy (the
+/// AIK half of mutual mTLS, hop-A). A standard client can't present a client cert
+/// to a forward proxy, so the AIK identity rides a signed token in the
+/// `Proxy-Authorization` header instead. See [`agent_proxy_pop_input`].
+pub const DS_AGENT_PROXY_POP: &[u8] = b"safeclaw/v1/agent-proxy-pop";
+
+/// Domain tag for the **per-record signature** (SUDP extension A1.2/A1.3,
+/// `design/sudp-identity-signing-revision.md`). This is the SUDP-protocol-layer
+/// record signature — hence the `sudp/v1/*` family (C.4 domain decision) rather
+/// than `safeclaw/v1/*` — even though the primitive lives here in core (the sudp
+/// crate stays a pure codec, §B). It signs the CIPHERTEXT hash + the plaintext
+/// `type`/`status`, so BOTH a blind server (write-gate / clean state) and every
+/// reader (the trust wall) can verify without decrypting.
+pub const DS_ITEM_SIG: &[u8] = b"sudp/v1/item-sig";
+
 /// HKDF `info` deriving an agent's Ed25519 identity seed from its root seed.
 const AIK_IDENTITY_INFO: &[u8] = b"safeclaw/v1/agent-identity";
 
@@ -116,6 +138,10 @@ pub enum IdKind {
     User,
     /// An agent principal (AIK). Prints as `ag_…`.
     Agent,
+    /// A device principal (DIK) — one machine's identity to the cloud. Prints as
+    /// `dev_…`. Symmetric with AIK (design/agent-device-identity-mtls.md §0);
+    /// replaces the bearer device pair token.
+    Device,
 }
 
 impl IdKind {
@@ -123,6 +149,7 @@ impl IdKind {
         match self {
             IdKind::User => "us",
             IdKind::Agent => "ag",
+            IdKind::Device => "dev",
         }
     }
 }
@@ -289,6 +316,129 @@ pub fn config_sig_input(
     out.push(status);
     push_lp(&mut out, &body_hash);
     push_lp(&mut out, signer_id.as_bytes());
+    out
+}
+
+/// Signing input for a **per-record signature** (SUDP extension A1.2/A1.3,
+/// `design/sudp-identity-signing-revision.md`): a principal's signature over one
+/// sealed record, binding its plaintext `type`/`status` to the sealed body.
+///
+/// ```text
+/// lp(DS_ITEM_SIG) ‖ lp(record_type) ‖ lp(item_id) ‖ u64_be(version)
+///   ‖ lp(vault_id) ‖ status(1) ‖ lp(SHA-256(sealed_body)) ‖ lp(principal_id)
+/// ```
+///
+/// Crucially the hash is over the **sealed body (ciphertext)**, not the plaintext
+/// — so a blind server AND every reader can verify the signature WITHOUT the key
+/// (the server does the write-gate for clean state; the reader is the trust wall,
+/// A1.5). `record_type` is the plaintext ns token (`secret`/`connection`/`policy`/
+/// `agent`/…) that the server gates on (A1.4 role×type) and the reader cross-binds
+/// to the decrypted record. `status` = `1` live / `0` tombstone (a delete is a
+/// signed record state; the signer+type decide who may delete). `item_id` is the
+/// blinded HMAC id (unchanged addressing). `principal_id` = the signer's self-id
+/// (`us_`/`dev_`/`ag_`) — a UIK for human writes, the DIK/AIK for automatic
+/// (daemon/agent) writes (A2). One signature does all three jobs: authorization
+/// (role×type), integrity/author identity, and rollback resistance (version is
+/// bound + the caller keeps version monotone).
+pub fn record_signature_input(
+    record_type: &str,
+    item_id: &[u8],
+    version: u64,
+    vault_id: &str,
+    sealed_body: &[u8],
+    status_live: bool,
+    principal_id: &str,
+) -> Vec<u8> {
+    let body_hash = sha256(sealed_body);
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_ITEM_SIG);
+    push_lp(&mut out, record_type.as_bytes());
+    push_lp(&mut out, item_id);
+    out.extend_from_slice(&version.to_be_bytes());
+    push_lp(&mut out, vault_id.as_bytes());
+    out.push(if status_live { 1 } else { 0 });
+    push_lp(&mut out, &body_hash);
+    push_lp(&mut out, principal_id.as_bytes());
+    out
+}
+
+/// Signing input for a **device request proof-of-possession** (hop-B of the
+/// mutual-mTLS transport, `design/agent-device-identity-mtls.md` §9.1). The
+/// daemon signs every cloud request with its DIK so the Node backend can verify
+/// "this request really came from an authorized device" WITHOUT a client-cert
+/// handshake (Railway terminates TLS before the app ever sees the connection).
+///
+/// ```text
+/// lp(DS_DEVICE_REQ) ‖ lp(method) ‖ lp(path) ‖ u64_be(timestamp)
+///   ‖ lp(SHA-256(body)) ‖ lp(device_id)
+/// ```
+///
+/// Every field binds so a captured signature can't be replayed onto a different
+/// request: `method`+`path` pin the endpoint (pass `path` including the query
+/// string, exactly as it appears on the wire, so it matches byte-for-byte at the
+/// verifier), `timestamp` (unix seconds) bounds the replay window, the body hash
+/// pins the payload (use `&[]` for a bodyless GET — its SHA-256 is a fixed
+/// constant both sides compute), and `device_id` (the `dev_…` self-id) tells the
+/// verifier which registered pubkey to check. This is a SafeClaw transport-auth
+/// concern, not part of the SUDP sealed-record protocol, so it lives in the
+/// `safeclaw/v1/*` domain (unlike the `sudp/v1/item-sig` record signature).
+///
+/// hop-B is ADDITIVE: the daemon keeps sending its bearer device-key too, so an
+/// un-upgraded backend (that ignores the signature header) still authenticates,
+/// and a backend that has not yet migrated the device pubkey column verifies
+/// nothing and falls back to the bearer. Nothing bricks in any upgrade order.
+pub fn device_request_signature_input(
+    method: &str,
+    path: &str,
+    timestamp: u64,
+    body: &[u8],
+    device_id: &str,
+) -> Vec<u8> {
+    let body_hash = sha256(body);
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_DEVICE_REQ);
+    push_lp(&mut out, method.as_bytes());
+    push_lp(&mut out, path.as_bytes());
+    out.extend_from_slice(&timestamp.to_be_bytes());
+    push_lp(&mut out, &body_hash);
+    push_lp(&mut out, device_id.as_bytes());
+    out
+}
+
+/// Signing input for an **agent proxy-connect proof-of-possession** (hop-A of the
+/// mutual-mTLS transport, `design/agent-device-identity-mtls.md` §9.1). An agent
+/// reaches the daemon through a standard forward proxy (`HTTP_PROXY`), whose only
+/// client-auth channel is the `Proxy-Authorization` header on each `CONNECT` — a
+/// standard client cannot present a client cert to a forward proxy, so hop-A (like
+/// hop-B under Railway) rides an application-layer signature, not TLS mutual auth.
+/// The `sc` transport signs this with the agent's AIK per CONNECT; the daemon
+/// verifies it against the vault's authorized-agents table.
+///
+/// ```text
+/// lp(DS_AGENT_PROXY_POP) ‖ lp(vault_id) ‖ lp(target) ‖ u64_be(timestamp) ‖ lp(agent_id)
+/// ```
+///
+/// `vault_id` = the CONNECT's proxy-auth username (which vault the agent is using),
+/// `target` = the CONNECT authority `host:port` the tunnel opens to (binds the
+/// token to that destination so a captured one can't be replayed elsewhere within
+/// the window), `timestamp` = unix seconds (freshness/replay window), `agent_id` =
+/// the AIK self-id (`ag_…`). The daemon rebuilds this from the CONNECT context +
+/// the token's carried pubkey (deriving `agent_id`) and verifies the signature,
+/// then checks `agent_id ∈` the authorized-agents table. Per-CONNECT, not
+/// per-request: one CONNECT opens a reused tunnel, and the proxy only sees
+/// `Proxy-Authorization` at CONNECT time.
+pub fn agent_proxy_pop_input(
+    vault_id: &str,
+    target: &str,
+    timestamp: u64,
+    agent_id: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_AGENT_PROXY_POP);
+    push_lp(&mut out, vault_id.as_bytes());
+    push_lp(&mut out, target.as_bytes());
+    out.extend_from_slice(&timestamp.to_be_bytes());
+    push_lp(&mut out, agent_id.as_bytes());
     out
 }
 
@@ -624,6 +774,125 @@ mod tests {
         let a = config_sig_input("ab", "c", 1, Some(b"x"), "s");
         let b = config_sig_input("a", "bc", 1, Some(b"x"), "s");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn record_signature_input_every_field_binds() {
+        let base = record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", true, "us_a");
+        assert_ne!(base, record_signature_input("connection", b"\x01\x02", 3, "v1", b"ct", true, "us_a"), "type binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x03", 3, "v1", b"ct", true, "us_a"), "item_id binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 4, "v1", b"ct", true, "us_a"), "version binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v2", b"ct", true, "us_a"), "vault binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", false, "us_a"), "status (live/tombstone) binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"CT", true, "us_a"), "sealed body binds");
+        assert_ne!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", true, "dev_a"), "principal binds");
+        assert_eq!(base, record_signature_input("secret", b"\x01\x02", 3, "v1", b"ct", true, "us_a"), "deterministic");
+    }
+
+    #[test]
+    fn record_signature_input_lp_ambiguity_resolved() {
+        // ("ab","c") vs ("a","bc") for (type, item_id) would collide without
+        // length prefixes; with them the inputs differ.
+        let a = record_signature_input("ab", b"c", 1, "v", b"x", true, "s");
+        let b = record_signature_input("a", b"bc", 1, "v", b"x", true, "s");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn record_signature_roundtrip_and_type_tamper() {
+        // A principal signs a record; the daemon/server verify over the SAME
+        // input (built from the plaintext type + the ciphertext hash). Swapping
+        // the plaintext type to bypass the write-gate breaks verification —
+        // the signature binds type↔sealed content (A1.3, kills type-class 越权).
+        let uik = SigningIdentity::from_seed(&UIK_SEED);
+        let input = record_signature_input("agent", b"\xaa\xbb\xcc", 2, "vault-x", b"sealed-ct", true, &uik.user_id());
+        let sig = uik.sign(&input);
+        assert!(verify(&uik.public_bytes(), &input, &sig), "own signature verifies");
+        let swapped = record_signature_input("secret", b"\xaa\xbb\xcc", 2, "vault-x", b"sealed-ct", true, &uik.user_id());
+        assert!(!verify(&uik.public_bytes(), &swapped, &sig), "a swapped plaintext type must not verify");
+    }
+
+    #[test]
+    fn device_request_signature_input_every_field_binds() {
+        let base = device_request_signature_input("GET", "/p", 1, b"body", "dev_a");
+        assert_ne!(base, device_request_signature_input("PUT", "/p", 1, b"body", "dev_a"), "method binds");
+        assert_ne!(base, device_request_signature_input("GET", "/q", 1, b"body", "dev_a"), "path binds");
+        assert_ne!(base, device_request_signature_input("GET", "/p", 2, b"body", "dev_a"), "timestamp binds");
+        assert_ne!(base, device_request_signature_input("GET", "/p", 1, b"BODY", "dev_a"), "body binds");
+        assert_ne!(base, device_request_signature_input("GET", "/p", 1, b"body", "dev_b"), "device_id binds");
+        assert_eq!(base, device_request_signature_input("GET", "/p", 1, b"body", "dev_a"), "deterministic");
+    }
+
+    #[test]
+    fn device_request_signature_input_lp_ambiguity_resolved() {
+        // ("GET","/p") vs ("GE","T/p") for (method, path) would collide without
+        // length prefixes; with them the inputs differ.
+        let a = device_request_signature_input("GET", "/p", 1, b"", "d");
+        let b = device_request_signature_input("GE", "T/p", 1, b"", "d");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn device_request_roundtrip_and_path_tamper() {
+        // The daemon signs a request with its DIK; the backend verifies over the
+        // SAME input rebuilt from the wire (method/path/ts/body/device_id).
+        // Replaying the signature onto a different path must fail — the DIK
+        // signature binds the request, not just the device.
+        let dik = SigningIdentity::from_seed(&UIK_SEED);
+        let dev_id = derive_id(IdKind::Device, &dik.public_bytes());
+        let input = device_request_signature_input("PUT", "/v/vault-x/membership", 1_700_000_000, b"{}", &dev_id);
+        let sig = dik.sign(&input);
+        assert!(verify(&dik.public_bytes(), &input, &sig), "own signature verifies");
+        let tampered = device_request_signature_input("PUT", "/v/vault-y/membership", 1_700_000_000, b"{}", &dev_id);
+        assert!(!verify(&dik.public_bytes(), &tampered, &sig), "a swapped path must not verify");
+    }
+
+    #[test]
+    fn pinned_device_request_signature_input() {
+        // K-vector: GET, path "/api/vault/agents/hashes", ts 1700000000, empty
+        // body, device "dev_box". The Node backend mirror pins the same bytes.
+        let input = device_request_signature_input("GET", "/api/vault/agents/hashes", 1_700_000_000, b"", "dev_box");
+        assert_eq!(hex(&input), "0000001673616665636c61772f76312f6465766963652d72657100000003474554000000182f6170692f7661756c742f6167656e74732f686173686573000000006553f10000000020e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855000000076465765f626f78");
+    }
+
+    #[test]
+    fn agent_proxy_pop_input_every_field_binds() {
+        let base = agent_proxy_pop_input("v1", "api.x.com:443", 1, "ag_a");
+        assert_ne!(base, agent_proxy_pop_input("v2", "api.x.com:443", 1, "ag_a"), "vault binds");
+        assert_ne!(base, agent_proxy_pop_input("v1", "api.y.com:443", 1, "ag_a"), "target binds");
+        assert_ne!(base, agent_proxy_pop_input("v1", "api.x.com:443", 2, "ag_a"), "timestamp binds");
+        assert_ne!(base, agent_proxy_pop_input("v1", "api.x.com:443", 1, "ag_b"), "agent_id binds");
+        assert_eq!(base, agent_proxy_pop_input("v1", "api.x.com:443", 1, "ag_a"), "deterministic");
+    }
+
+    #[test]
+    fn agent_proxy_pop_roundtrip_and_target_tamper() {
+        // The sc transport signs a CONNECT with the AIK; the daemon rebuilds the
+        // input from the CONNECT context (vid + target + ts + derived ag_id) and
+        // verifies. Replaying the signature onto a different target must fail —
+        // the token binds the destination, not just the agent.
+        let aik = SigningIdentity::from_seed(&UIK_SEED);
+        let ag = derive_id(IdKind::Agent, &aik.public_bytes());
+        let input = agent_proxy_pop_input("vault-x", "api.openai.com:443", 1_700_000_000, &ag);
+        let sig = aik.sign(&input);
+        assert!(verify(&aik.public_bytes(), &input, &sig), "own signature verifies");
+        let elsewhere = agent_proxy_pop_input("vault-x", "evil.example:443", 1_700_000_000, &ag);
+        assert!(!verify(&aik.public_bytes(), &elsewhere, &sig), "a swapped target must not verify");
+    }
+
+    #[test]
+    fn pinned_agent_proxy_pop_input() {
+        // K-vector: vault "vault-7", target "api.x:443", ts 1700000000, agent "ag_a".
+        let input = agent_proxy_pop_input("vault-7", "api.x:443", 1_700_000_000, "ag_a");
+        assert_eq!(hex(&input), "0000001b73616665636c61772f76312f6167656e742d70726f78792d706f70000000077661756c742d37000000096170692e783a343433000000006553f1000000000461675f61");
+    }
+
+    #[test]
+    fn pinned_record_signature_input() {
+        // K-vector: type "secret", id 0x0102, version 7, vault "vault-7",
+        // sealed body b"ct", live, principal "us_owner". Mirror pins the same.
+        let input = record_signature_input("secret", b"\x01\x02", 7, "vault-7", b"ct", true, "us_owner");
+        assert_eq!(hex(&input), "00000010737564702f76312f6974656d2d736967000000067365637265740000000201020000000000000007000000077661756c742d370100000020f8dcb34308e5c69f46a33cafa62bd922476b18c78a114eb144e34a5e374f7d600000000875735f6f776e6572");
     }
 
     // ── Pinned cross-language vectors ───────────────────────────────────────

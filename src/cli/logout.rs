@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use crate::cli::active::{load, save, CliConfig};
 use crate::config::LogoutArgs;
+use crate::device_auth::DikRequestExt;
 
 pub async fn run(args: LogoutArgs) -> Result<(), String> {
     let cfg = load().unwrap_or_default();
@@ -109,9 +110,11 @@ async fn revoke_device_cloud(cfg: &CliConfig) -> Result<Option<String>, String> 
         .build()
         .map_err(|e| format!("http client init: {}", e))?;
 
+    let list_url = format!("{}/api/vault/devices", cloud);
     let resp = client
-        .get(format!("{}/api/vault/devices", cloud))
+        .get(&list_url)
         .bearer_auth(&key)
+        .dik_pop("GET", &list_url, &[])
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;
@@ -129,9 +132,11 @@ async fn revoke_device_cloud(cfg: &CliConfig) -> Result<Option<String>, String> 
     };
     let label = me.label.clone().unwrap_or_else(|| me.prefix.clone());
 
+    let del_url = format!("{}/api/vault/devices/{}", cloud, me.id);
     let del = client
-        .delete(format!("{}/api/vault/devices/{}", cloud, me.id))
+        .delete(&del_url)
         .bearer_auth(&key)
+        .dik_pop("DELETE", &del_url, &[])
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;

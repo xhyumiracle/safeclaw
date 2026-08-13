@@ -378,12 +378,45 @@ impl AgentMask {
     }
 }
 
-/// The body of an `agent:<agent_id>` item: today just the mask, kept as a
-/// struct so future per-agent fields land without re-addressing.
+/// One row of a vault's **authorized-agents table** — the item body under
+/// `aux:agent/<ag_id>` (design/agent-device-identity-mtls.md §11.1). It records
+/// the agent's self-certifying pubkey, the owning member (`us_…`) whose UIK
+/// authority admits it, and the connection reach mask.
+///
+/// **This table is the daemon's ONLY agent-authz source** (§11.1): the presented
+/// AIK's pubkey → `ag_id` → an item here → apply this mask. **Presence in the
+/// table = authorized; dropping the item = a clean vault-level revoke** (no
+/// re-key — the agent never held K). There is no separate admission mode: an
+/// `ag_id` with no item is simply not authorized.
+///
+/// Each item is **UIK-signed** and folded through [`crate::identity::config_sig_input`]
+/// under the logical name `agent/<ag_id>`; the fold verifies the signer is
+/// EITHER this `owner` (a member authorizing their OWN agent) OR any owner
+/// (owner override). Because the daemon holds only PUBLIC keys, it cannot
+/// re-sign a folded row, so the verified signed wrapper is retained in
+/// [`Self::signed_body`] and re-emitted byte-identically.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentEntry {
+    /// The agent's Ed25519 signing pubkey (base64url-nopad). Self-certifying:
+    /// `derive_id(Agent, pubkey)` MUST equal this item's `ag_id` (the map key).
+    /// Empty on a legacy prefix-keyed grant (pre-AIK); such a row is never
+    /// AIK-consultable (no cert maps to it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_pubkey: String,
+    /// The owning member's `us_…`. The authorizing UIK signer must be this owner
+    /// (self-service for one's OWN agent) OR any owner. Empty on a legacy grant.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
+    /// Connection reach mask (deny-list; `All` = unrestricted).
     #[serde(default)]
     pub connections: AgentMask,
+    /// The verified signed wrapper (`{ data, uik_sig, uik_sign_pub }`) exactly as
+    /// folded from cloud, retained so the daemon can re-emit this row
+    /// byte-identically (it holds only PUBLIC keys and cannot re-sign). `None` for
+    /// a legacy raw (unsigned) row → the daemon re-emits the raw body. Never
+    /// serialized as a struct field; consulted directly by the seal path.
+    #[serde(skip)]
+    pub signed_body: Option<serde_json::Value>,
 }
 
 /// `aux` payload — everything inside `ProtectedState.aux` for v4 vaults.
@@ -422,11 +455,11 @@ pub struct VaultAux {
     /// it never shadows a built-in id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub services: BTreeMap<String, String>,
-    /// Per-agent reach masks, keyed by agent id (pubkey-derived once identity
-    /// ships; api-key id until then). Sparse — an absent entry means the agent
-    /// reaches everything (`AgentMask::All`, personal parity). Sliced to
-    /// `agent:<id>` items at the sync layer (one item per agent = independent
-    /// CAS, same pattern as connections). Team §8.1.
+    /// The vault's **authorized-agents table** (design §11.1), keyed by `ag_id`
+    /// (`derive_id(Agent, pubkey)`). **Presence = authorized**; an `ag_id` with no
+    /// entry is not authorized (there is no admission mode). Each [`AgentEntry`] is
+    /// UIK-signed. Sliced to `aux:agent/<ag_id>` items (one per agent = independent
+    /// CAS, same pattern as connections). Team §8.1 / identity §11.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AgentEntry>,
 }

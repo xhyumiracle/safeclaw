@@ -4,7 +4,9 @@
 //! key; the cloud stores only its hash; the key works on ANY of the account's
 //! paired devices (the daemon syncs the hash-set + validates locally). Auth is
 //! this device's device-key (account-scoped), so `sc agent` works on any
-//! paired machine. See [[project_vault_agent_architecture_2026_06_25]].
+//! paired machine. As of the identity wave each agent ALSO mints an AIK keypair
+//! (hop-A PoP identity) here; the api-key stays as the dual-auth legacy path.
+//! See [[project_vault_agent_architecture_2026_06_25]].
 
 use std::time::Duration;
 
@@ -12,6 +14,7 @@ use serde::Deserialize;
 
 use crate::cli::active::load as load_config;
 use crate::config::{AgentAddArgs, AgentRmArgs, AgentSubcommand};
+use crate::device_auth::DikRequestExt;
 
 pub async fn run(sub: AgentSubcommand) -> Result<(), String> {
     match sub {
@@ -67,10 +70,34 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         crate::config::PROXY_PORT
     );
 
+    // ── Mint this agent's AIK (possession-proven identity; identity wave §2) ──
+    // Ed25519 keypair, self-certifying `ag_…` id. The private SEED never leaves
+    // this disk (0600) and never enters the agent's env — only the PUBLIC key is
+    // registered with the cloud (for the known-agents roster / discovery; the
+    // daemon's real authz source is the E2E authorized-agents table). hop-A
+    // verifies the AIK per-CONNECT via a Proxy-Authorization PoP token
+    // (DPoP-style), NOT mTLS. Persisted only AFTER the cloud accepts the
+    // registration, so a failed create leaves no orphan file.
+    let (seed, ag_id) = crate::identity_file::mint(crate::identity::IdKind::Agent);
+    let (aik, _) = crate::identity_file::resolve(crate::identity::IdKind::Agent, &seed);
+    let aik_pub = data_encoding::BASE64.encode(&aik.public_bytes());
+    let identity_path = crate::identity_file::agent_identity_path(&args.name)?;
+
+    let url = format!("{}/api/vault/agents", cloud);
+    let body = serde_json::json!({
+        "label": args.name,
+        "tier": "agent",
+        // Additive: an older backend ignores these; a current one records the
+        // pubkey in the known-agents roster (management/discovery — the daemon's
+        // authz is the E2E authorized-agents table, not this server record).
+        "agent_id": ag_id,
+        "agent_pubkey": aik_pub,
+    });
     let resp = client()?
-        .post(format!("{}/api/vault/agents", cloud))
+        .post(&url)
         .bearer_auth(&key)
-        .json(&serde_json::json!({ "label": args.name, "tier": "agent" }))
+        .dik_pop("POST", &url, &serde_json::to_vec(&body).unwrap_or_default())
+        .json(&body)
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
@@ -82,12 +109,15 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         .await
         .map_err(|e| format!("parse response: {}", e))?;
 
+    crate::identity_file::write(&identity_path, crate::identity::IdKind::Agent, &seed)?;
+
     // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─
-    // Print the agent's env as two dotenv lines: the daemon's API face + the
-    // fresh key. The agent appends ONE command's stdout to its own `.env` —
-    // its SSOT from then on — and never assembles a value. STDOUT only; stderr
-    // guidance carries NO secret, so blind-capture keeps the key out of the
-    // agent's transcript (and out of the install prompt).
+    // Print the agent's env as dotenv lines: the daemon's API face, the AIK
+    // identity PATH (a path, not a secret — the possession-proven identity, the
+    // dual-auth target), and the legacy api-key (still the ACTIVE transport until
+    // the AIK PoP path is enforced; kept so nothing bricks — design §7). The agent appends ONE
+    // command's stdout to its own `.env` and never assembles a value. STDOUT
+    // only; stderr guidance carries NO secret.
     //
     // Deliberately NOT baked: a precomputed proxy URL (froze a host:port that a
     // moved daemon made stale — `sc run` rebuilds it live), and a vault id
@@ -95,6 +125,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
     // `sc vault use` forever — vault is per-call, not identity; see
     // design/vault-addressing.md). Identity-only env self-heals.
     println!("SAFECLAW_BROKER_URL={}", broker_url);
+    println!("SAFECLAW_AGENT_IDENTITY={}", identity_path.display());
     println!("SAFECLAW_API_KEY={}", r.token);
 
     let rm_name = if args.name.contains(char::is_whitespace) {
@@ -108,15 +139,23 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
          displaying them. Works on any paired device; revoke: `sc agent rm {}`.",
         args.name, rm_name
     );
+    // Deliberately NO "go authorize it" nudge here: authorizing is a Console action
+    // that normally completes AUTOMATICALLY (the connect-agent modal detects the new
+    // agent in the roster and writes the UIK-signed grant with K, §11.4). A premature
+    // link every add would front-run that. If authorization DIDN'T happen (console
+    // closed / vault locked), the agent's end-of-setup access check surfaces the
+    // daemon's precise `agent_not_authorized` — the honest, in-context nudge.
     Ok(())
 }
 
 async fn fetch_agents(cloud: &str, key: &str) -> Result<Vec<ListKey>, String> {
     // `/api/vault/agents` is already tier-scoped server-side (agent|demo);
     // device-keys live under `/api/vault/devices`.
+    let url = format!("{}/api/vault/agents", cloud);
     let resp = client()?
-        .get(format!("{}/api/vault/agents", cloud))
+        .get(&url)
         .bearer_auth(key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;
@@ -171,9 +210,11 @@ async fn rm(args: AgentRmArgs) -> Result<(), String> {
             ))
         }
     };
+    let url = format!("{}/api/vault/agents/{}", cloud, id);
     let resp = client()?
-        .delete(format!("{}/api/vault/agents/{}", cloud, id))
+        .delete(&url)
         .bearer_auth(&key)
+        .dik_pop("DELETE", &url, &[])
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(&cloud, &e))?;

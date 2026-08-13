@@ -242,11 +242,14 @@ pub struct SecretsCache {
     /// per-connection (`policy.connections.<id>`), while the built-in rules it
     /// merges come from the shared service definition.
     pub connections: HashMap<String, crate::storage::plaintext::Connection>,
-    /// Per-agent reach masks (team §8.1), keyed by the agent api-key PREFIX —
-    /// the identity handle the daemon can derive from a presented Bearer (the
-    /// pubkey-derived agent id takes this slot when AIK ships; few rows, cheap
-    /// re-key). Snapshot of `view.aux.agents` at unlock/refresh. Absent entry
-    /// = `AgentMask::All` (personal parity).
+    /// The vault's **authorized-agents table** (design §11.1), keyed by `ag_id`
+    /// (`derive_id(Agent, pubkey)`). Snapshot of `view.aux.agents` at
+    /// unlock/refresh. **Presence = authorized**; an `ag_id` with no entry is not
+    /// in the table. Consulted ONLY on the AIK (PoP) path where the daemon knows
+    /// the presented `ag_id`; the legacy Basic api-key path (dual-auth window)
+    /// carries an api-key prefix, which is never in this `ag_`-keyed table → the
+    /// mask lookup misses → the caller falls to the legacy allow (nothing bricks
+    /// until bearers retire).
     pub agents: std::collections::BTreeMap<String, crate::storage::plaintext::AgentEntry>,
     /// Custom (per-vault `aux.services`) service definitions, validated at
     /// unlock. Wiped on lock (Default drop). A custom service folds into
@@ -305,6 +308,12 @@ pub struct AppState {
     /// only, repopulated on each pull — same restart-softness as `cloud_contact`,
     /// which the offline lease already accepts (it is a soft backstop).
     pub vault_shared: Mutex<HashMap<String, bool>>,
+    /// Vaults whose cloud sync returned `SC_UPGRADE_REQUIRED` — this daemon is too
+    /// old for their (newer) item format (design 甲). While set, the broker refuses
+    /// with [`crate::error::ScCode::UpgradeRequired`] so the AGENT gets an actionable
+    /// "run `sc upgrade`" instead of a silent parked-sync failure. In-memory only,
+    /// (re)set by the sync path; cleared when a sync succeeds again.
+    pub vault_upgrade_required: Mutex<std::collections::HashSet<String>>,
     /// Team-edition extension hooks (team-edition §9 open/closed split). The
     /// open build leaves the [`crate::team_hooks::NoopHooks`] default (no team
     /// policy); the closed `safeclaw-ee` overlay injects real ones via
@@ -462,6 +471,7 @@ impl AppState {
             vaults,
             cloud_contact: Mutex::new(HashMap::new()),
             vault_shared: Mutex::new(HashMap::new()),
+            vault_upgrade_required: Mutex::new(std::collections::HashSet::new()),
             team: std::sync::Arc::new(crate::team_hooks::NoopHooks),
             pending_format_mark: Mutex::new(std::collections::HashSet::new()),
             pending_config_ids: Mutex::new(HashMap::new()),
@@ -1331,54 +1341,110 @@ impl AppState {
             .insert(vault_id.to_string(), shared);
     }
 
-    /// Does this vault's reach mask let `agent_prefix` use `connection_id`?
+    /// Mark (or clear) a vault as needing a daemon upgrade — the cloud returned
+    /// `SC_UPGRADE_REQUIRED` for its sync (design 甲). Set by the sync path on that
+    /// signal, cleared on a successful sync. The broker reads it to fail loudly with
+    /// an actionable "run `sc upgrade`" to the agent.
+    pub fn set_vault_upgrade_required(&self, vault_id: &str, required: bool) {
+        let mut set = self.vault_upgrade_required.lock().unwrap();
+        if required {
+            set.insert(vault_id.to_string());
+        } else {
+            set.remove(vault_id);
+        }
+    }
+
+    /// Is this vault flagged `SC_UPGRADE_REQUIRED` (daemon too old for its format)?
+    pub fn is_vault_upgrade_required(&self, vault_id: &str) -> bool {
+        self.vault_upgrade_required
+            .lock()
+            .unwrap()
+            .contains(vault_id)
+    }
+
+    /// Does this vault's reach mask let `agent_id` use `connection_id`?
     /// (team §8.1 — ONE pipeline: the proxy deny, the registry annotation and
-    /// GET /vaults all read THIS.) Locked vault → `None` (caller renders its
-    /// usual locked answer). An agent with no mask entry is unrestricted.
+    /// GET /vaults all read THIS.) The verdict:
+    ///   - `Some(false)` — the agent IS in the authorized-agents table and its
+    ///     mask denies this connection (the only denial the proxy acts on).
+    ///   - `Some(true)` — in the table, mask allows.
+    ///   - `None` — vault locked, OR `agent_id` is not in the `ag_`-keyed table.
+    ///     The caller treats `None` as "no mask restriction" (allow): this is the
+    ///     legacy Basic-auth path (api-key prefix, never in an `ag_`-keyed table)
+    ///     during the dual-auth window. True fail-closed ("not in table = deny")
+    ///     is enforced by the AIK proxy path once bearers retire (§11.6).
     pub fn agent_mask_allows(
         &self,
         vault_id: &str,
-        agent_prefix: &str,
+        agent_id: &str,
         connection_id: &str,
     ) -> Option<bool> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => Some(
-                cache
-                    .agents
-                    .get(agent_prefix)
-                    .map(|e| e.connections.allows(connection_id))
-                    .unwrap_or(true),
-            ),
+            Some(VaultState::Unlocked { cache, .. }) => cache
+                .agents
+                .get(agent_id)
+                .map(|e| e.connections.allows(connection_id)),
             _ => None,
         }
     }
 
+    /// Is `agent_id` present in this vault's authorized-agents table (§11)?
+    /// Presence = authorized: the UIK-signed `ag_`-keyed table is the daemon's
+    /// only authz source, and dropping a row is the revoke. Used by the hop-A AIK
+    /// PoP proxy path to decide whether a crypto-verified `ag_…` may use this
+    /// vault at all — distinct from [`agent_mask_allows`], which only restricts
+    /// WHICH connections an already-authorized agent may reach. `false` when the
+    /// vault is locked or the agent isn't in the table (fail-closed — the AIK path
+    /// is opt-in and dual-authed with the legacy api-key, so this never bricks a
+    /// legacy agent, whose api-key prefix simply isn't an `ag_` and takes the
+    /// hash-set path instead).
+    pub fn agent_is_authorized(&self, vault_id: &str, agent_id: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.agents.contains_key(agent_id),
+            _ => false,
+        }
+    }
+
+    /// Is `agent_id` present in the authorized-agents table of ANY currently
+    /// UNLOCKED vault this daemon holds (§11)? The ACCOUNT-scoped check for the
+    /// api-face reads (registry / op-poll / `/vaults`) — those aren't tied to a
+    /// single vault, so a hop-A AIK PoP that proves possession of `ag_…` is a
+    /// valid agent of this account for those cross-vault reads iff it's
+    /// authorized on at least one vault. `false` if no unlocked vault authorizes
+    /// it (fail-closed; dual-auth with the legacy api-key covers the transition).
+    pub fn agent_is_authorized_any(&self, agent_id: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        states.values().any(|s| match s {
+            VaultState::Unlocked { cache, .. } => cache.agents.contains_key(agent_id),
+            _ => false,
+        })
+    }
+
     /// Which of `candidates` this agent is ALLOWED to reach in this vault —
-    /// evaluated through `AgentMask::allows` so the blacklist, the legacy
-    /// whitelist and `All` all resolve identically (team §8.1 ONE pipeline:
-    /// same verdict as the proxy deny). `None` = vault locked OR the agent has
-    /// no mask entry (unrestricted → caller masks nothing); `Some(set)` = the
-    /// subset of `candidates` that stays reachable. Used by the registry/vaults
-    /// surfaces to annotate rows without N lock round-trips.
+    /// evaluated through `AgentMask::allows` so the blacklist and `All` resolve
+    /// identically (team §8.1 ONE pipeline: same verdict as the proxy deny).
+    /// `Some(set)` = the subset of `candidates` reachable under this agent's mask;
+    /// `None` = vault locked OR `agent_id` is not in the authorized-agents table
+    /// (the caller masks nothing — the legacy allow of the dual-auth window, since
+    /// a legacy api-key prefix is never in the `ag_`-keyed table). Used by the
+    /// registry/vaults surfaces to annotate rows without N lock round-trips.
     pub fn agent_allowed_connections(
         &self,
         vault_id: &str,
-        agent_prefix: &str,
+        agent_id: &str,
         candidates: &[String],
     ) -> Option<Vec<String>> {
         let states = self.vault_states.lock().unwrap();
         match states.get(vault_id) {
-            Some(VaultState::Unlocked { cache, .. }) => {
-                let entry = cache.agents.get(agent_prefix)?; // absent = unrestricted
-                Some(
-                    candidates
-                        .iter()
-                        .filter(|id| entry.connections.allows(id))
-                        .cloned()
-                        .collect(),
-                )
-            }
+            Some(VaultState::Unlocked { cache, .. }) => cache.agents.get(agent_id).map(|entry| {
+                candidates
+                    .iter()
+                    .filter(|id| entry.connections.allows(id))
+                    .cloned()
+                    .collect()
+            }),
             _ => None,
         }
     }

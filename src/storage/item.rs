@@ -259,6 +259,23 @@ pub enum ItemNs {
     Members,
 }
 
+/// The authority a record's SIGNER carries, for the §A1.4/A2 role×type write
+/// policy. A principal that authors a record is EITHER a human (UIK — an owner or
+/// a plain member) OR the device (DIK) making an automatic, no-human-present write
+/// (OAuth refresh / connect). Agents (AIK) never author records — they USE the
+/// vault through the broker — so there is no agent writer role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterRole {
+    /// A human UIK that is an OWNER of the vault.
+    Owner,
+    /// A human UIK that is a non-owner MEMBER.
+    Member,
+    /// The DIK — the daemon's automatic writes on behalf of its account. Bounded
+    /// to data records (an owner-config or agent-authz change is a deliberate
+    /// human act, never an automatic one).
+    Device,
+}
+
 impl ItemNs {
     /// The lowercase wire string (matches the serde rename and the TS side).
     pub fn as_str(self) -> &'static str {
@@ -274,6 +291,29 @@ impl ItemNs {
             ItemNs::AuditRetentionDays => "audit_retention_days",
             ItemNs::Services => "services",
             ItemNs::Members => "members",
+        }
+    }
+
+    /// §A1.4/A2 role×type write authorization: may a principal with `role` write
+    /// (or tombstone) this record type? `is_own_agent` applies ONLY to `Agent` —
+    /// it means the signer is the authorized agent's declared owner (self-service).
+    /// The server uses this on the plaintext type as a clean-state write-gate, and
+    /// every reader re-applies it after verifying the record signature (A1.5, the
+    /// trust wall). Fail-CLOSED: retired (`Members`), legacy (`Aux`), and any type
+    /// not enumerated deny (A1.4 "未知 type → 默认拒").
+    pub fn write_allowed(self, role: WriterRole, is_own_agent: bool) -> bool {
+        use ItemNs::*;
+        match self {
+            // Data records: any member principal, incl. the device's automatic writes.
+            Secret | Connection | Connecting => true,
+            // Owner-config singletons: a human OWNER only.
+            Policy | Stores | StoreOrder | AuditRetentionDays | Services => {
+                role == WriterRole::Owner
+            }
+            // Authorized-agents table (§11.1): any owner, or the agent's own member.
+            Agent => role == WriterRole::Owner || (role == WriterRole::Member && is_own_agent),
+            // Retired in-vault membership + legacy aux ns + anything else: fail-closed.
+            Members | Aux => false,
         }
     }
 
@@ -394,6 +434,32 @@ pub fn unseal_item<S: PrimitiveSuite>(
 mod tests {
     use super::*;
     use sudp::primitives::StdPrimitives;
+
+    #[test]
+    fn write_allowed_role_x_type() {
+        use ItemNs::*;
+        use WriterRole::*;
+        // Data records: every writer principal (owner / member / device auto-write).
+        for ns in [Secret, Connection, Connecting] {
+            for role in [Owner, Member, Device] {
+                assert!(ns.write_allowed(role, false), "{ns:?} writable by {role:?}");
+            }
+        }
+        // Owner-config: OWNER only; member + device denied.
+        for ns in [Policy, Stores, StoreOrder, AuditRetentionDays, Services] {
+            assert!(ns.write_allowed(Owner, false), "{ns:?} owner ok");
+            assert!(!ns.write_allowed(Member, false), "{ns:?} member denied");
+            assert!(!ns.write_allowed(Device, false), "{ns:?} device denied");
+        }
+        // Authorized-agents table: any owner; the agent's OWN member; not others.
+        assert!(Agent.write_allowed(Owner, false), "any owner may authorize any agent");
+        assert!(Agent.write_allowed(Member, true), "member authorizes their OWN agent");
+        assert!(!Agent.write_allowed(Member, false), "member cannot authorize someone else's agent");
+        assert!(!Agent.write_allowed(Device, true), "device never authorizes agents");
+        // Retired / legacy / (implicitly) unknown: fail-closed.
+        assert!(!Members.write_allowed(Owner, false), "in-vault membership retired");
+        assert!(!Aux.write_allowed(Owner, false), "legacy aux ns not writable");
+    }
 
     /// THE pinned cross-language parity vector (build contract §1).
     ///

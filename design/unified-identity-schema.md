@@ -199,6 +199,59 @@ silently lost:
    `writerIds` come from the DB, never a us_id the caller couldn't bind. (Found in self-review.)
 
 --------------------------------------------------------------------------------
+## 8c. Invite/join flow + seat semantics (2026-08-06, user-approved; RESOLVED)
+
+Two 2026-08-06 records disagreed (this SSOT draft vs a forwarded decision summary). The
+user resolved in favor of the hybrid below (2026-08-06). Superseded alternatives are kept
+inline and marked ⛔ so the trail can't be re-litigated.
+
+1. **Invite to a REGISTERED account = membership born at invite time.** The owner's
+   client looks up the invitee's UIK `enc_pub` (email→UIK directory, §1.3) and seals K
+   into `members` in the SAME `PUT /membership` as the invite op (§5: seal is
+   public-key-only — no invitee action needed). "Accept" is roster/UX acknowledgment
+   ONLY — no crypto, no owner re-confirm. The two-step "invite → approve" ceremony
+   collapses to one step. **The current deposit+approve code (/join deposit → owner
+   approve) is REPLACED by this on the registered path.**
+2. **Invite to an UNREGISTERED email = REJECTED with an actionable error** + an optional
+   "send a signup link" action (that link is NOT an invite). They register — registration
+   MUST mint UIK + first credential (**credential-at-birth invariant**: no account with a
+   UIK but zero credentials) — then the owner invites them normally (now registered →
+   path 1). ⛔ SUPERSEDED: the earlier "unregistered = applicant + an owner device
+   auto-completes the seal on next unlock" — dropped as unnecessary machinery (no
+   applicant state, no auto-seal queue).
+3. **`members` ⟺ K-holders ⟺ billable seats — ONE roster.** An entry in `members` means
+   the person holds K, counts as a seat **from the invite moment**, and shrinking =
+   offboard (+ re-key). Withdrawing an invited member = offboard + re-key (they already
+   hold K). Credentials never affect seats (add-passkey/device is self-service). ⛔
+   SUPERSEDED: "seat counts only after accept; withdraw needs no re-key" — it split the
+   roster into K-holders ⊋ seats and left a K-retention gap (a sealed-but-withdrawn
+   invitee keeps K without a re-key).
+4. **First-touch directory trust** (email→UIK lookup served by the backend) stays the
+   accepted §1.3 boundary; no extra flow in v1.
+5. **Trial billing = Creem-native (card at first invite), NOT app-managed** (2026-08-06):
+   the first invite opens a Creem checkout (card + 30-day trial, `units = seats`); Creem
+   owns trial → auto-charge → dunning. We build only the freeze GATE that reads Creem's
+   status. ⛔ SUPERSEDED: the app-managed "no card until trial end" trial — dropped (it
+   duplicated Creem's lifecycle for a solo dev to maintain, and card-on-file converts far
+   better; the only friction is the owner entering a card once at first invite).
+6. **Billing account = an EXPLICIT, first-class record, DECOUPLED from ownership**
+   (2026-08-06). Store `vaults.billing_account_id` (its OWN column — NOT derived from
+   `vaults.user_id` or owner status); initially = creator. Because a creator can be
+   offboarded (Option B), billing is decoupled by design: a removed creator STOPS being a
+   member/seat but REMAINS the billing account — a pay-only account (sees billing / seats /
+   card, never vault plaintext) until an explicit transfer. `subscriptions.account_id` =
+   the billing account (one Creem customer per). **Seat formula follows precisely:
+   billable = members EXCLUDING the billing account.** Billing account is in `members` ⇒
+   their own seat is free (`members − 1`); billing account not in `members` (removed
+   creator) ⇒ no free seat, all `members` billable — numerically identical to
+   "(members − 1) × $18" in the normal case, just exact at the edge. **Display:** every
+   owner sees who the billing account is + seat count + next charge; only the billing
+   account sees/manages the card. **v1: no transfer** (the field is set at team start and
+   stays); **v2: transfer = update `billing_account_id` + move seats to the new account's
+   sub** — a seamless additive upgrade. If the billing account stops paying and won't
+   transfer, the team freezes (v1 limitation; v2 transfer resolves it).
+
+--------------------------------------------------------------------------------
 ## 9. STATUS — implementation (ET1-ET4 DONE + verified; 2026-08-06)
 
 - **ET1 dev reconcile** ✓ — `cur→members`, `credentials.uik_wrapped→wrapped_uik`, dead
