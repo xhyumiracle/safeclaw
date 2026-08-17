@@ -98,6 +98,7 @@ pub enum Command {
     /// running daemon), the exact shape `GET /registry` serves. `--json` for CI.
     Registry(RegistryArgs),
     /// Alias for `sc secret ls`.
+    #[command(alias = "list")]
     Ls(CommonArgs),
     /// Alias for `sc secret get`.
     Get(GetArgs),
@@ -279,6 +280,7 @@ pub enum ConnectionSubcommand {
     Add(ConnectArgs),
     /// List the connections the agent can use (id, hosts, phantoms). Requires an
     /// unlocked vault. `--json` for scripts.
+    #[command(alias = "list")]
     Ls(ConnectionLsArgs),
     /// Remove a connection and its secret(s) from the vault (two passkey
     /// gestures: unlock + write). Mirrors the console's "Disconnect".
@@ -375,6 +377,7 @@ pub enum SecretSubcommand {
     /// Delete a native secret. Two passkey gestures.
     Rm(RmArgs),
     /// List secret names this vault can resolve.
+    #[command(alias = "list")]
     Ls(CommonArgs),
 }
 
@@ -400,6 +403,7 @@ pub enum ServiceSubcommand {
     /// the daemon (its connections stay stuck), and the console only surfaces
     /// definitions that have a connection, so this is where orphaned or broken
     /// defs become visible. One passkey gesture (unlock, read-only).
+    #[command(alias = "list")]
     Ls(ServiceLsArgs),
     /// Delete a custom service definition from the vault (`aux.services`).
     /// Warns when connections still reference it (they keep working off stored
@@ -478,6 +482,7 @@ pub enum AgentSubcommand {
     /// paired devices.
     Add(AgentAddArgs),
     /// List this account's agents (name, key prefix, last-used).
+    #[command(alias = "list")]
     Ls,
     /// Revoke an agent by name (or key prefix / id). Propagates to every
     /// device in under a second over the sync stream (one poll cycle when a
@@ -519,6 +524,7 @@ pub enum PasskeySubcommand {
     /// List passkeys enrolled on the active vault (public metadata only:
     /// credential id, device name, transports, timestamps). No vault
     /// unlock or passkey gesture required.
+    #[command(alias = "list")]
     Ls(CommonArgs),
     /// Add a new passkey (cross-device or same-device). NOT YET
     /// IMPLEMENTED — needs the daemon-side `/cli/auth?op=enroll-passkey`
@@ -558,6 +564,7 @@ pub enum VaultSubcommand {
     Status(StatusArgs),
     /// List vaults this CLI has used (from local config) + mark the
     /// device default with `*`. `--json` for scripts/agents.
+    #[command(alias = "list")]
     Ls(VaultLsArgs),
     /// Switch the active vault. Pass a vault URL (`<daemon>/v/<vault_id>`),
     /// an index from `sc vault ls`, --local for the localhost default vault,
@@ -654,6 +661,7 @@ pub struct StoreArgs {
 pub enum StoreSubcommand {
     /// List external stores connected to the active vault. Needs the
     /// vault unlocked (we read from daemon's cache snapshot).
+    #[command(alias = "list")]
     Ls(CommonArgs),
 }
 
