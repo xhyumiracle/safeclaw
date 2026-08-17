@@ -32,15 +32,13 @@ and decline needs a re-key).
 {
   us_id:        <invitee UIK id, from /directory at invite>,
   role:         'member' | 'owner',
-  enc_pub:      <invitee UIK enc_pub>,        // carried so re-key can re-seal K' without a lookup
   member_entry: { role, k_encapped, k_ct },   // exactly the triple's members[us_id]
   delegation_log: [ <owner-signed `set` event granting role to us_id> ],
   generation:   <K generation the member_entry was sealed at>  // staleness check
 }
 ```
-The fold loads the invitee's `sig_pub` from `identities` (registered path); only
-the public `enc_pub` is carried, purely so the re-key refresh can re-seal K'
-without a per-invite identity lookup.
+The fold loads the invitee's `sig_pub` from `identities` (registered path), so
+the grant carries no pubkeys.
 
 ### Grant properties (all enforced)
 - **Expires**: rides `invitations.expires_at` (7d). `getInvitationByToken` flips
@@ -69,27 +67,29 @@ without a per-invite identity lookup.
 3. **Decline / revoke / expire**: DELETE/mark the invitation. The grant dies with
    it. No re-key (never in the live roster). Billing reconcile (seat released).
 
-## Staleness = the one real edge, handled (no workaround)
+## Staleness = clear pending on re-key (simple, no refresh)
 
-Two owner ceremonies can invalidate a parked grant between invite and accept:
+A re-key rotates K→K', so every parked `member_entry` now seals the OLD key.
+Rather than refresh the parked grants, we CLEAR them (2026-08-17 decision — the
+user rejected the re-seal/re-sign refresh as over-built):
 
-- **Re-key (K rotation, on offboard)** rotates K→K'. `member_entry` seals the OLD
-  K. `generation` no longer matches. **Handled proactively**: the re-key ceremony,
-  right after it re-seals K' to the kept members, ALSO re-seals K' to every pending
-  invitee's `enc_pub` and PUTs the refreshed `member_entry` + `generation` back onto
-  each pending invitation (`PUT /v/{vid}/invitations/{id}/grant`, owner-only). The
-  delegation event is UNCHANGED (role grants bind `role_epoch`, not `generation` —
-  a K-rotation never touches them).
-- **Root succession (owner-key rotation)** advances `role_epoch`, so the parked
-  delegation event's epoch goes stale. This is far rarer than re-key. Accept
-  re-folds and, if the event no longer seats under the current root, returns
-  `grant_stale` and the owner re-invites. (Same `refreshPendingGrant` primitive can
-  re-sign on succession later if churn ever warrants; not wired in v1 because
-  succession is a manual, exceptional event.)
+- **Invariant (load-bearing, server-side):** `handleMembershipPut` clears ALL
+  pending invitations for the vault whenever the triple's `proof.generation`
+  bumps (= a re-key). This holds no matter which path drove the re-key, so no
+  stale grant ever survives to be accepted on a rotated key. The freed pending
+  seats are reconciled.
+- **UI confirm:** the only console op that re-keys is offboarding a member
+  (`changeMemberRole` is a pure delegation-log append — no K rotation, so it does
+  NOT touch pending grants). The offboard confirm warns "N pending invites will be
+  cancelled; you'll need to re-invite" before proceeding.
+- **Belt (accept):** accept still checks `grant.generation === current` and
+  re-folds the merged triple, so even if a grant somehow outlived a re-key it
+  fails closed with `grant_stale` rather than seating a member on a rotated key.
+  (In practice the invariant already flipped it to `revoked`, so accept returns
+  `invitation_revoked`.)
 
-Accept ALWAYS re-folds the merged triple, so a stale grant that slipped through
-(e.g. a refresh that lost its own CAS) fails closed with `grant_stale`, never
-admits a member on a stale key.
+Result: after any re-key the invitee simply gets re-invited. No re-seal, no
+re-sign, no `role_epoch`/succession special-casing.
 
 ## Billing (Q2: bill at invite)
 
@@ -104,8 +104,9 @@ INVITE, not accept:
 
 ## Surfaces
 
-- Owner Members tab: pending invitations already listed (`handleInvitationList`);
-  add a copyable invite link. Re-key transparently refreshes their grants.
+- Owner Members tab: pending invitations already listed (`handleInvitationList`).
+  Offboarding warns that pending invites will be cancelled (they're cleared on the
+  re-key) and to re-invite after.
 - Invitee inbox: `GET /api/invitations/mine` lists invitations addressed to the
   logged-in account's email with status=sent; a console card offers Accept / Decline.
 
