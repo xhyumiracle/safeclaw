@@ -318,3 +318,58 @@ inline and marked ⛔ so the trail can't be re-litigated.
 - Anchor-KEY rotation on creator-key compromise (org-recovery; separate).
 - On-chain / SAS public-log root for first-touch (future; the head commitment is ready).
 - Any change to sudp.
+
+--------------------------------------------------------------------------------
+## 11. Identity invariants — UIK/passkey co-birth + the two authority planes (2026-08-18, user-flagged)
+
+### 11.1 A UIK and its first passkey are born together; zero passkeys is unreachable
+- The PRIVATE UIK exists in storage ONLY as `credentials.wrapped_uik` = `Wrap_{W_c}(UIK)`.
+  `identities` holds only the PUBLIC keys (`us_…` / `sig_pub` / `enc_pub`). There is no
+  standalone / un-wrapped UIK anywhere.
+- Mint is client-side, in the SAME gesture as the first passkey: `UikRoot.generate()` makes the
+  UIK and the new passkey's PRF-derived `W_c` wraps it; both commit together (`registerIdentity`
+  + the credential's `wrapped_uik`, `vault-routes.mjs` ~3987). There is no "mint UIK first, then
+  decide whether to enroll a passkey" step.
+- Locked consequences:
+  - Signup mints NOTHING. A just-registered account has no UIK and no passkey; the UIK is
+    minted lazily at the first vault ceremony.
+  - "UIK present but zero passkeys" is NOT a representable state: losing every passkey loses the
+    only wrap of the private UIK, so the UIK itself is gone. This is the first-principles reason
+    the last-passkey delete is hard-blocked (`vault-grant.ts` ~2588, `cannot remove the last
+    passkey`).
+  - Edge: the identity insert and the credential wrap are two non-transactional writes (~3987
+    then ~3989, logged non-fatal). A rare partial failure can leave a bare PUBLIC `identities`
+    row with no wrapping credential, but the account still has that passkey (just not
+    UIK-bearing = the "needs upgrade" state, losslessly re-bindable). It never yields a usable
+    UIK without a passkey.
+
+### 11.2 Two authority planes: owner-gated vault writes vs self-service identity ops
+- **Vault plane (owner-gated):** membership / policy / roster / K rotation. Gated on the
+  crypto-folded owner set because it changes OTHER people's access to shared secrets. This is the
+  console banner's "membership writes are owner-only".
+- **Identity plane (self-service, authority root = UIK possession):** a person managing THEIR OWN
+  credentials and agents: add / upgrade / remove their own passkey, authorize / revoke their own
+  agents. No owner approval, because it only extends access AMONG one person's own principals,
+  all bound to the SAME UIK. This is the banner's "(or your own K re-seal)" carve-out.
+- **Invariant that makes self-service sound:** a person is not a device, but a device's reach is a
+  SUBSET of the person's reach. Adding / upgrading your own device grants it at most your EXISTING
+  membership (the UIK is already the member); it never reaches a vault you are not in, and never
+  grants a NEW person anything. So it needs no owner gate.
+- **Corollary — passkey upgrade is a pure identity-plane op.** Binding the account UIK to a passkey
+  writes one account-level row (`credentials.wrapped_uik`) and thereby unlocks EVERY UIK-member
+  vault at once. It needs no vault SECRET (no K, no content).
+- **Same solution as agent access.** Agent authorization is a UIK-signed grant (authz table,
+  `agent-device-identity-mtls.md`). Passkey add / upgrade / remove share the identical authority
+  root (a fresh UIK-possession PRF gesture) and belong on the same self-service surface
+  (Account -> Passkeys / Account -> Agents), NOT behind any one vault's gate.
+
+### 11.3 GAP (2026-08-18): `upgradePasskey` is vault-coupled; it should be account-level
+- Today `upgradePasskey(rpId, vaultId, cached, target)` sources the UIK by unlocking THIS vault's
+  keyset row (requires the vault unlocked AND UIK-bearing, `vault-grant.ts` ~1980-1994) and rides a
+  vault-addressed membership PUT. That couples an account-level identity op to a specific vault: it
+  lives in the vault's Passkeys tab and is inert while that vault is locked.
+- Target design (per 11.2): source the UIK from ANY unlocked UIK-bearing session (recover-from-self
+  on any already-bearing passkey) and write only the account-level `credentials.wrapped_uik`;
+  primary home = Account -> Passkeys, self-authorized. The in-vault Passkeys tab keeps it as a
+  convenience entry but stops gating on that vault's unlock.
+- Not yet built; captured here so the refactor stays coherent with 11.2.
