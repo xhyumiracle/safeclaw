@@ -363,13 +363,20 @@ inline and marked ⛔ so the trail can't be re-litigated.
   root (a fresh UIK-possession PRF gesture) and belong on the same self-service surface
   (Account -> Passkeys / Account -> Agents), NOT behind any one vault's gate.
 
-### 11.3 GAP (2026-08-18): `upgradePasskey` is vault-coupled; it should be account-level
-- Today `upgradePasskey(rpId, vaultId, cached, target)` sources the UIK by unlocking THIS vault's
-  keyset row (requires the vault unlocked AND UIK-bearing, `vault-grant.ts` ~1980-1994) and rides a
-  vault-addressed membership PUT. That couples an account-level identity op to a specific vault: it
-  lives in the vault's Passkeys tab and is inert while that vault is locked.
-- Target design (per 11.2): source the UIK from ANY unlocked UIK-bearing session (recover-from-self
-  on any already-bearing passkey) and write only the account-level `credentials.wrapped_uik`;
-  primary home = Account -> Passkeys, self-authorized. The in-vault Passkeys tab keeps it as a
-  convenience entry but stops gating on that vault's unlock.
-- Not yet built; captured here so the refactor stays coherent with 11.2.
+### 11.3 Passkey upgrade = account-level credential-wrap write (WRITE side DONE 2026-08-18)
+- **The write is now dedicated + account-level.** `PUT /api/me/credential-wrap` attaches the UIK
+  custody wrap to the caller's OWN credential (`wrapped_uik` + `wrap_salt` + `identity_id` via
+  SET-ONCE `registerIdentity`), gated on ONE server-authoritative fact — the credential's `user_id`
+  is this account. Same declare-intent / ownership model as the item write (`recordWriteGate`), NOT
+  a triple diff. It does NOT touch the membership triple, needs NO owner rights, bumps NO
+  `keyset_seq`. `upgradePasskey` step 4 calls it instead of a members-unchanged membership PUT.
+  (BE a30682b / FE 3d59683.) This is why a plain MEMBER can now upgrade their own passkey.
+  - Bug this closed: the old members-unchanged PUT was authorized either by owner rights or by
+    `isSelfServiceOnlyWrite`'s byte-compare; a member hit "membership writes are owner-only". That
+    compare is now canonical (11d05a7) and stays ONLY for the genuine K re-seal path (which DOES
+    change `members[me].k`).
+- **Remaining GAP (read side): UIK sourcing is still vault-coupled.** `upgradePasskey` still
+  recovers the UIK by unlocking THIS vault's keyset row (`vault-grant.ts` ~1980-1994), so it needs
+  the vault unlocked and UIK-bearing, and lives in the vault's Passkeys tab. Target: source the UIK
+  from ANY unlocked UIK-bearing session (recover-from-self) and move the primary home to
+  Account -> Passkeys. The write endpoint above is already account-level and ready for that.
