@@ -380,3 +380,63 @@ inline and marked ⛔ so the trail can't be re-litigated.
   the vault unlocked and UIK-bearing, and lives in the vault's Passkeys tab. Target: source the UIK
   from ANY unlocked UIK-bearing session (recover-from-self) and move the primary home to
   Account -> Passkeys. The write endpoint above is already account-level and ready for that.
+
+--------------------------------------------------------------------------------
+## 12. Recovery credential — a durable, non-passkey custodian of the UIK (DESIGN SKELETON, 2026-08-18)
+
+Design locked, NOT built. Concretizes the long-planned "account-level master-key backstop"
+(`resolvePersonUik` case ④ comment; vault-delete model's "lose your keys" note).
+
+### 12.1 The problem
+The private UIK exists ONLY as `Wrap_{W_c}(UIK)` on `credentials` (§11.1) — account-level, one
+wrap per passkey, `W_c` derived from that passkey's PRF. So the set of "things that can recover
+the UIK" == the set of the account's passkeys. Lose them ALL and the private UIK is gone forever.
+Today the only mitigation is the hard block on deleting the last passkey (`vault-grant.ts` ~2588):
+a stopgap, not recovery. This also leaves `resolvePersonUik` case ④ ("account HAS a UIK, no
+session can reach it") as a dead end.
+
+### 12.2 The design: recovery == one more wrap of the SAME UIK, under a non-passkey KEK
+A recovery credential is structurally identical to a passkey wrap; only the KEK source differs:
+```
+credentials.wrapped_uik  = Wrap_{ W_c(passkey PRF) }(UIK)        # N of these, exist today
+recovery  wrapped_uik    = Wrap_{ W_recovery(recovery secret) }(UIK)   # 1 new one
+```
+Because it is the SAME multi-custodian-of-one-UIK shape, it composes with everything already
+built (add-device, upgrade, `resolvePersonUik` reuse). Account-level, vault-independent, like the
+passkey wraps. Store it as a row keyed to the account: either a `kind='recovery'` row in
+`credentials` (no cid / no WebAuthn) or a sibling `recovery_credentials` table (OPEN, 12.6).
+
+### 12.3 Recommended secret: a high-entropy RECOVERY CODE (not a master password)
+| | Recovery code (RECOMMENDED) | Master password |
+|---|---|---|
+| Model | 1Password Secret Key / Apple Recovery Key | login-style password |
+| Entropy | high (generated) -> not offline-guessable | low -> `wrapped_uik` leak = offline crack |
+| Phishing / reuse | not phishable, no reuse | phishable, reuse risk |
+| Cost to user | must store one offline string | memorable, always at hand |
+KDF for either: a memory-hard KDF (Argon2id) over the secret + a per-account salt -> `W_recovery`.
+
+### 12.4 Two hard constraints (violate either and it is escrow theater, not E2E)
+1. `W_recovery` is derived CLIENT-SIDE only. The server NEVER sees the recovery secret or the
+   plaintext UIK — it stores only the opaque `Wrap_{W_recovery}(UIK)` ciphertext.
+2. The recovery secret is used ONLY during recovery (re-establishing a passkey after total loss),
+   never held by the everyday daemon/session. This keeps the day-to-day attack surface = the
+   passkeys, and is what makes it "session can't touch it" (not theater).
+
+### 12.5 Flows
+- **Mint (at the first-passkey ceremony, alongside the UIK mint):** generate a recovery code,
+  derive `W_recovery`, store `Wrap_{W_recovery}(UIK)`. Show the code to the user ONCE ("save this
+  offline"), 1P-kit style. (Or offer it as an opt-in step right after onboarding.)
+- **Recover (lost ALL passkeys):** user enters the recovery code -> client derives `W_recovery` ->
+  unwraps UIK -> mints a NEW passkey and wraps the UIK under it (`resolvePersonUik` reuse, sourced
+  from recovery instead of a passkey session). Back in. This is the concrete closer for case ④.
+
+### 12.6 Honest trade-off + open questions
+- No free lunch: this MOVES the single point of failure from "all devices" to "one offline
+  recovery code" (strictly better: offline, user-controlled, device-independent), it does not
+  ERASE it. The only ways to hold no user-durable secret at all: (a) platform passkey SYNC
+  (delegate durability to iCloud / Google Password Manager — synced passkeys already survive
+  single-device loss), (b) social / threshold (Shamir) recovery across guardians (later).
+- OPEN: storage location (credentials `kind` vs sibling table); recovery-code ROTATION +
+  revocation; whether to ALSO allow a master password as a convenience second custodian;
+  multiple recovery credentials; interaction with future account master-key / org recovery.
+- Non-goals here: org/admin-driven recovery, server-side escrow of any UIK-opening key.
