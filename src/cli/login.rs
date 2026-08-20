@@ -108,6 +108,144 @@ struct ExchangeResp {
     console_url: Option<String>,
 }
 
+/// Device Flow (RFC 8628) step 1 response — a short-lived code pair.
+#[derive(Debug, Deserialize)]
+struct AuthorizeResp {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+/// Device Flow poll response. `status` ∈ { pending, denied, approved }; the
+/// credential fields are present only on `approved` (same shape as ExchangeResp).
+#[derive(Debug, Deserialize)]
+struct PollResp {
+    status: String,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    vault_id: Option<String>,
+    #[serde(default)]
+    device_key: Option<String>,
+    #[serde(default)]
+    pro_backend_url: Option<String>,
+    #[serde(default)]
+    console_url: Option<String>,
+}
+
+/// Device Flow (RFC 8628): `sc login` with no `--pair-token`. The daemon asks the
+/// cloud for a short user_code, shows it to the human, and polls until they
+/// approve it in their authenticated browser at `<console>/pair`. Nothing secret
+/// enters the prompt/transcript. Parallel to the token path; both converge on the
+/// same ExchangeResp + persistence tail. design/agent-device-identity-mtls.md §12.
+async fn device_flow_pair(
+    client: &reqwest::Client,
+    custodian: &str,
+    device_name: &str,
+    dev_id: &str,
+    dik_pub: &str,
+    dik: &crate::identity::SigningIdentity,
+) -> Result<ExchangeResp, String> {
+    // 1. authorize (unauthenticated) → device_code + user_code + verify URL.
+    let body = json!({
+        "device_name": device_name,
+        "device_id": dev_id,
+        "device_pubkey": dik_pub,
+    });
+    let resp = client
+        .post(format!("{}/api/pair/authorize", custodian))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| crate::cli::neterr::reach_failed(custodian, &e))?;
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let detail = resp.text().await.unwrap_or_default();
+        // A 404 here usually means the server predates Device Flow OR this `sc`
+        // is talking to it wrong — either way, upgrading is the fix.
+        return Err(format!(
+            "could not start pairing (HTTP {}{}). Your `sc` may be too old for this \
+             server — run `sc upgrade` and try again.",
+            code,
+            if detail.trim().is_empty() { String::new() } else { format!(": {}", detail.trim()) }
+        ));
+    }
+    let auth: AuthorizeResp = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse authorize response: {}", e))?;
+
+    // PoP: sign the (secret) device_code with the DIK private key so the server can
+    // prove — before it mints anything — that we hold the key whose pubkey we
+    // registered at authorize. Deterministic (Ed25519), so compute once. §12.3.
+    let pop = data_encoding::BASE64.encode(&dik.sign(auth.device_code.as_bytes()));
+
+    // 2. Show the human where to approve. Prefer the pre-filled URL if present.
+    let open_uri = auth
+        .verification_uri_complete
+        .as_deref()
+        .unwrap_or(&auth.verification_uri);
+    eprintln!();
+    eprintln!("To connect this machine, open this URL in your browser and approve it:");
+    eprintln!("  {}", open_uri);
+    eprintln!("Verification code: {}", auth.user_code);
+    eprintln!();
+    eprintln!("Waiting for you to approve in the browser…");
+
+    // 3. Poll until approved / denied / expired. Each poll is a single fast
+    //    round-trip; the wait between them is the human's approval time.
+    let interval = auth.interval.unwrap_or(5).clamp(1, 30);
+    loop {
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+        let presp = client
+            .post(format!("{}/api/pair/poll", custodian))
+            .json(&json!({ "device_code": auth.device_code, "pop": pop }))
+            .send()
+            .await
+            .map_err(|e| crate::cli::neterr::reach_failed(custodian, &e))?;
+        let status = presp.status();
+        if status.as_u16() == 410 {
+            return Err("pairing code expired before you approved it; run `sc login` again.".to_string());
+        }
+        if !status.is_success() {
+            let detail = presp.text().await.unwrap_or_default();
+            return Err(format!(
+                "pairing failed (HTTP {}{})",
+                status.as_u16(),
+                if detail.trim().is_empty() { String::new() } else { format!(": {}", detail.trim()) }
+            ));
+        }
+        let poll: PollResp = presp
+            .json()
+            .await
+            .map_err(|e| format!("parse poll response: {}", e))?;
+        match poll.status.as_str() {
+            "pending" => continue,
+            "denied" => return Err("pairing was declined in the browser.".to_string()),
+            "approved" => {
+                return Ok(ExchangeResp {
+                    account_id: poll.account_id.unwrap_or_default(),
+                    vault_id: poll
+                        .vault_id
+                        .ok_or_else(|| "approved but the server returned no vault_id".to_string())?,
+                    device_key: poll
+                        .device_key
+                        .ok_or_else(|| "approved but the server returned no device_key".to_string())?,
+                    pro_backend_url: poll
+                        .pro_backend_url
+                        .unwrap_or_else(|| custodian.to_string()),
+                    console_url: poll.console_url,
+                });
+            }
+            other => return Err(format!("unexpected pairing status '{}'", other)),
+        }
+    }
+}
+
 pub async fn run(args: LoginArgs) -> Result<(), String> {
     // ── Resolve cloud endpoint: env override > --env selector > baked ─────
     let custodian = resolve_custodian(args.env.as_deref())?;
@@ -167,64 +305,70 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     let (dik, _) = crate::identity_file::resolve(crate::identity::IdKind::Device, &dik_seed);
     let dik_pub = data_encoding::BASE64.encode(&dik.public_bytes());
 
-    let body = json!({
-        "pair_token": args.pair_token,
-        "device_name": device_name,
-        // Additive: an older custodian ignores these; a current one records the
-        // pubkey for the authorized-devices set.
-        "device_id": dev_id,
-        "device_pubkey": dik_pub,
-    });
-
-    let url = format!("{}/api/pair-token/exchange", custodian);
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| crate::cli::neterr::reach_failed(&custodian, &e))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let detail = resp.text().await.unwrap_or_default();
-        let detail_trimmed = detail.trim();
-        return Err(match status.as_u16() {
-            401 => format!(
-                "pair-token invalid or unknown. Generate a new one at {}/dashboard (\"Connect a new agent\").",
-                custodian
-            ),
-            // 409 = `no_vault`: the vault this token was pinned to is gone
-            // (deleted between mint and exchange), or the account has nothing
-            // sealed. The server message says which — surface it verbatim.
-            // (Historically 409 meant "already used"; that's 401 now.)
-            409 => {
-                let msg = serde_json::from_str::<serde_json::Value>(detail_trimmed)
-                    .ok()
-                    .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
-                    .unwrap_or_else(|| "no vault to connect".to_string());
-                format!(
-                    "{}. Generate a new install token at {}/dashboard (\"Connect a new agent\").",
-                    msg, custodian
-                )
-            }
-            410 => format!(
-                "pair-token expired. Generate a new one at {}/dashboard (\"Connect a new agent\").",
-                custodian
-            ),
-            other => {
-                if detail_trimmed.is_empty() {
-                    format!("custodian returned HTTP {}", other)
-                } else {
-                    format!("custodian returned HTTP {}: {}", other, detail_trimmed)
-                }
-            }
+    let parsed: ExchangeResp = if let Some(pair_token) = args.pair_token.clone().filter(|t| !t.is_empty()) {
+        // ── Token exchange: the console "Connect a new agent" paste flow ─────
+        let body = json!({
+            "pair_token": pair_token,
+            "device_name": device_name,
+            // Additive: an older custodian ignores these; a current one records
+            // the pubkey for the authorized-devices set.
+            "device_id": dev_id,
+            "device_pubkey": dik_pub,
         });
-    }
 
-    let parsed: ExchangeResp = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse exchange response: {}", e))?;
+        let url = format!("{}/api/pair-token/exchange", custodian);
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| crate::cli::neterr::reach_failed(&custodian, &e))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            let detail_trimmed = detail.trim();
+            return Err(match status.as_u16() {
+                401 => format!(
+                    "pair-token invalid or unknown. Generate a new one at {}/dashboard (\"Connect a new agent\").",
+                    custodian
+                ),
+                // 409 = `no_vault`: the vault this token was pinned to is gone
+                // (deleted between mint and exchange), or the account has nothing
+                // sealed. The server message says which — surface it verbatim.
+                // (Historically 409 meant "already used"; that's 401 now.)
+                409 => {
+                    let msg = serde_json::from_str::<serde_json::Value>(detail_trimmed)
+                        .ok()
+                        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+                        .unwrap_or_else(|| "no vault to connect".to_string());
+                    format!(
+                        "{}. Generate a new install token at {}/dashboard (\"Connect a new agent\").",
+                        msg, custodian
+                    )
+                }
+                410 => format!(
+                    "pair-token expired. Generate a new one at {}/dashboard (\"Connect a new agent\").",
+                    custodian
+                ),
+                other => {
+                    if detail_trimmed.is_empty() {
+                        format!("custodian returned HTTP {}", other)
+                    } else {
+                        format!("custodian returned HTTP {}: {}", other, detail_trimmed)
+                    }
+                }
+            });
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| format!("parse exchange response: {}", e))?
+    } else {
+        // ── Device Flow (RFC 8628): no token pasted — the daemon initiates and
+        //    the user approves in their browser. Nothing secret in the prompt.
+        device_flow_pair(&client, &custodian, &device_name, &dev_id, &dik_pub, &dik).await?
+    };
 
     // ── Persist the device-key to ~/.safeclaw/device-key (0600) ──────────
     let key_path = device_key_path()?;

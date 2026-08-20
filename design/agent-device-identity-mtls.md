@@ -32,6 +32,10 @@ still hold for mTLS / multi-agent / naming / migration / threat model; **§2/§3
 SUPERSEDED by §11.** Diagram: `design/identity-protocol.svg`. Post-compact execution plan: §11.6 +
 §9.
 
+**Status update 2026-08-20:** bootstrap/pairing — how AIK/DIK first get certified (§9.1's open
+item) — is now **§12 (LOCKED, Device Flow / RFC 8628)**. It supersedes §11.3-pt1's "default all"
+and §11.4's auto-authorize-on-poll. Vault-in-bootstrap defers to `design/vault-addressing.md`.
+
 ### Decision log (what · why · why-not · reversals — one line each)
 - **AIK/DIK/UIK = Ed25519 keypairs, id = fold(pubkey)** · self-certifying, server can't swap a key behind an id · not bearers (injectable/replayable).
 - **Auth = mutual mTLS both hops** (AIK client cert to daemon; DIK to cloud) · a big-co reviewer named requestor-identity-check = mTLS · not a bearer, not per-op signing.
@@ -309,6 +313,9 @@ hop-B: daemon presents DIK; cloud verifies `dev_` ∈ authorized-devices (throug
 host, realized as a DIK-signed request — the app-layer equivalent).
 
 ### 11.3 The authz primitive surfaces at 4 natural moments (all write the same UIK-signed items)
+> ⛔ **pt1's "default all" SUPERSEDED by §12.4** — default = the single vault in context; "all my
+> vaults" is an explicit opt-in (a broad default also manufactures multi-vault ambiguity, §12.6).
+> The 4 moments + multi-select otherwise stand.
 1. **Connect a new agent** (account · `/access`): intent = an agent for my account → default
    authorize on **all my vaults** (multi = my vaults, default all). One passkey.
 2. **Install an agent on a vault** (a vault surface): intent = an agent here → authorize **this
@@ -318,6 +325,10 @@ host, realized as a DIK-signed request — the app-layer equivalent).
 4. **Agents tab**: the ongoing management grid (per-agent × per-vault; revoke / mask).
 
 ### 11.4 Connect/install prompt + modal (build on the existing polished prompt)
+> ⛔ **SUPERSEDED by §12** (Device Flow): the "Console auto-authorizes when it detects the new
+> agent in the roster (poll)" + "modal keep-open, authorizes automatically" model is replaced by an
+> explicit `/pair` ceremony with `user_code` binding. Kept truth: authorization is Console-side,
+> never in the prompt.
 - The agent-run prompt is ~unchanged (pair device [skip if paired] · `sc agent add` mints the
   identity env · persist skill + instructions · don't test). Only wording tweak: "three
   SAFECLAW_* dotenv lines" → "your complete SafeClaw env" (now includes the identity-file path).
@@ -344,3 +355,103 @@ idempotently ("skip if paired").
 - Daemon authz consult reads ONLY the in-vault table (remove the derived/admission-mode logic).
 - Console: the authz primitive component (multi-select) at the 4 moments; modal keep-open hint;
   vault-create/join multi-select "allow my agents (default all)."
+
+--------------------------------------------------------------------------------
+## 12. Bootstrap / pairing — Device Flow (LOCKED 2026-08-20, user-approved)
+
+How AIK/DIK first get **certified** — the enrollment channel §9.1 left open. Shape = **OAuth 2.0
+Device Authorization Grant (RFC 8628)**. Additive + dual-auth (§7): the `pair_token` path and the
+vid-in-proxy face keep running through the window; retire on the same gate as the bearers —
+**nothing currently running breaks.** Design mock: `safeclaw-market/designs/device-flow-pairing.html`.
+
+### 12.1 Reversed direction, one primitive
+- Today a human mints a `pair_token` and pastes it into the agent prompt (secret → context → transcript).
+- Device Flow: the **agent/daemon initiates**, gets a `device_code` (kept — the secret poll handle)
+  + a short **`user_code`** (the only thing shown) + a verification URI. The agent **emits** the
+  `user_code`; admission arrives on the back-channel poll. `user_code` is low-entropy, short-TTL,
+  useless without an authenticated browser session — a transcript leak is near-harmless.
+- **One primitive:** a single authorization request certifies a **list of principals**, each with a
+  declared scope. The list = whichever pubkeys aren't yet in the authorized set. First pairing =
+  `{device, agent}` (one ceremony, no double burden); a new agent on a trusted device = `{agent}`.
+  "Already trusted" is not a mode — the device pubkey is simply already registered, so it's absent
+  from the list. **No `if-first-else`.**
+
+### 12.2 Approval = admission, not a cert (§0 unchanged)
+Approval mints **no cert / bearer**. It **admits the pubkey into the authorized set** (ssh
+`authorized_keys` style):
+- **DIK** → account authorized-devices = an `api_keys` row (`sig_pub`/`identity_id`).
+- **AIK** → the E2E **UIK-signed `aux:agent/<ag_id>` item** (§11.1), written via the existing
+  generic route `PUT /v/{vid}/items/{item_id}` in the ceremony's passkey session (one passkey →
+  UIK → every selected vault's K, one gesture). **No new authz route.**
+Runtime auth is untouched (hop-A AIK PoP, hop-B DIK-signed request; §1/§11.2). Device Flow is the
+**enrollment channel only** — pubkeys up, admission down, privates never leave the machine.
+
+### 12.3 Registration is possession-proven, not TOFU
+Today the exchange/create handlers store any pubkey the caller sends with **no PoP** (the DIK
+verifier exists but is audit-only). Under Device Flow the **poll carries a PoP** over the
+`device_code` (signed by the private key being registered): the server admits a pubkey only when
+possession is proven **and** the human approved. Closes the TOFU hole.
+
+### 12.4 Every agent explicitly confirmed; least-privilege at the grant
+No local silent mint — each new agent is browser-confirmed (the human sees `ag_id`, path, scope).
+**Hard boundary = the authorized-set** (`ag ∈ authorized(vid)`, daemon-enforced): reach is set at
+authorization, not runtime. **Default selection = the single vault in context, NOT all** ("all my
+vaults" is an explicit opt-in) — least-privilege, and a narrow grant also avoids manufacturing the
+multi-vault ambiguity of §12.6. (Supersedes §11.3-pt1.)
+
+### 12.5 Routes + ceremony — reshape `pair-token` in place
+One `/api/pair/*` family (reuse the `pair_tokens` table + poll skeleton; do **not** fork a parallel
+`/api/device/*` — "device" collides with DIK):
+
+| now | becomes | role |
+|---|---|---|
+| `POST /api/pair-token/mint` | `POST /api/pair/authorize` | issue `device_code` + `user_code` + verify-URI; body = principal list + proposed scope |
+| `POST /api/pair-token/exchange` (AUTH=NONE, TOFU) | `POST /api/pair/poll` | daemon polls with `device_code`; `authorization_pending` until approved; then admit (PoP-gated) |
+| `POST /api/pair-token/status` | folded into the ceremony's own state | — |
+| — | `GET /pair` (console) | the ceremony |
+
+**`/pair`** models on `/grant/[id]` (standalone minimal-header, passkey gesture): passkey proves
+the human → renders the **principal list** (device/agent rows + scope) + a **`user_code` confirm
+box** (binds "the CLI session that initiated" to "the human approving" — the sole reason `user_code`
+exists, and why we keep a code over click-only) → approve/reject → the two admissions of §12.2 in
+one passkey session.
+
+### 12.6 Prompt stays fully static; vault ≠ prompt data
+- **Setup prompt** = skill + `sc login` / `sc agent add`. **No vault id, no key, no account id —
+  zero per-install customization** (HF-parity). The `user_code` is printed **by the CLI** (output),
+  never pasted in.
+- **Which vault an agent lands on** = the human's ceremony selection (an authorization property of
+  the AIK), resolved daemon-side — never carried by the agent. (Task-prompt text naming a vault is
+  the human's data, not setup.)
+- **Ambient vault** = single source `SAFECLAW_VAULT_ID` (set by `sc run`; resolve or `--vault`;
+  **fail-closed** on multi-with-no-default). Both faces read it: `sc` directly; the transparent face
+  via the **AIK shim injecting the vid** → `HTTPS_PROXY` is a **bare loopback** (no vid, no key; key
+  = AIK PoP). Per-op switch = `--vault` (stateless, still `ag ∈ authorized`); whole-ambient switch =
+  relaunch; **no state file**. Addressing SSOT = `design/vault-addressing.md` (see its 2026-08-20
+  note). Verified 2026-08-20: the explicit broker face already runs bare
+  (`SAFECLAW_BROKER_URL = http://127.0.0.1:<port>`, vid only in `SAFECLAW_VAULT_ID`).
+
+### 12.7 Retire (after the dual-auth window)
+- `install_prompt` carrying a `pair_token` → the prompt carries only the commands; the code comes
+  **from** the CLI.
+- `pair-token/exchange`'s AUTH=NONE TOFU path → approval-then-admit + registration PoP (§12.3).
+- `connect-agent-modal.tsx onAuthorizeAgent` auto-write + §11.4 "modal keep-open, auto-authorizes on
+  poll" → the explicit `/pair` ceremony.
+- Legacy vid-in-`HTTPS_PROXY` → drop when the shim is the sole transport (same gate as retiring
+  bearers, §7).
+
+### 12.8 Install prompt → static one-liner + onboarding doc (two-phase) [MARK: Phase 1 buildable now]
+HF-style split. **Skill** (`safeclaw-skill.md`) stays generic ("how to use", ongoing) — untouched.
+An **onboarding doc** (public `/docs`, fold into the existing agent guide — do NOT fork) becomes the
+home for the current `install_prompt`'s **non-skill, must-keep content**: the step sequence **and the
+tuned framing that keeps a security-minded agent from refusing**. Relocate that wording **verbatim**
+— it is load-bearing (drop-test it does NOT pass). The **prompt** collapses to one benign line that
+points at the doc; a one-line pointer + the official-domain doc URL together carry the "this is safe"
+frame (HF's exact pattern).
+- **Phase 1 (ship now · non-breaking · console-stack only · no core/protocol):** write/extend the
+  onboarding doc; shrink `install_prompt` (`safeclaw-pro-backend/src/vault-routes.mjs`) to
+  "read <doc> + `sc login --pair-token <TOKEN>`". The token still flows → pairing is unchanged.
+  Result ≈ one line + one token command.
+- **Phase 2 (rides §12 Device Flow):** the token leaves the prompt → a **pure static one-liner**.
+- **Validation:** "agent still onboards without balking" is a live onboarding e2e (with the user),
+  NOT statically testable here.

@@ -83,3 +83,14 @@ Unchanged in shape; what changes is the *sources* of each level:
   (wrong secrets, wrong approvers, wrong audit trail).
 - **No precedence flip.** Config beating env would yank vaults out from
   under running sessions on every `vault use`.
+
+## Identity-wave evolution (2026-08-20 — see `agent-device-identity-mtls.md` §12)
+
+Decision #4's "`sc run` embeds the vid in the child's proxy URL" evolves under the identity
+wave: the **AIK shim** injects the vid from `$SAFECLAW_VAULT_ID` per CONNECT, so `HTTPS_PROXY`
+becomes a **bare loopback** (no vid, no key — key = AIK PoP). `$SAFECLAW_VAULT_ID` stays the single
+ambient source (both faces read it). The resolution chain, per-op `--vault`, the no-cross-vault
+non-goal, and "switch transparent face = relaunch" are all unchanged. End-state, gated on the shim
+being the sole transport (same gate as retiring bearers). Verified 2026-08-20: the explicit broker
+face already runs bare (`SAFECLAW_BROKER_URL = http://127.0.0.1:<port>`, vid only in
+`$SAFECLAW_VAULT_ID`).

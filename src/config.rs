@@ -843,10 +843,12 @@ pub struct UpgradeArgs {
 /// Args for `sc login`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// One-shot pair-token from safeclaw.pro → Connect-a-new-agent modal.
-    /// 10-min TTL; single-use; format `spt_...`.
+    /// One-shot pair-token from safeclaw.pro → Connect-a-new-agent modal
+    /// (single-use, format `spt_...`). OMIT it to use Device Flow instead:
+    /// `sc login` with no token asks the cloud for a short code you approve in
+    /// your browser — nothing secret touches the prompt (design §12).
     #[arg(long)]
-    pub pair_token: String,
+    pub pair_token: Option<String>,
     /// Friendly label shown for this host in the dashboard's device list.
     /// Defaults to the machine's hostname, else `agent-device`.
     #[arg(long)]
