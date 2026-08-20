@@ -74,7 +74,7 @@ pub async fn run_add(args: ServiceAddArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "service-add" }, "target": "", "scope": { "toml": toml_str } },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,
@@ -104,7 +104,7 @@ pub async fn run_ls(args: ServiceLsArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "service-ls" }, "target": "", "scope": null },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,
@@ -172,7 +172,7 @@ pub async fn run_rm(args: ServiceRmArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "service-rm" }, "target": args.id, "scope": null },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,

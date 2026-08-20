@@ -187,7 +187,7 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "connection-rm" }, "target": id, "scope": { "keep_secrets": args.keep_secrets } },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,
@@ -303,7 +303,7 @@ async fn run_raw(
     let op = json!({
         "act": { "type": { "custom": "connection-add" }, "target": name, "scope": scope },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,
@@ -436,7 +436,7 @@ async fn run_service_backed(
     let op = json!({
         "act": { "type": { "custom": "connection-add" }, "target": name, "scope": scope },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,

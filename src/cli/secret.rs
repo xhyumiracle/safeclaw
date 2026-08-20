@@ -81,7 +81,7 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "secret-set" }, "target": key, "scope": scope },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,
@@ -216,7 +216,7 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "secret-rm" }, "target": key, "scope": null },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,
@@ -269,7 +269,7 @@ pub async fn run_get(args: GetArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": "export", "target": key, "scope": null },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,

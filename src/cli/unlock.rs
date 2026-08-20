@@ -23,7 +23,7 @@ async fn drive(custom_op: &str, label: &str, args: UnlockArgs) -> Result<(), Str
     let op = json!({
         "act": { "type": { "custom": custom_op }, "target": "", "scope": null },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
 
     let opts = ApproveOpts {

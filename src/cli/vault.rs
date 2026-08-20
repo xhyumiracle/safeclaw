@@ -410,7 +410,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
             }
         },
         "bind": { "redeemer": vault_id },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let (op_id, r) = create_op(&custodian, &vault_id, &enroll_op).await?;
     let r_bytes = STANDARD
@@ -504,7 +504,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "vault-delete" }, "target": "", "scope": null },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = crate::cli::approve::ApproveOpts {
         no_browser: args.no_browser,
