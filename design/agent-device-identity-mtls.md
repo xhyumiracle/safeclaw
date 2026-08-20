@@ -448,10 +448,60 @@ tuned framing that keeps a security-minded agent from refusing**. Relocate that 
 — it is load-bearing (drop-test it does NOT pass). The **prompt** collapses to one benign line that
 points at the doc; a one-line pointer + the official-domain doc URL together carry the "this is safe"
 frame (HF's exact pattern).
-- **Phase 1 (ship now · non-breaking · console-stack only · no core/protocol):** write/extend the
-  onboarding doc; shrink `install_prompt` (`safeclaw-pro-backend/src/vault-routes.mjs`) to
-  "read <doc> + `sc login --pair-token <TOKEN>`". The token still flows → pairing is unchanged.
-  Result ≈ one line + one token command.
+- **Phase 1 (doc-split) — ⛔ ROLLED BACK 2026-08-20 (user):** "prompt 不多,单独开一个 doc 似乎没
+  必要." The `install_prompt` stays **self-contained** (its tuned, refusal-proof framing lives in the
+  prompt, not a doc). No doc-pointer shrink. Phase 2 (token-drop) still stands — it just collapses the
+  *self-contained* prompt to a token-less one once §12 Device Flow is e2e-verified, and is where the
+  "sc too old → run `sc upgrade`" note lands (needs sc >= a device-flow-capable version).
 - **Phase 2 (rides §12 Device Flow):** the token leaves the prompt → a **pure static one-liner**.
 - **Validation:** "agent still onboards without balking" is a live onboarding e2e (with the user),
   NOT statically testable here.
+
+### 12.9 Unified force-upgrade floor (LOCKED 2026-08-20, user-approved) [BUILT dev]
+The premise the user set: with many breaking changes since 0.9.x, do NOT try to make every old daemon
+keep half-working. Be blunt — **old versions are no longer supported; run `sc upgrade`; after upgrade
+you are guaranteed to be running the new binary.** Two mechanisms, plus one honest ceiling.
+
+**(1) Global version floor at ONE dispatch chokepoint (backend).** `daemonUpgradeGate(req,res)` in
+`vault-routes.mjs`, called once at the top of `tryHandleVaultRoute` for the whole daemon data-plane
+(`inAgentNew` = blob/items/keys/membership/audit + `inOpRelay` + the SSE stream). Refuses any
+**device-tier** api-key below `team.MIN_DAEMON_VERSION` (`team.mjs`, currently `0.10.0`) with the
+stable `403 {code:'SC_UPGRADE_REQUIRED', min_version, upgrade:'sc upgrade', message}`. Keys on the
+device tier, so browser sessions (no `sc_` key) and agent-tier keys pass through untouched;
+`verifyApiKey` is prefix-cached so the resolve is near-free even though the handler re-resolves.
+**Absent `x-safeclaw-version` counts as old** (`versionLt(undefined,…)=true`), which catches
+pre-header 0.9.x daemons. This is a SUPERSET of the old fmt2-only `teamSyncGate` (kept only as the
+hook for a format that needs an EVEN HIGHER floor than the global one; today equal ⇒ no-op).
+  - **Why one chokepoint, not per-handler:** every daemon→cloud call funnels through
+    `tryHandleVaultRoute` (relay.mjs forwards here), so one gate covers all daemon routes and any
+    future one for free — "unified pipeline, not a patch."
+  - **Coverage verified (core):** every current daemon→cloud request on a gated route carries
+    `x-safeclaw-version` (all sync/op-relay/audit via `egress_proxy::client`, SSE via
+    `client_streaming`; CLI + loopback calls hit the LOCAL daemon, not the cloud gate). ⇒ no
+    false-positive on a current daemon. Header value = `CARGO_PKG_VERSION` (bare), correct for the
+    floor since `versionLt` ignores the `-rc` suffix (an rc of 0.10 is allowed).
+  - **Old daemon reaction is safe:** it maps 401/403 → park-on-local-cache (no data loss), and (0.10+)
+    surfaces `SC_UPGRADE_REQUIRED` to the agent as HTTP 426 (`proxy/handler.rs`).
+  - **⚠ Release coordination:** the floor lives on dev at `0.10.0`. Bump `MIN_DAEMON_VERSION` (and
+    promote it to prod) ONLY in lock-step with a released stable users can `sc upgrade` TO — raising it
+    past the newest release strands every daemon with no target.
+
+**(2) "You end up on the new binary" self-check (core).** `up.rs::restart()` (the chokepoint
+`sc upgrade` execs into) now calls `warn_if_stale_after_restart()`: after the bounce it probes the
+local daemon's `/health` version and compares it to `build_version()`. The common install (unit
+ExecStart path == the binary `sc upgrade` overwrote) relaunches the new binary by construction; this
+catches the rare exceptions (service unit points at a *different* `sc` = path drift, or the bounce
+didn't take) and makes them LOUD + actionable (`sc down && sc up`) instead of a silent stale daemon.
+We deliberately do NOT rewrite the unit's ExecStart path in place (symlink/spacing edge cases,
+fragile) — the loud self-check covers all failure modes with one mechanism.
+
+**Honest ceiling (un-fixable retroactively):** a shipped 0.9.x daemon serving an agent from its
+**already-cached** secrets is an OFFLINE local path — the cloud floor cannot refuse it. Mitigations:
+the value is stale-but-valid (not corrupt); ANY cloud touch (new grant, new item, membership/re-key)
+is refused; and pre-launch the population is small ⇒ operational fix = watch `/admin` version census
+and get the few users to `sc upgrade`. This is why the upgrade window must be short and loud, not
+silent (cf. S1/S2: agent-facing stale-serve, OAuth rotating-refresh fork on a parked device).
+
+**Non-goals:** gating pairing (`/api/pair*`) or `agents/hashes` — an old daemon that pairs is
+force-upgraded on its very first sync, and hashes carry no content. Front-end untouched (the console's
+`/api/me/daemon-status` soft nudge already exists).
