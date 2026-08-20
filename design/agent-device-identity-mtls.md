@@ -505,3 +505,126 @@ silent (cf. S1/S2: agent-facing stale-serve, OAuth rotating-refresh fork on a pa
 **Non-goals:** gating pairing (`/api/pair*`) or `agents/hashes` — an old daemon that pairs is
 force-upgraded on its very first sync, and hashes carry no content. Front-end untouched (the console's
 `/api/me/daemon-status` soft nudge already exists).
+
+## 13. Identity migration / legacy cutover (LOCKED 2026-08-20, user-approved)
+
+The wave shipped the crypto substrate (AIK/DIK keypairs, PoP) additively behind dual-auth, so nothing
+breaks — but that left the actual *adoption* unbuilt: existing agents/devices carry NO keypair
+("legacy"), there is no in-place upgrade and no nudge, so the AIK/DIK census can never reach 0 and the
+compat-sunset rows (`compat-sunset.md` #1/#2/#3/#6/#7) can never be deleted. The wave can't *finish*.
+User's call (2026-08-20): don't build in-place AIK/DIK upgrade — **wipe + re-pair from scratch**. It's
+cleaner and less code.
+
+### 13.0 Principles (constraints first)
+- **P1 — passkeys/UIK are the person's vault access ⇒ NEVER wipeable** (wipe = self-lockout). UIK must
+  upgrade *in place*.
+- **P2 — agents/devices are cheap, re-pairable identities holding NO unique data** (vault data is
+  sealed and untouched) ⇒ safe to wipe; re-pair under the new flow mints a proper AIK/DIK from birth.
+- **P3 — the migration must let us DELETE the dual-auth compat.** A "census reaches 0 eventually"
+  driver isn't enough; a hard cut makes it 0 now, so the legacy paths can be ripped out and the wave
+  closes.
+- **P4 — one coordinated cutover, riding the 0.10 force-upgrade (§12.9)**, not a drawn-out campaign.
+- **P5 — no silent destruction** (clear consent/messaging), and **P6 — never lock the user out**
+  (after a wipe they can always re-pair because their passkey/UIK is untouched).
+- **P7 — minimal clicks for the unavoidable in-place work (UIK).**
+
+### 13.1 Non-goals
+In-place AIK/DIK upgrade (rejected — wipe+re-pair). Preserving legacy agent/device identities across
+the cut. A gradual/opt-in migration. Touching vault data or UIK/passkeys during the agent/device wipe.
+
+### 13.2 Per-identity plan
+- **DIK (devices) — WIPE + re-`sc login`.** The cut = **enforce DIK** (flip `SC_DEVICE_SIG_AUDIT`
+  audit→reject + the `MIN_TEAM_DAEMON_VERSION` bump, compat-sunset #3/#7): a device with no DIK is
+  refused, so it must re-run `sc login`, which already mints+registers a DIK (`cli/login.rs`). The
+  daemon surfaces "re-run `sc login`" on that rejection (same shape as §12.9's "run `sc upgrade`"). A
+  console **"reset devices"** affordance revokes the stale device `api_keys` rows so they don't linger.
+- **AIK (agents) — WIPE + re-add.** Same: legacy (no-`identity_id`) agents are revoked; the user
+  re-pairs via `sc agent add` / the §12 device-flow, which mints an AIK from birth. Requiring AIK
+  (fail-closed hop-A, compat-sunset #1/#2) is the enforcement that makes a legacy api-key agent stop
+  working, forcing the re-add.
+- **Migration UX = a GUIDED, USER-PRESSED button** — the middle path between a silent server wipe
+  (reads as "you deleted my stuff", angers) and pure passive enforcement (things mysteriously break).
+  The console surfaces a clear **"Upgrade your agents & devices"** affordance (identity nudge → confirm
+  modal: "this signs out your N legacy agents/devices; re-pair each after — your passkeys and vault
+  access are untouched"). The USER presses it → it revokes only the **legacy (keypair-less)**
+  agent/device creds (reuses `handleRevokeKey`) → the console then **guides the re-pair** (per device
+  `sc login`, per agent `sc agent add`; headless fine via the §12 device-flow URL). Re-pair mints
+  AIK/DIK from birth. User-initiated ⇒ not angering; explicit ⇒ they know exactly what happens. Target
+  legacy-only (never an already-upgraded entity); NEVER a "reset passkeys" sibling (P1).
+  - **Enforcement is the BACKSTOP deadline, not the primary UX.** For holdouts who ignore the nudge,
+    the coordinated cutover eventually flips DIK-reject / require-AIK ("legacy support ends <date>;
+    upgrade now, one click"): legacy stops being accepted, the daemon says "re-run `sc login`", re-pair
+    becomes mandatory. This is what *guarantees* the census reaches 0. The delete-trigger counts only
+    **ACTIVE (used <30d) keypair-less** creds, so post-button / post-deadline it drains within the
+    inactivity window (a lazy reaper GC's long-dead rows). Pre-launch (≈one user) the button alone
+    drains it; the deadline only matters at scale.
+- **UIK (passkeys) — in place, minimal clicks.** Mechanism exists (`upgradePasskey`,
+  `lib/vault-grant.ts`) but is buried in a per-vault tab. Move it to the account level
+  (`/account/passkeys`), add an account **nudge banner** ("N passkeys need upgrading"), and drive it in
+  the **fewest gestures the crypto allows** (see §13.5).
+
+### 13.3 Cutover ordering (rides §12.9)
+1. 0.10 stable out + force-upgrade floor live (§12.9) — daemons are already ≥0.10.
+2. Ship the migration UX: account-level UIK upgrade + the identity nudge banner + the guided
+   **"Upgrade agents & devices"** button (user-pressed → revoke legacy + guide re-pair) + the daemon
+   "re-run `sc login`" surfacing.
+3. Flip enforcement: DIK audit→reject, hop-A require-AIK (fail-closed). Legacy agents/devices now stop
+   working ⇒ users re-pair; passkeys upgrade in place.
+4. **Active-legacy census drains to 0 within the inactivity window** (post-flip a legacy cred is
+   rejected → goes unused → drops out of the active count; §13.2 — bounded, no wipe). Then **delete the
+   compat** (compat-sunset #1/#2/#3/#6/#7 + their code) and re-run green gates.
+
+### 13.4 Compat this unlocks (delete after the cut)
+`compat-sunset.md` rows **#1** (dual-window agent-id keying), **#2** (hop-A legacy Basic api-key),
+**#3** (hop-B legacy device bearer), **#6** (`~/.safeclaw/device-key`), **#7** (`SC_DEVICE_SIG_AUDIT`).
+Row **#5** (NoUik/fmt1) is a separate *vault-format* census with its own self-heal (task B1b); row
+**#4** (config-sig) is the 甲 cutover — both out of scope here.
+
+### 13.5 RESOLVED (verified 2026-08-20): UIK upgrade is PER-PASSKEY, one tap on its own device — no batch
+`upgradePasskey` (`vault-grant.ts:1975`) derives the target passkey's wrap key `W_c` from **that
+passkey's OWN PRF assertion** (`safePasskeyGet` on the target, lines 1992-2001) and wraps the UIK under
+it — so upgrading passkey X requires X's authenticator present + tapped. There is **no pubkey-only /
+batch path**: a passkey that isn't present can't produce its PRF, so its wrap can't be computed. This
+is crypto-fundamental (each passkey independently holds the UIK under its own PRF key) and a GOOD
+property — a compromised/absent passkey can't be silently enrolled onto attacker devices; the target
+must physically consent.
+**⇒ UIK upgrade = ONE tap per legacy passkey, on the device that holds it.** Clean UX (clarity beats
+click-count): the account page (`/account/passkeys`) lists every passkey, flags the legacy ones WITH
+their device label, gives the passkey present on THIS device a live one-tap "Upgrade" CTA, and clearly
+signposts the rest ("upgrade on <device>: one tap"); a nudge banner surfaces the count. The user
+grasps the WHY (independent keys) and the WHAT (one tap where each key lives).
+
+### 13.6 Build list
+1. **FE:** account-level `/account/passkeys` — list all passkeys, flag legacy + device label, live
+   one-tap "Upgrade" for the passkey on THIS device + "upgrade on <device>" signpost for the rest
+   (§13.5, per-passkey by crypto) + the identity nudge banner.
+2. **FE+BE:** console guided **"Upgrade agents & devices"** button — user-pressed → confirm modal →
+   revoke LEGACY (keypair-less) agent/device creds (reuses `handleRevokeKey`) → guide re-pair.
+3. **Core:** on DIK-reject / AIK-required, daemon surfaces "re-run `sc login`" (mirror §12.9).
+4. **BE+Core:** flip DIK enforce (`SC_DEVICE_SIG_AUDIT`→reject) + hop-A require-AIK (fail-closed),
+   census-gated.
+5. **Delete compat** (§13.4) + green gates.
+Supersedes the "in-place AIK/DIK upgrade" reading of tasks #72/#75/#81; those shrink to this list.
+
+### 13.7 Why this is optimal (adversarial review)
+- **Wipe+re-pair isn't just simpler, it's more SECURE than a silent DIK self-heal.** Self-heal would
+  bolt a DIK onto a device that was TOFU-paired (no proof at pairing) — grandfathering an unproven
+  identity into the "proven" model. Re-`sc login` re-establishes the device under the §12 device-flow
+  with PoP, so every post-cut identity is proven-from-birth. (For agents there is no silent option at
+  all — an agent can't self-mint an authorized AIK without a UIK-signed ceremony — so re-pair is
+  forced there regardless; doing devices the same way keeps ONE model, not two.)
+- **Do the cut PRE-LAUNCH.** The re-pair cost scales with entities-per-user; pre-launch that's a
+  handful. Cutting now means every *launched* user starts on the new model and never faces a
+  migration — the cost is only ever paid by today's tiny dogfood population. Post-launch this same hard
+  cut would be a coordinated fleet event; now it's free. This is the decisive timing argument.
+- **Rejected alternatives:** (a) in-place AIK/DIK upgrade — most code, must graft keypairs onto
+  existing identities + re-authorize, and still leaves TOFU grandfathering; (b) silent DIK self-heal —
+  zero friction but grandfathers unproven devices AND has no agent analogue, so you'd ship two
+  divergent migration models; (c) do nothing / dual-auth forever — the census never drains, the compat
+  is immortal, the wave never closes (the status quo this doc kills).
+- **Residual honest costs:** an agent cut mid-task breaks (message clearly; it rides a deliberate
+  upgrade window). UIK is one tap per passkey per device (§13.5, crypto-bound — not a UI choice); the
+  UX sells clarity, not a false "one click for all".
+- **Verdict:** optimal for the pre-launch window; **fully settled, no open questions** (§13.5 resolved
+  2026-08-20). Net effect on the codebase is *negative* lines (delete 5 compat rows) — the tell that
+  the direction is right.
