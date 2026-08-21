@@ -86,6 +86,19 @@ pub struct CliConfig {
     /// `sc vault forget` never sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_deleted_upstream: Option<String>,
+    /// The account id this device paired to, captured at `sc login` (TOFU). §15
+    /// uses it as the account principal-ledger ANCHOR: the ledger's owner-UIK pubkey
+    /// self-certifies against it (`derive_id(User, uik_pub) == account_id`), so no
+    /// separate anchor pin is needed. Absent on pre-§15 pairings (the ledger loop
+    /// then simply doesn't start). Cleared by logout / self-revoke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// §15 principal-ledger enforcement switch: DEFAULT OFF — a verified revoke of
+    /// THIS device only locks+wipes when this is "on". `SAFECLAW_PRINCIPAL_ENFORCE`
+    /// overrides (and survives an old binary's config save). Flipped on at the P6
+    /// cutover. See [`crate::principal_ledger::principal_enforce_enabled`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_enforce: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -329,6 +342,7 @@ pub fn put_cloud_coords(
     daemon: &str,
     cloud_backend: &str,
     frontend_origin: Option<&str>,
+    account_id: Option<&str>,
 ) -> Result<PathBuf, String> {
     let mut cfg = load().unwrap_or_default();
     cfg.daemon = Some(daemon.to_string());
@@ -337,7 +351,35 @@ pub fn put_cloud_coords(
     cfg.frontend_origin = frontend_origin
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_string());
+    // §15: persist the paired account id as the principal-ledger anchor (TOFU).
+    // Keep a previously-known value if this pairing response omits it (older backend).
+    if let Some(a) = account_id.filter(|s| !s.is_empty()) {
+        cfg.account_id = Some(a.to_string());
+    }
     save(&cfg)
+}
+
+/// The account id captured at pairing (§15 principal-ledger anchor). `None` for a
+/// local-only / pre-§15 daemon (the ledger loop then doesn't start).
+pub fn account_id() -> Option<String> {
+    load().ok()?.account_id.filter(|s| !s.is_empty())
+}
+
+/// Clear the cloud pairing from config + the known-vaults catalog (the inverse of
+/// [`put_cloud_coords`]): drop daemon/vault/cloud_backend/frontend_origin/account_id
+/// + known_vaults, preserve user `settings`. Used by the §15 self-revoke wipe so it
+/// leaves the same state `sc logout` does.
+pub fn clear_pairing() -> Result<(), String> {
+    let mut cfg = load().unwrap_or_default();
+    cfg.daemon = None;
+    cfg.vault = None;
+    cfg.cloud_backend = None;
+    cfg.frontend_origin = None;
+    cfg.account_id = None;
+    cfg.vault_deleted_upstream = None;
+    cfg.known_vaults.clear();
+    save(&cfg)?;
+    clear_known_vaults()
 }
 
 /// Resolve the cloud FRONTEND origin (for the human web-approval link

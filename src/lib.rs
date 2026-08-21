@@ -29,6 +29,7 @@ mod generated_services;
 pub mod identity;
 pub mod identity_file;
 pub mod passkey;
+pub mod principal_ledger;
 pub mod protocol;
 pub mod proxy;
 pub mod relay;

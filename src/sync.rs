@@ -563,6 +563,19 @@ pub fn spawn_watchers(state: Arc<AppState>) {
     // with the vaults already watched above so it only spawns for NEW ones.
     let watched: std::collections::HashSet<String> =
         synced_vault_ids(&cfg).into_iter().collect();
+    // §15 account principal ledger: pull + verify + (flag-gated) enforce a VERIFIED
+    // self-revoke (lock + wipe all + logout). Spawned for a paired daemon that knows
+    // its account anchor (persisted at login); dormant until SAFECLAW_PRINCIPAL_ENFORCE
+    // is on (the P6 cutover flips the default). Uses clones so the discovery loop below
+    // still takes ownership.
+    if let Some(account_id) = active::account_id() {
+        tokio::spawn(crate::principal_ledger::principal_ledger_loop(
+            state.clone(),
+            cloud.clone(),
+            dk.clone(),
+            account_id,
+        ));
+    }
     tokio::spawn(discovery_reconcile_loop(state, cloud, dk, watched));
 }
 
@@ -882,7 +895,7 @@ fn drop_local_vault(state: &Arc<AppState>, vault: &str) {
 /// land AFTER `remove_file` and re-create a live file for a tombstoned id. The
 /// ONLY lock-free drop is `pull_on_start`'s (pre-serve: no AppState, no
 /// concurrent writers yet), which uses `drop_local_vault_disk` directly.
-async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) {
+pub(crate) async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) {
     let lock = {
         let mut locks = state.vault_write_locks.lock().unwrap();
         Arc::clone(

@@ -409,6 +409,9 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         &local_custodian,
         &pro_backend_url,
         parsed.console_url.as_deref(),
+        // §15: persist the account id as the principal-ledger anchor (both the token
+        // and device-flow paths converge here with `parsed.account_id` in hand).
+        (!parsed.account_id.is_empty()).then_some(parsed.account_id.as_str()),
     )
     .map_err(|e| format!("save active config: {}", e))?;
 

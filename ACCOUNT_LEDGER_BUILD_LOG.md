@@ -31,17 +31,39 @@ while online: a revoked device/agent loses the ability to use secrets. Universal
   lp-ambiguity + roundtrip + pinned golden-vector tests. 33 identity tests green.
   Anchor needs NO new primitive: `account_id == derive_id(User, owner_uik_pub)` already
   self-certifies the owner UIK (same trick as per-vault genesis anchor).
-- **P2 backend** — account principal ledger: append-only owner-signed events
-  (`admit`/`revoke`, monotone `seq`). New table (e.g. `account_principals` /
-  `principal_ledger`) + write endpoint (verify UIK sig vs account anchor = write-gate) +
-  serve endpoint (daemon pulls). Dual-path with the current session-admission + api_keys
-  roster. Node mirror of `principal_event_input` (parity vs the pinned hex).
-- **P3 frontend** — admission + revoke become UIK-signed ceremonies. /pair approval signs
-  `admit` (passkey tap); revoke UI signs `revoke`. Bootstrap: pin/learn the account owner
-  UIK at first pair. Pin the same golden hex as P1.
-- **P4 core/daemon** — sync the ledger, verify vs account anchor, fold the current
-  principal set. On self (device) `revoke` verified → LOCK + WIPE all local vaults +
-  logout. Behind a flag until verified. Delivery-before-hard-kill.
+- **P2 backend** — DONE (backend `dev` commit `778bb63`; migration LIVE on dev DB
+  `nyykwxuakkjydmjroyzb` + verified). Table `account_principal_events` (append-only,
+  monotone `seq`, PK `(account_id,seq)` replay guard, RLS service-role-only) + rollback.
+  `keyset-roles.mjs`: `principalEventInput()` Node mirror + boot golden-vector self-check
+  (parity MATCH vs Rust pinned hex). `vault-routes.mjs`: `GET /api/vault/principals`
+  (daemon/console pull; session OR device-key; serves raw signed events + account anchor
+  pubkey) + `POST` (append; SESSION + verified owner-UIK signature, monotone-seq guard,
+  self-cert anchor check). Additive/dormant: §14 roster stays authoritative; missing
+  migration degrades to empty, never 500. LEFT: push backend `dev` to remote + Railway
+  `dev-backend` redeploy (batched; endpoints dormant so no rush — needed before P4 e2e).
+- **P3 frontend** — DONE (frontend `dev` commit `622670b`; tsc clean; parity 60/60).
+  `uik-crypto.ts`: `principalEventInput` + `DS_PRINCIPAL_EVENT` (three-way Rust↔Node↔TS
+  parity, pinned vector in `verify-uik-crypto.mts`). `vault-grant.ts`: `recoverOwnerUik`
+  (account-scoped passkey tap → unwrap owner UIK, no vault, never mints) +
+  `signAndPostPrincipalEvent` (seq=cursor+1, retry once on 409). `vault-api.ts`:
+  get/post principal-ledger. `/pair` approve signs `admit` (one owner tap);
+  access-client revoke signs `revoke` BEFORE the DELETE (delivery-before-hard-kill).
+  Additive/dormant/best-effort: session approve + DELETE stay enforced; a cancelled tap
+  never blocks them. P6 flips enforcement + makes the tap mandatory.
+- **P4 core/daemon** — DONE (this branch; `cargo build` clean, 5 new tests green).
+  New `src/principal_ledger.rs`: `fetch_ledger` (GET /api/vault/principals, device-key +
+  DIK PoP), `fold_verified` (self-cert anchor check `derive_id(User, uik_pub)==account_id`;
+  per-event owner-sig verify; skip-invalid; monotone-seq), and `principal_ledger_loop`
+  (poll 120s → verify → flag-gated enforce). Verified self-revoke → `self_wipe_and_logout`:
+  `drop_local_vault_locked` every vault (evict K + wipe blob, in-process) → delete
+  device-key → `clear_pairing` → `process::exit`. Rollback-resistant: a verified
+  self-revoke LATCHES to `principal_floor.json`; a pull whose max seq regresses is ignored
+  (server can't un-revoke). Anchor bootstrap RESOLVED: `account_id` persisted at pairing
+  (`put_cloud_coords` + login, both paths) IS the anchor (self-certifying). Flag
+  `SAFECLAW_PRINCIPAL_ENFORCE` / `CliConfig.principal_enforce`, DEFAULT OFF. Agent revoke
+  rides the existing /agents/hashes sync (backend drops the key). `sc logout` also clears
+  `account_id`. Invariant held: destructive only on a VERIFIED sig, never a bare 401
+  (a fetch failure parks).
 - **P5 per-vault drop hardening** — sign the vault-delete tombstone (currently unsigned
   server cleartext); upgrade daemon membership-loss from "stop serving" to "actively
   LOCK+WIPE"; extend to personal. ("team removes member" ≡ "user deletes own vault" =
@@ -53,6 +75,29 @@ while online: a revoked device/agent loses the ability to use secrets. Universal
 `sc logout` stops the daemon on macOS too + wipes local `<state_dir>/vaults/` (commit 6efb795).
 
 ## Resume pointer
-Next: **P2 backend** — add the account principal ledger table + write/serve endpoints +
-the Node `principalEventInput` mirror (parity with `identity.rs` pinned hex
-`0000001b…75735f61636374`). Keep dual-path with §14 session-admission.
+Next: **P5 per-vault drop hardening** (SSOT §15 "per-vault drop", agent-device-identity-mtls.md:725-736).
+Three gaps to close: (a) the vault-DELETE tombstone is currently UNSIGNED server cleartext —
+`sync.rs` acts on `status:"deleted"` before any signed-envelope check; sign it (vault-owner K
+or owner UIK) so a malicious server can't forge a delete; (b) upgrade daemon membership-loss
+from "stop serving" to "actively LOCK + WIPE" the dropped vault (reuse `drop_local_vault_locked`);
+(c) extend both to PERSONAL vaults (today's tombstone drop is the personal path; the signing +
+active-wipe is the new part). Semantics: delete-vault = account-wide tombstone; offboard-member =
+single-member removal; ONE daemon reaction = verify a vault-owner-signed "vault Y access gone" →
+LOCK+WIPE vault Y locally. Keep the P4 invariant: destructive only on a VERIFIED signature.
+Then **P6 cutover**: flip `SAFECLAW_PRINCIPAL_ENFORCE` default on + make the /pair admit tap
+mandatory + retire §14 session-only admission + adversarial review + e2e.
+
+--- (P4 done; historical note below) ---
+P4 was: **core/daemon** (Rust, on this branch; the DESTRUCTIVE phase — flag-gated).
+Add: (a) a daemon pull of `GET /api/vault/principals` (DIK PoP, like the VA2 vault
+discovery loop in `sync.rs`); (b) verify each event's owner-UIK sig via
+`identity::principal_event_input` against the account anchor learned at pairing
+(`derive_id(User, owner_uik_pub) == account_id`), fold by monotone `seq` (reject a
+ledger that drops a higher-seq revoke); (c) enforcement behind a flag: on a VERIFIED
+`revoke` of THIS device's own `dev_…` → LOCK + WIPE all local vaults + logout (reuse
+the `sc logout` wipe path). Agent `revoke` → drop from the local authorizing set.
+INVARIANTS: destructive only on a daemon-VERIFIED owner signature, NEVER a bare 401
+(401 keeps PARKING — the transient-403 incident). Delivery-before-hard-kill already
+set up FE-side (revoke event posted before the key DELETE). Where the daemon learns
+the account anchor UIK pubkey at pairing is the one open bootstrap question to resolve
+against current pairing code. Keep additive: nothing enforces until the flag flips (P6).
