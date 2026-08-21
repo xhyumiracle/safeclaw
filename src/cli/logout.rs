@@ -38,11 +38,25 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
         }
     }
 
-    // 2. Stop the daemon so it stops serving/syncing this account's vaults (and
-    //    stops any orphan-vault 403 sync spam). Best-effort / Linux-only.
-    #[cfg(target_os = "linux")]
+    // 2. Stop the daemon so it stops serving/syncing this account's vaults and
+    //    drops in-memory K. Cross-platform: macOS previously skipped this, so a
+    //    self-logout left the daemon running (K in memory, vault.dat on disk) and
+    //    kept substituting secrets — the "unpair -> this machine can't use
+    //    secrets" expectation has to hold for self-logout too. Best-effort.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let _ = crate::cli::service::run_stop();
+    }
+
+    // 2b. Wipe local sealed vault state (`<state_dir>/vaults/`). Unpair means this
+    //    machine is out; the sealed blobs are ciphertext (no leak), but leaving
+    //    them is untidy and a re-pair re-pulls them from the cloud. Best-effort —
+    //    a wipe failure must not block the unpair.
+    {
+        let vaults_dir = crate::config::default_state_dir().join("vaults");
+        if vaults_dir.exists() {
+            let _ = std::fs::remove_dir_all(&vaults_dir);
+        }
     }
 
     // 3. Remove the device-key file (this host's identity to the cloud).

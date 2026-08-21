@@ -678,7 +678,81 @@ agent) end-to-end.
    vault-pick required for admission). Agents tab shows only ADMITTED agents (pending ones aren't
    toggle-able).
 
-**Locked decisions:** admission = session-auth (no K); vault access = K-toggle (unchanged); agent uses
+**Locked decisions** [⚠️ PARTIALLY SUPERSEDED 2026-08-21 by §15 — admission is upgraded from
+session-auth to **owner-UIK-signed** (for symmetry with revoke + so the daemon can verify it). §14's
+real invariant ("admission needs NO vault-K") STANDS: the UIK is the owner's account identity, not any
+vault's K. Only "session-auth, no signature" is revised. Everything else here (two-step admission ≠
+vault-access, ONE /pair primitive, never auto-admit) stands and ships as-is for launch]**:** admission
+= session-auth (no K); vault access = K-toggle (unchanged); agent uses
 the SAME /pair ceremony as device (ONE primitive); v1 may confirm each principal separately (combined
 device+first-agent multi-principal approval page = later nicety); NEVER auto-admit (retire §11.4
 auto-authorize). **Non-goal:** admission granting vault access automatically (strictly two steps).
+
+---
+
+## §15. Account principal ledger + universal revocation-drop (design 2026-08-21, UNBUILT)
+
+**Principle.** Owner decisions over the account's *principals* (devices, agents) — both ADMIT (pair /
+`sc agent add`) and REVOKE — are **owner-signed** and, while the target is online, **enforced locally**:
+a revoked device/agent loses the ability to use secrets. This is a UNIVERSAL invariant, not a team
+privilege. Scope: the online case (a reachable daemon syncs the signed removal and acts). A
+deliberately-offline device is out of scope (inherent: its disk is unreachable; K is memory-only +
+re-lock on restart is the residual mitigation, plus the team offline-lease where it applies).
+
+**Two crypto-distinct layers, both owner-signed (this is the whole model):**
+
+| Layer | What it authorizes | Channel | Signer / anchor | Revoke → daemon does |
+|---|---|---|---|---|
+| **Account admission** | device/agent is a principal of the ACCOUNT | NEW account principal ledger | owner **UIK**, anchored to a per-account TOFU-pinned owner-UIK root | device `−` → LOCK + WIPE **all** vaults + logout; agent `−` → global broker reject |
+| **Per-vault access** | principal may use vault Y | per-vault (authorized-agents for agents; passkey-membership for devices) | **K** (per-vault, existing genesis anchor) | remove → drop **that one** vault |
+
+**Pair and revoke are the two ends of ONE account-level lifecycle → design them together, symmetric.**
+The account principal ledger is an append-only, owner-UIK-signed log: `+device D` / `−device D` /
+`+agent A` / `−agent A`. Pair = signed `+`, revoke = signed `−`, same anchor, same verify. This
+SUPERSEDES §14's session-only admission: /pair approval becomes an owner passkey signature (UIK), not a
+session click. Cost: one extra tap at /pair. Win: a stolen session can no longer admit a rogue
+principal or revoke your devices (DoS), and the roster is daemon-verifiable — which is what makes
+revoke enforceable.
+
+**The missing primitive = an ACCOUNT-level trust anchor.** Today every owner-signed authz is per-vault
+(anchored to that vault's creator UIK genesis). Devices/agents are account-scoped and must be
+revocable even with 0 vaults, so they cannot ride a per-vault anchor. Fix: TOFU-pin the account
+owner's UIK pubkey as an account trust root at first pair (mirrors the per-vault genesis-anchor
+pattern, lifted to account scope). Everything else reuses the proven per-vault delegation-log
+machinery (domain-separated Ed25519 inputs, append-only signed log, daemon fold + sidecar verify),
+just at account scope.
+
+**Per-vault drop (the SECOND primitive) is a two-authoring / one-reaction shape.**
+- Two authoring actions, different scope: **delete-vault** = account-wide tombstone (vault gone for
+  everyone); **offboard-member** = single-member removal (vault stays for others). "team removes user
+  from vault" ≡ "user deletes own personal vault" — both are a vault-owner-signed "access to vault Y is
+  gone."
+- ONE daemon reaction: *verify a vault-owner-signed "vault Y access gone" → actively LOCK + WIPE vault
+  Y locally.* Team already has the reactive half via membership-loss (the removed member's daemon stops
+  serving); GAPS to close: (a) the vault-DELETE tombstone is currently UNSIGNED server cleartext
+  (`sync.rs` acts on `status:"deleted"` before the signed-envelope check) — sign it; (b) upgrade
+  "stops serving" to "actively LOCK + WIPE"; (c) extend to personal vaults.
+- **agent** revoke by a team = per-vault MASK/block only (the agent is its user's account asset; a team
+  cannot destroy another account's agent). Global agent revoke (`sc agent rm`) is the account layer.
+
+**Delivery-before-hard-kill (sequencing).** For an online target to VERIFY its own revocation and
+self-drop, the signed `−` must reach it over a channel it can still sync. So: publish the owner-signed
+removal → target pulls + verifies + drops → THEN hard-kill its device-key. Killing the key first only
+yields a bare 401, which today (correctly, to survive transient backend 403s) PARKS and does not drop —
+so a key-kill alone must NOT be relied on for enforcement.
+
+**Already shipped (rc.9, the small clear pieces):** `sc logout` now (a) stops the daemon on macOS too
+(previously Linux-only → a mac self-logout left the daemon serving), and (b) wipes local
+`<state_dir>/vaults/`. So self-unpair already enforces "this machine can't use secrets."
+
+**Scope / sequencing.** Current §14 session-admission SHIPS for launch (low-stakes roster, inert until
+vault-toggled). The signed account principal ledger + universal revocation-drop is a dedicated
+POST-LAUNCH wave (new account anchor + ledger + daemon account-ledger sync/verify/drop + /pair
+admission becomes UIK-signed + sign the vault-delete tombstone). Design-lock this section first, then
+build.
+
+**Non-goals:** enforcing against a deliberately-offline device (inherent limit); admission granting
+vault access (still strictly two steps, §14 stands); a per-vault fan-out for device revoke (rejected —
+device revoke is an account fact, must work with 0 vaults). See
+[[project_agent_device_identity_mtls]], [[project_vault_auto_discovery]],
+[[project_team_edition_design]].
