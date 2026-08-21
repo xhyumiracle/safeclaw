@@ -95,11 +95,15 @@ fn control_port_alive() -> bool {
     std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok()
 }
 
-/// Poll the control port until it answers or we give up (~6s — the daemon binds
-/// in ~2-3s, plus a margin for a cold `pull_on_start`).
+/// Poll the control port until it answers or we give up (~20s). The daemon binds
+/// only AFTER `pull_on_start`, which now auto-discovers the account's vaults and
+/// pulls each one's sealed blob before serving — on a multi-vault account that
+/// cold start runs well past the old 6s window, so a bounce would false-alarm
+/// "nothing answering" even though the daemon comes up a beat later. Poll long
+/// enough to cover it; a genuinely dead daemon still errors, just later.
 #[cfg(target_os = "macos")]
 fn wait_for_control_port() -> bool {
-    for _ in 0..24 {
+    for _ in 0..80 {
         if control_port_alive() {
             return true;
         }

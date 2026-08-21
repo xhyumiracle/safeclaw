@@ -427,7 +427,10 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     // bring-up verbs rather than re-implementing them here.
     // Best-effort: pairing already succeeded; if bring-up can't run (e.g. a
     // non-Linux host with no service manager), point the user at `sc up`.
-    eprintln!("Starting SafeClaw and unlocking your vault…");
+    // Not "unlocking your vault" — a fresh multi-vault account has no active vault
+    // to unlock yet (that's a later, per-use choice), so a bring-up note must not
+    // promise an unlock that won't happen.
+    eprintln!("Starting SafeClaw…");
     if crate::cli::service::unit_installed() {
         // Re-pair / post-upgrade: a daemon may already be running on the OLD
         // pairing config. Bounce it so it reloads the just-persisted config,
