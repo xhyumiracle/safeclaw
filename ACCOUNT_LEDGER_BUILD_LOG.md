@@ -64,17 +64,59 @@ while online: a revoked device/agent loses the ability to use secrets. Universal
   rides the existing /agents/hashes sync (backend drops the key). `sc logout` also clears
   `account_id`. Invariant held: destructive only on a VERIFIED sig, never a bare 401
   (a fetch failure parks).
-- **P5 per-vault drop hardening** — sign the vault-delete tombstone (currently unsigned
-  server cleartext); upgrade daemon membership-loss from "stop serving" to "actively
-  LOCK+WIPE"; extend to personal. ("team removes member" ≡ "user deletes own vault" =
-  one verified vault-owner-signed "vault access gone" → daemon drops that vault.)
+- **P5 per-vault drop hardening** — MAPPED, NOT BUILT (a mini-wave; two legs, see below).
+  Split into leg A (unambiguous, buildable) and leg B (blocked on a design question).
+  - **Leg A — sign the vault-delete TOMBSTONE.** Today it is UNSIGNED server cleartext: a
+    top-level `status:"deleted"` field the daemon acts on in 4 sites BEFORE any signature
+    path (core `sync.rs`: `classify_pull_body:752`, `handle_blob_wake_body:2069`,
+    `watch_loop` SSE arm `:1615`, + `pull_on_start`/`sync_vault_now`/`recover_after_conflict`).
+    Backend sets it as a plain DB column (`vault-routes.mjs handleDeleteVault:1435-1439`) and
+    serves it with NO env/sig (`:2200`). The server envelope (`DS_SERVER_ENVELOPE`) is
+    SERVER-signed and does NOT cover `status` — so a NEW owner-signed field is needed
+    (`DS_VAULT_TOMBSTONE`), verified against the vault genesis anchor via the SAME
+    `resolve_current_root` / `fold_owner_set` machinery (`sealed_vault.rs:1774`). Full build:
+    new primitive in identity.rs + Node mirror (keyset-roles.mjs) + FE mirror (uik-crypto.ts)
+    + 3 golden vectors; FE delete ceremony signs it (owner passkey tap); backend stores+serves
+    it; core verifies-before-destroy, DUAL-PATH (accept unsigned OR verified-signed; only
+    REQUIRE signed behind a flag, so existing deletes never brick). Large but unambiguous.
+  - **Leg B — membership-loss active-wipe — BLOCKED ON A DESIGN QUESTION (do NOT guess).**
+    Today a removed team member's daemon only "stops serving" weakly: `adopt_membership_triple`
+    (`sync.rs:2844`) adopts only PRESENT members, never prunes an absent self, never wipes;
+    stale K stays retained while unlocked + `vault.dat` stays on disk. The VERIFIED signal
+    exists — `fold_owner_set` returns the full owner-verified member map and is `Untrusted`
+    (fail-closed) on a rolled-back log — BUT: a shared vault's membership is keyed by the
+    USER's UIK (`us_…`), while the daemon holds a DEVICE identity (`dev_…`). "Which `us_` is
+    this daemon a member AS?" is not cleanly answered at the daemon layer (the daemon serves
+    K to the local user/agent; the us_ is established client-side at unlock). Wiping on a
+    wrong answer = destroying a LEGIT member's vault (data loss). RESOLVE WITH THE USER before
+    building: does the daemon persist the `us_` it unlocked as, per vault? Only then can
+    "self ∉ verified member set → wipe" fire safely. Personal (fmt1/NoUik) vaults have no
+    triple, so their "access gone" rides leg A's tombstone, not membership.
 - **P6 cutover** — flip enforcement (require signed admission; wipe-on-revoke on) + retire
   session-admission + adversarial review + e2e. Gated/census'd.
 
 ## Already shipped (rc.9, the small clear pieces, on dev)
 `sc logout` stops the daemon on macOS too + wipes local `<state_dir>/vaults/` (commit 6efb795).
 
-## Resume pointer
+## Status (2026-08-22)
+P1-P4 DONE + green + committed across all 3 repos: the CORE §15 invariant (owner-signed
+admit/revoke ledger end-to-end; verified device self-revoke → lock+wipe+logout,
+rollback-resistant, flag-gated default OFF). This fully covers the originating request
+("owner revokes device → device can't use secrets, online case"). Commits: core P1 `1970d03`
++ P4 `a5704b3` (branch `feat/account-principal-ledger`); backend P2 `778bb63` (dev, migration
+LIVE on dev DB); frontend P3 `622670b` (dev).
+LEFT (paused for user input / launch-gated):
+- **P5 leg A** (sign delete tombstone) — buildable, large; see above. Ready to build on request.
+- **P5 leg B** (membership-loss wipe) — BLOCKED on the daemon-identity design question above.
+- **P6 cutover** — flip `SAFECLAW_PRINCIPAL_ENFORCE` on + mandatory /pair tap + retire §14
+  session-admission + adversarial review. The FLIP is a launch decision (user-gated); the
+  adversarial review + making the tap mandatory are buildable.
+- Ship: push backend `dev` + Railway `dev-backend` redeploy (P2/P3 endpoints dormant so no
+  rush); merge core branch `feat/account-principal-ledger` → core `dev` + cut an rc when P5/P6
+  land. All current work is isolated on the branch / additive-dormant, so the user's fresh
+  e2e on rc.9 is unaffected.
+
+## (superseded) earlier resume pointer
 Next: **P5 per-vault drop hardening** (SSOT §15 "per-vault drop", agent-device-identity-mtls.md:725-736).
 Three gaps to close: (a) the vault-DELETE tombstone is currently UNSIGNED server cleartext —
 `sync.rs` acts on `status:"deleted"` before any signed-envelope check; sign it (vault-owner K
