@@ -36,15 +36,16 @@ this repo into their skills directory.
 | Var | Meaning |
 |---|---|
 | `SAFECLAW_BROKER_URL` | The local broker, e.g. `http://127.0.0.1:23294` |
-| `SAFECLAW_API_KEY` | The agent's bearer identity |
+| `SAFECLAW_AGENT_IDENTITY` | Path to the agent's identity file (its AIK keypair). NOT a secret — `sc run` signs a fresh per-request proof-of-possession with it; no api key is stored or sent. |
 
-The vault is not part of the env: each request names one in its URL
-(`/v/<vault>/…`), and `sc run` binds one per launched command
-(`sc run --vault <id> -- <cmd>` to pick). `sc vault ls` lists ids (`*` = default).
+Both lines are non-secret, so the env block is safe to display. The vault is not
+part of the env: each request names one in its URL (`/v/<vault>/…`), and `sc run`
+binds one per launched command (`sc run --vault <id> -- <cmd>` to pick).
+`sc vault ls` lists ids (`*` = default).
 
-One identity per agent keeps the audit trail attributable; don't share a key
-across agents, and don't re-run `sc agent add` when the env already exists (it
-mints a duplicate).
+One identity per agent keeps the audit trail attributable; don't share an
+identity file across agents, and don't re-run `sc agent add` when the env already
+exists (it registers a duplicate).
 
 These vars steer the *agent's* requests only. Your own `sc` commands read the
 active vault from `~/.safeclaw/config.toml` (set by `sc login` / `sc vault

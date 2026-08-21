@@ -57,13 +57,12 @@ struct PairAuthorizeResp {
     interval: Option<u64>,
 }
 
-/// Poll response. `status` ∈ { pending, denied, approved }; `agent_key` (the
-/// tier-'agent' api-key) is present only once the owner approves admission.
+/// Poll response. `status` ∈ { pending, denied, approved }. Any credential the
+/// server returns is ignored — the agent authenticates by its AIK (proof-of-
+/// possession), so admission just needs the `approved` signal.
 #[derive(Deserialize)]
 struct PairPollResp {
     status: String,
-    #[serde(default)]
-    agent_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -163,7 +162,7 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
 
     // Poll until approved / denied / expired. Same cadence as `sc login`.
     let interval = auth.interval.unwrap_or(5).clamp(1, 30);
-    let agent_key = loop {
+    loop {
         tokio::time::sleep(Duration::from_secs(interval)).await;
         let presp = client
             .post(format!("{}/api/pair/poll", cloud))
@@ -190,28 +189,23 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         match poll.status.as_str() {
             "pending" => continue,
             "denied" => return Err("agent authorization was declined in the browser.".to_string()),
-            "approved" => {
-                break poll
-                    .agent_key
-                    .ok_or_else(|| "approved but the server returned no agent key".to_string())?;
-            }
+            "approved" => break,
             other => return Err(format!("unexpected authorization status '{}'", other)),
         }
-    };
+    }
 
     // Admitted — NOW persist the AIK identity file (0600).
     crate::identity_file::write(&identity_path, crate::identity::IdKind::Agent, &seed)?;
 
     // ── Mint-time projection (CREDENTIAL_BROKER.md §14): this IS the minter ─
-    // Print the agent's env as dotenv lines: the daemon's API face, the AIK
-    // identity PATH (a path, not a secret — the possession-proven identity, the
-    // dual-auth target), and the legacy api-key (still the ACTIVE transport until
-    // the AIK PoP path is enforced; kept so nothing bricks — design §7). The agent
-    // appends ONE command's stdout to its own `.env` and never assembles a value.
-    // STDOUT only; stderr guidance carries NO secret.
+    // The agent's env is now just TWO non-secret lines: the daemon's API face and
+    // the AIK identity PATH (a path, not a secret). Auth is the AIK's per-CONNECT
+    // proof-of-possession, minted by `sc run`'s transport shim — NO api-key is
+    // emitted (it was legacy dual-auth cruft the shim stripped anyway). So there's
+    // no secret to guard: this output can be shown, and appended to the agent's env
+    // file directly. The daemon still holds an account-roster row for this AIK.
     println!("SAFECLAW_BROKER_URL={}", broker_url);
     println!("SAFECLAW_AGENT_IDENTITY={}", identity_path.display());
-    println!("SAFECLAW_API_KEY={}", agent_key);
 
     let rm_name = if args.name.contains(char::is_whitespace) {
         format!("'{}'", args.name)
@@ -219,9 +213,9 @@ async fn add(args: AgentAddArgs) -> Result<(), String> {
         args.name.clone()
     };
     eprintln!(
-        "\nAgent '{}' authorized — its complete SafeClaw env (incl. its api key, shown ONCE) \
-         went to stdout. Append those lines to the env file your framework loads, without \
-         displaying them. It can now reach any vault you toggle on for it in the console's \
+        "\nAgent '{}' authorized — its SafeClaw env (two non-secret lines: the broker URL \
+         and its identity-file path) went to stdout. Append them to the env file your \
+         framework loads. It can reach any vault you toggle on for it in the console's \
          Agents tab. Works on any paired device; revoke: `sc agent rm {}`.",
         args.name, rm_name
     );
