@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::cli::active::put_active_with_cloud;
+use crate::cli::active::put_cloud_coords;
 use crate::config::LoginArgs;
 
 /// Default daemon control-plane port (matches `ServeArgs` `SAFECLAW_PORT`).
@@ -98,7 +98,13 @@ mod tests {
 #[derive(Debug, Deserialize)]
 struct ExchangeResp {
     account_id: String,
-    vault_id: String,
+    /// The vault the pairing was scoped to, when the server sends one. Device
+    /// pairing is now account-level and vault-agnostic, so this is optional and
+    /// unused for selection — the daemon auto-discovers the account's vaults.
+    /// Kept for forward/back compat with a server that still returns it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    vault_id: Option<String>,
     device_key: String,
     pro_backend_url: String,
     /// Cloud FRONTEND origin (web approval page host). Optional for forward-
@@ -229,9 +235,9 @@ async fn device_flow_pair(
             "approved" => {
                 return Ok(ExchangeResp {
                     account_id: poll.account_id.unwrap_or_default(),
-                    vault_id: poll
-                        .vault_id
-                        .ok_or_else(|| "approved but the server returned no vault_id".to_string())?,
+                    // Vault-agnostic pairing: a vault_id is no longer required to
+                    // finish. The daemon discovers the account's vaults on start.
+                    vault_id: poll.vault_id,
                     device_key: poll
                         .device_key
                         .ok_or_else(|| "approved but the server returned no device_key".to_string())?,
@@ -399,19 +405,18 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(DEFAULT_DAEMON_PORT);
     let local_custodian = format!("http://127.0.0.1:{}", daemon_port);
-    put_active_with_cloud(
+    put_cloud_coords(
         &local_custodian,
-        &parsed.vault_id,
         &pro_backend_url,
         parsed.console_url.as_deref(),
     )
     .map_err(|e| format!("save active config: {}", e))?;
 
     eprintln!(
-        "Paired to {} (vault {}); your agent talks to {}.",
-        pro_backend_url, parsed.vault_id, local_custodian
+        "Paired to {}; your agent talks to {}.",
+        pro_backend_url, local_custodian
     );
-    if parsed.account_id != parsed.vault_id {
+    if !parsed.account_id.is_empty() {
         eprintln!("  account: {}", parsed.account_id);
     }
 

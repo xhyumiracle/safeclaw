@@ -18,6 +18,12 @@ pub struct ConnRow {
     pub hosts: Vec<String>,
     /// Ready-made phantom strings (a list — §6).
     pub phantoms: Vec<String>,
+    /// The agent-facing `setup` hint of the backing service, when it has one:
+    /// how to configure a local tool so its traffic is brokered. Lifted from the
+    /// registry's `services` array so `sc connection ls --json` carries it, which
+    /// is the keyless agent's only route to it (the api-face registry read is
+    /// Bearer-gated). `None` for a raw connection or a service with no hint.
+    pub setup: Option<String>,
 }
 
 /// Fetch + project the vault's usable connections. `daemon` is the control-plane
@@ -44,9 +50,24 @@ pub async fn connections(daemon: &str, vault: &str) -> Result<Vec<ConnRow>, Stri
     Ok(project(&body))
 }
 
-/// Pull `{name, hosts, phantoms}` out of the registry `connections` array.
+/// Pull `{name, hosts, phantoms, setup}` out of the registry `connections`
+/// array, resolving each connection's `setup` hint from the `services` array.
 fn project(body: &Value) -> Vec<ConnRow> {
     let mut out = Vec::new();
+    // service id -> its `setup` hint (present only on the per-vault registry).
+    let setup_by_service: std::collections::HashMap<&str, String> = body
+        .get("services")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let id = s.get("id").and_then(|v| v.as_str())?;
+                    let setup = s.get("setup").and_then(|v| v.as_str())?;
+                    Some((id, setup.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let Some(arr) = body.get("connections").and_then(|v| v.as_array()) else {
         return out;
     };
@@ -82,10 +103,15 @@ fn project(body: &Value) -> Vec<ConnRow> {
                     .collect()
             })
             .unwrap_or_default();
+        let setup = s
+            .get("service")
+            .and_then(|v| v.as_str())
+            .and_then(|svc| setup_by_service.get(svc).cloned());
         out.push(ConnRow {
             name,
             hosts,
             phantoms,
+            setup,
         });
     }
     out

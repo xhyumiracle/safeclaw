@@ -116,7 +116,7 @@ pub async fn run_ls(args: ConnectionLsArgs) -> Result<(), String> {
     if args.json {
         let arr: Vec<Value> = conns
             .iter()
-            .map(|c| serde_json::json!({ "id": c.name, "hosts": c.hosts, "phantoms": c.phantoms }))
+            .map(|c| serde_json::json!({ "id": c.name, "hosts": c.hosts, "phantoms": c.phantoms, "setup": c.setup }))
             .collect();
         println!(
             "{}",

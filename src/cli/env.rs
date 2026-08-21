@@ -18,11 +18,11 @@
 //! The pin's one legitimate minter is `sc run`, which injects it into the
 //! child it launches.
 //!
-//! The AGENT's config (routing var PLUS its per-agent `SAFECLAW_API_KEY`) is
-//! minted whole by `sc agent add`, not here: agent ≡ api-key, account-level,
-//! so each agent holds its own key and `sc env` (device scope) must never emit
-//! one — that would collapse every agent on the device to one key. See
-//! [[project_vault_agent_architecture_2026_06_25]] / CREDENTIAL_BROKER.md §14.
+//! The AGENT's config (routing var PLUS its per-agent identity path
+//! `SAFECLAW_AGENT_IDENTITY`) is minted whole by `sc agent add`, not here: each
+//! agent holds its own AIK identity file, so `sc env` (device scope) must never
+//! emit an agent identity — that would collapse every agent on the device to one.
+//! See [[project_vault_agent_architecture_2026_06_25]] / CREDENTIAL_BROKER.md §14.
 
 use crate::cli::active::{device_daemon_host, load as load_config};
 use crate::config::PROXY_PORT;

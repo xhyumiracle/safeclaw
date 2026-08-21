@@ -72,10 +72,10 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
         eprintln!("Nothing was paired; cleared any stale local config.");
     }
     eprintln!();
-    eprintln!("  Your agent's SAFECLAW_* env (BROKER_URL / VAULT_ID / API_KEY) may");
-    eprintln!("  still be persisted in its .env — it's stale now; remove it. Agent keys stay");
+    eprintln!("  Your agent's SAFECLAW_* env (BROKER_URL / AGENT_IDENTITY) may");
+    eprintln!("  still be persisted in its .env — it's stale now; remove it. Agents stay");
     eprintln!("  valid account-wide (logout revokes only this DEVICE) — revoke unused ones");
-    eprintln!("  with `sc agent rm`. Re-pair with `sc login --pair-token <token>`.");
+    eprintln!("  with `sc agent rm`. Re-pair with `sc login`.");
     Ok(())
 }
 

@@ -100,9 +100,21 @@ pub async fn pull_on_start(state_dir: &Path) {
         tracing::debug!("cloud sync: no device-key (unpaired); skipping pull");
         return;
     };
-    // All vaults this device knows (active ∪ known_vaults) are kept online —
-    // the agent addresses any of them by vid, no "switch vault" needed (1P
-    // model). See [[project_vault_agent_architecture_2026_06_25]].
+    // Auto-discover every vault this ACCOUNT owns, not just the ones a manual
+    // `sc vault use` recorded (design/vault-addressing.md). Persist newly found
+    // ids into the known-vaults catalog BEFORE computing the pull set below, so
+    // the daemon serves a console-created vault with no `sc vault use`. Blobs are
+    // passkey-sealed, so syncing every account vault leaks nothing; unlock stays
+    // passkey-gated. Best-effort: an old backend or a network blip just leaves
+    // the locally-known set as it was.
+    let discovered = discover_account_vault_ids(cloud, &dk).await;
+    let fresh = remember_discovered(&cfg, &discovered);
+    if !fresh.is_empty() {
+        tracing::info!(count = fresh.len(), "cloud sync: adopted account vaults via discovery");
+    }
+    // All vaults this device knows (active ∪ known_vaults ∪ discovered) are kept
+    // online — the agent addresses any of them by vid, no "switch vault" needed
+    // (1P model). See [[project_vault_agent_architecture_2026_06_25]].
     let ids = synced_vault_ids(&cfg);
     if ids.is_empty() {
         tracing::debug!("cloud sync: no vaults to pull");
@@ -365,6 +377,130 @@ fn synced_vault_ids(cfg: &crate::cli::active::CliConfig) -> Vec<String> {
     ids
 }
 
+/// GET the account's vault ids from the cloud — the same `/api/vault/vaults` the
+/// console lists, now device-key authable. The daemon keeps EVERY account vault
+/// synced (1P per-item model), so a vault created in the browser reaches this
+/// device with no `sc vault use`. Best-effort: any failure returns an empty list
+/// and the caller leaves the locally-known set untouched. This never REMOVES a
+/// vault; deletion is the tombstone path (`PullOutcome::Deleted`).
+async fn discover_account_vault_ids(cloud: &str, dk: &str) -> Vec<String> {
+    let cloud = cloud.trim_end_matches('/');
+    let url = format!("{}/api/vault/vaults", cloud);
+    let Ok(client) = crate::cli::egress_proxy::client(Duration::from_secs(15)) else {
+        return Vec::new();
+    };
+    let resp = match client
+        .get(&url)
+        .bearer_auth(dk)
+        .dik_pop("GET", &url, &[])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("vault discovery: reach {} failed: {}", cloud, e);
+            return Vec::new();
+        }
+    };
+    if !resp.status().is_success() {
+        // 404 = a backend that predates device-key vault listing; anything else
+        // is transient. Either way, keep what we already know.
+        tracing::debug!(status = %resp.status(), "vault discovery: non-success (old backend?)");
+        return Vec::new();
+    }
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!("vault discovery: parse failed: {}", e);
+            return Vec::new();
+        }
+    };
+    body.get("vaults")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persist discovered vault ids into the known-vaults catalog under this device's
+/// local daemon URL, so `synced_vault_ids` / `sc vault ls` include them. Returns
+/// the ids that were NOT already known (the ones freshly adopted this call), so
+/// the caller can spawn a watcher for each new one. Setting a DEFAULT is a
+/// separate act (`sc vault use`); discovery only makes vaults AVAILABLE.
+fn remember_discovered(cfg: &crate::cli::active::CliConfig, ids: &[String]) -> Vec<String> {
+    let daemon = cfg
+        .daemon
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT));
+    let known: std::collections::HashSet<String> = crate::cli::active::known_vaults()
+        .into_iter()
+        .map(|kv| kv.vault)
+        .collect();
+    let mut fresh = Vec::new();
+    for id in ids {
+        if known.contains(id) {
+            continue;
+        }
+        match crate::cli::active::remember(&daemon, id) {
+            Ok(()) => fresh.push(id.clone()),
+            Err(e) => tracing::debug!(vault = %id, "vault discovery: remember failed: {}", e),
+        }
+    }
+    fresh
+}
+
+/// Live auto-discovery: adopt an account vault created AFTER the daemon started
+/// (e.g. in the console) without a restart. Re-lists the account's vaults on an
+/// interval; a genuinely new one is persisted, pulled once so it serves right
+/// away, then handed to a steady `watch_loop`. That watcher rides long-poll
+/// (its cell is not in the SSE dispatcher's fixed set); the next daemon restart
+/// folds it into the SSE stream. Spawned unconditionally for a paired daemon, so
+/// even a device with zero vaults today adopts its first console-created one.
+async fn discovery_reconcile_loop(
+    state: Arc<AppState>,
+    cloud: String,
+    dk: String,
+    mut watched: std::collections::HashSet<String>,
+) {
+    /// Cadence for spotting a newly created vault. Fast path for existing vaults
+    /// is still the per-vault watcher; this only governs first adoption latency.
+    const INTERVAL: Duration = Duration::from_secs(120);
+    // A private health channel pinned Down: dynamically-added vaults run on
+    // long-poll (Fallback), and holding the sender here keeps every spawned
+    // watcher's `health_rx.changed()` parked instead of erroring on a dropped
+    // sender.
+    let (_health_tx, health_rx) = tokio::sync::watch::channel(StreamHealth::Down);
+    loop {
+        tokio::time::sleep(INTERVAL).await;
+        let cfg = match active::load() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let discovered = discover_account_vault_ids(&cloud, &dk).await;
+        let fresh = remember_discovered(&cfg, &discovered);
+        for vid in fresh {
+            if !watched.insert(vid.clone()) {
+                continue;
+            }
+            let st = state.clone();
+            let cl = cloud.clone();
+            let dkk = dk.clone();
+            let hr = health_rx.clone();
+            tracing::info!(vault = %vid, "cloud sync: live-adopted a new account vault (long-poll until restart)");
+            tokio::spawn(async move {
+                let cell = Arc::new(WakeCell::new());
+                // Pull once so the vault serves immediately, then keep it current.
+                let _ = pull(&st.config.state_dir, &cl, &vid, &dkk).await;
+                watch_loop(st, vid, cl, dkk, cell, hr).await;
+            });
+        }
+    }
+}
+
 /// Spawn one `watch_loop` per synced vault (active ∪ known_vaults), so every
 /// vault is kept live, not just the active one. Gated like the rest of sync —
 /// no-op for a local-only/unpaired daemon. Vaults added after start are picked
@@ -414,8 +550,20 @@ pub fn spawn_watchers(state: Arc<AppState>) {
         ));
     }
     if !cells.is_empty() {
-        tokio::spawn(crate::sync_stream::dispatcher(cloud, dk, cells, health_tx));
+        tokio::spawn(crate::sync_stream::dispatcher(
+            cloud.clone(),
+            dk.clone(),
+            cells,
+            health_tx,
+        ));
     }
+    // Live auto-discovery (design/vault-addressing.md): adopt account vaults
+    // created after startup with no restart. Runs even with zero vaults today, so
+    // a freshly-paired device picks up its first console-created vault. Seeded
+    // with the vaults already watched above so it only spawns for NEW ones.
+    let watched: std::collections::HashSet<String> =
+        synced_vault_ids(&cfg).into_iter().collect();
+    tokio::spawn(discovery_reconcile_loop(state, cloud, dk, watched));
 }
 
 /// Pull the vault's sealed blob (version-gated by the `.blob_version` sidecar).

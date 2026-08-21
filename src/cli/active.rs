@@ -297,6 +297,16 @@ pub fn forget_vault(vault: &str) -> Result<bool, String> {
     Ok(removed_known || cleared_active)
 }
 
+/// Dedupe-add a vault to the known-vaults catalog WITHOUT changing the active
+/// selection. The daemon's auto-discovery path calls this for every vault the
+/// account owns (design/vault-addressing.md), so `sc vault ls` and the sync
+/// watcher pick them up with no manual `sc vault use`. Choosing a DEFAULT stays
+/// a separate, explicit act (`put_active`) — discovery never writes `config.vault`,
+/// so an explicit default stays put when new vaults appear.
+pub fn remember(daemon: &str, vault: &str) -> Result<(), String> {
+    remember_vault(daemon, vault)
+}
+
 /// Set the active vault and dedupe-add it to the catalog.
 pub fn put_active(daemon: &str, vault: &str) -> Result<PathBuf, String> {
     remember_vault(daemon, vault)?;
@@ -307,20 +317,21 @@ pub fn put_active(daemon: &str, vault: &str) -> Result<PathBuf, String> {
     save(&cfg)
 }
 
-/// Set the active vault to a LOCAL daemon URL AND record the cloud pro-backend
-/// for sealed-blob sync. Used by `sc login`: the agent talks to the local
-/// `daemon`, while the daemon syncs against the cloud (`cloud_backend`).
-/// Dedupe-adds to the catalog like `put_active`.
-pub fn put_active_with_cloud(
+/// Record the cloud pairing coordinates (`sc login`) WITHOUT choosing a vault.
+/// Device pairing is account-level and vault-agnostic (design/vault-addressing.md):
+/// the daemon auto-discovers the account's vaults on start, a single one
+/// auto-selects, and a multi-vault account is resolved by the user (`sc vault
+/// use`) or per command (`--vault`). The agent talks to the local `daemon`; the
+/// daemon syncs against the cloud (`cloud_backend`). Leaves `config.vault` as it
+/// was: a fresh machine has none (auto-select decides), and a re-pair keeps an
+/// explicit default the user already set.
+pub fn put_cloud_coords(
     daemon: &str,
-    vault: &str,
     cloud_backend: &str,
     frontend_origin: Option<&str>,
 ) -> Result<PathBuf, String> {
-    remember_vault(daemon, vault)?;
     let mut cfg = load().unwrap_or_default();
     cfg.daemon = Some(daemon.to_string());
-    cfg.vault = Some(vault.to_string());
     cfg.vault_deleted_upstream = None;
     cfg.cloud_backend = Some(cloud_backend.to_string());
     cfg.frontend_origin = frontend_origin

@@ -1,27 +1,27 @@
 # Agents: attribution without possession
 
 To SafeClaw, an agent is an **identity**, not a trust decision. Each agent
-gets its own API key; what any agent may *do* is decided elsewhere, by
+gets its own keypair; what any agent may *do* is decided elsewhere, by
 [policy](approvals.md), per action, at use time.
 
 ## The identity
 
 `sc agent add <name>` (or the console's install prompt) mints one env
-block:
+block of two non-secret values:
 
 | Var | Meaning |
 |---|---|
 | `SAFECLAW_BROKER_URL` | the local broker, e.g. `http://127.0.0.1:23294` |
-| `SAFECLAW_API_KEY` | this agent's bearer identity |
+| `SAFECLAW_AGENT_IDENTITY` | path to the agent's identity file (its keypair). Not a secret; `sc run` signs a fresh proof with it per request, and no key is stored or sent. |
 
 The vault is not part of the env: each request names one in its URL
 (`/v/<vault>/…`), and `sc run` binds one per launched command
 (`sc run --vault <id> -- <cmd>` to pick). `sc vault ls` lists ids (`*` = default).
 
-One key per agent keeps the audit trail attributable: every brokered request
-and every approval you grant is tied to a named agent, so "which agent did
-what, when, with which credential" is a query, not a reconstruction. Don't
-share a key across agents; don't re-mint when the env already exists.
+One identity per agent keeps the audit trail attributable: every brokered
+request and every approval you grant is tied to a named agent, so "which agent
+did what, when, with which credential" is a query, not a reconstruction. Keep
+one identity file per agent, and don't re-mint when the env already exists.
 
 ## What an agent can do
 

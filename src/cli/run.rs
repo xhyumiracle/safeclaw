@@ -32,14 +32,16 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     preflight(&ca, &control).await?;
 
     let proxy_url = agent_proxy_url(&vid);
-    // Friendly hint (user's request): a human shell has no agent identity, so
-    // credential substitution will 407. Say so once, up front — non-credential
-    // traffic is unaffected, so this is a note, not an error.
-    if !args.export_env && !agent_has_key() {
+    // Friendly hint (user's request): a shell with NEITHER an AIK identity nor a
+    // legacy api-key can't authenticate credential substitution, so it will 407.
+    // Say so once, up front. An AIK agent (SAFECLAW_AGENT_IDENTITY) takes the shim
+    // path below and needs no key, so the note must recognize it too, or a keyless
+    // agent that is fully set up gets a misleading warning.
+    if !args.export_env && !agent_has_key() && load_agent_signer().is_none() {
         eprintln!(
-            "note: no SafeClaw agent key in this shell — credential substitution will 407. \
-             Load your agent env (the file holding SAFECLAW_API_KEY) and retry; this is not a \
-             daemon or port problem. Non-credential traffic is unaffected."
+            "note: this shell carries no SafeClaw agent identity, so credential substitution \
+             will 407. Load your agent env (SAFECLAW_AGENT_IDENTITY, or a legacy SAFECLAW_API_KEY) \
+             and retry. This is not a daemon or port problem; non-credential traffic is unaffected."
         );
     }
 

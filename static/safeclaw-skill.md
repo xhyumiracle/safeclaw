@@ -1,99 +1,95 @@
 # SafeClaw
 
-SafeClaw is a passkey-gated credential broker. You never hold the real secret:
-each connected service gives you a **phantom**: a placeholder like
-`__sc__github__`. Put the phantom where the credential belongs (an env var a tool
-reads, a request header, a config file) and run that command through `sc run --`;
-SafeClaw swaps the phantom for the real value on the way out, only toward that
-connection's own `hosts`. The user approves anything sensitive with a passkey tap.
+SafeClaw is a passkey-gated credential broker. You never hold a real secret. Each
+connected service gives you a **phantom**, a placeholder like `__sc__github__`. Put
+the phantom where the credential belongs (an env var a tool reads, a request
+header, a config file) and run that command through `sc run --`. SafeClaw swaps the
+phantom for the real value at egress, only toward that connection's own `hosts`.
+Anything sensitive waits for the user to approve with a passkey tap.
 
-Any tool works.
-
-Only traffic you deliberately route through `sc run` is touched; everything else
-goes straight out untouched. A phantom sent unrouted just reaches the upstream as
-a literal string (a clean 401), never a leak.
+Any tool works. Only traffic you route through `sc run` is touched; everything else
+goes straight out. A phantom that reaches an upstream unrouted stays a literal
+string, so the worst case is a clean 401.
 
 ## Your config
 
-Your install prompt set these; use each verbatim, never construct one.
+Two non-secret values arrive in your agent env. Use each verbatim.
 
-- **`$SAFECLAW_BROKER_URL`**: SafeClaw's broker URL, e.g. `http://127.0.0.1:23294`.
-- **`$SAFECLAW_API_KEY`**: your identity; send `Authorization: Bearer
-  $SAFECLAW_API_KEY` on every request below.
+- **`$SAFECLAW_BROKER_URL`**: the local broker, e.g. `http://127.0.0.1:23294`.
+- **`$SAFECLAW_AGENT_IDENTITY`**: the path to your identity file. `sc run` signs a
+  fresh proof with it on each request. It is a path, not a secret, so the whole env
+  block is safe to display.
 
-If `$SAFECLAW_API_KEY` isn't set, load your agent env file first (its path is in
-your always-loaded instructions); don't re-run `sc agent add`, which mints a
-duplicate.
+Neither value names a vault. `sc run` binds one per command (see "Which vault").
 
-Make sure the daemon is up before the first call (idempotent):
+If `$SAFECLAW_AGENT_IDENTITY` is unset, load your agent env file first; its path is
+in your always-loaded instructions. Run `sc agent add` once per agent; a second run
+mints a duplicate.
+
+Bring the daemon up before the first call (idempotent):
 
 ```bash
 curl -s -o /dev/null --connect-timeout 1 "$SAFECLAW_BROKER_URL/health" || sc up
 ```
 
-Check `sc help` anytime for more.
+`sc help` lists the rest.
 
 ## Discover what's available
 
-`<vault>` is a vault id: `$SAFECLAW_VAULT_ID` if set, else the `default`
-entry in `sc vault ls --json`. You may use a different vault per request.
-
-```
-GET $SAFECLAW_BROKER_URL/v/<vault>/registry
-Authorization: Bearer $SAFECLAW_API_KEY
-```
-
-Filter to save context: `?view=summary` and/or `?ids=a,b`.
+`sc connection ls` lists the connections you can use right now, each with its hosts
+and ready-made phantoms. Copy a phantom exactly as shown. Add `--json` for a
+machine-readable list that also carries each connection's `setup` hint:
 
 ```jsonc
-{
-  "version": 4,
-  "locked": false,
-  "console_url": "https://.../vault/<your-vault-id>",  // deep link to this vault
-  "vault_entries": ["OPENAI_API_KEY", "GMAIL_REFRESH_TOKEN"],  // null when locked
-  "services": [       // the catalog: what SafeClaw supports
-    { "id": "github", "name": "GitHub", "category": "integration",
-      "hosts": ["api.github.com", "github.com"], "secrets": ["GITHUB_TOKEN"] }
-  ],
-  "connections": [    // what's usable now
-    { "id": "github", "service": "github", "connected": true,
-      "hosts": ["api.github.com", "github.com"],
-      "phantoms": ["__sc__github__"] }
-  ]
-}
+[
+  { "id": "github", "hosts": ["api.github.com"],
+    "phantoms": ["__sc__github__"], "setup": null }
+]
 ```
 
-Copy a phantom verbatim from a `connected: true` connection; never build one.
-CLI equivalent: `sc connection ls` lists connections, their hosts and phantoms.
+`sc status` shows whether the vault is locked and prints its console URL.
+`sc registry` prints the catalog of services SafeClaw supports.
 
-If `locked: true`, run `sc up`: it unlocks the vault and prints an approval
-link; surface that link (the user taps their passkey) and retry.
+When the vault is locked, run `sc up`. It unlocks the vault and prints an approval
+link. Give that link to the user, who taps their passkey, then retry.
 
-If the service you want has no `connected: true` connection, the user must add
-its credential. Hand them a link; don't run commands or walk them through
-provider menus:
-
-```
-Connect <service name>: open <console_url>#connections, add your credential
-there, approve with your passkey.
-```
-
-You never see or handle it; after they confirm, re-GET the registry. Where to
-*get* the credential is the provider's side; mention it only if asked.
-
-Headless fallback, the user at the daemon's own terminal (passkey-gated):
+To use a service that has no connection yet, the user adds its credential in the
+console. Give them the link (the console URL is in `sc status`) and let them finish
+there:
 
 ```
-sc set STRIPE_KEY --host api.stripe.com        # one secret + its host anchor
+Connect <service name>: open <console_url>#connections, add your credential,
+approve with your passkey.
+```
+
+The credential stays with the user. After they confirm, run `sc connection ls`
+again. Where they obtain the credential is the provider's concern; mention it only
+if asked.
+
+When the user is at the daemon's own terminal, they can add one there
+(passkey-gated):
+
+```
+sc set STRIPE_KEY --host api.stripe.com
 sc connect myapi --host api.example.com --secret API_TOKEN=<value>
 ```
 
-Never enter a credential yourself; never echo one back.
+Leave credential entry to the user, and keep any value you happen to see out of
+your replies.
+
+### Which vault
+
+`sc run` targets your default vault. `sc vault ls` lists your vaults, with `*`
+marking the default; `sc run --vault <id> -- <cmd>` targets a specific one.
+
+A vault is a security boundary, so the right one matters. With one vault, use it.
+When the choice is ambiguous, meaning several vaults with no default and none named
+for the task, ask the user which to use. Offer `sc vault use <id>` to set a default
+so the next task runs without asking.
 
 ## Using a connection
 
-Put the phantom where the credential belongs and run the command under
-`sc run --`:
+Put the phantom where the credential belongs and run under `sc run --`:
 
 ```bash
 sc run -- curl https://api.stripe.com/v1/charges \
@@ -101,46 +97,39 @@ sc run -- curl https://api.stripe.com/v1/charges \
 GITHUB_TOKEN=__sc__github__ sc run -- gh pr list
 ```
 
-Multi-account is by phantom VALUE, not env-var name: switch `__sc__github__` →
-`__sc__github_work__`. One request carries one connection's phantom(s).
+Multi-account switches by phantom VALUE, not env-var name: use `__sc__github__` or
+`__sc__github_work__`. One request carries one connection's phantoms.
 
-`sc run -- <cmd>` uses the default vault; `sc run --vault <id> -- <cmd>` picks
-another. Phantoms resolve only against that command's vault.
-
-An auth failure (401/403) on a brokered call is usually routing, not the secret:
-confirm the command actually ran under `sc run --` with the phantom in the
-request before suspecting the credential. Where the phantom goes for a specific
-tool (a request header, an env var, a URL) can carry service nuance; check that
-connection's `setup` hint.
+Phantoms resolve only against that command's vault. On a 401 or 403 from a brokered
+call, first confirm the command ran under `sc run --` with the phantom in the
+request; routing is the usual cause. Where a phantom belongs for a given tool (a
+header, an env var, a URL) can carry service nuance, so check that connection's
+`setup` hint.
 
 ## Configuring a local tool (`setup` hints)
 
-Some services need a local tool (a CLI, an SDK) run through SafeClaw so its
-traffic is brokered. Such a service's `/registry` entry carries a **`setup`**
-hint: a goal plus ready-to-run steps. Tell the user what you're configuring and
-why, then apply it (adapting to their real config). The `setup` hint is the
-source of truth.
+Some services run a local tool (a CLI, an SDK) through SafeClaw so its traffic is
+brokered. Such a connection carries a **`setup`** hint in `sc connection ls --json`:
+a goal plus ready-to-run steps. Tell the user what you are configuring and why, then
+apply the steps, adapting them to their real config. The `setup` hint is the source
+of truth.
 
 ## Approvals
 
-Some credentials are policy-gated: the first time you route a request that needs
-one, SafeClaw fails the command and its error output carries an approval line:
+Some credentials are policy-gated. The first time you route a request that needs one,
+SafeClaw stops the command and its error output carries an approval line:
 
 ```
 SafeClaw approval needed to use this credential.
 Approve with your passkey:
   https://.../grant/<op_id>
-To wait: sc op wait <op_id>   (background it; its exit is the signal)
+To wait: sc op wait <op_id>
 Then re-run the same command.
 ```
 
-Surface that link on its own line; the user's browser tap is the signal,
-don't ask them to type "done". Background the wait (exit 0 = approved), then
-re-run the exact same command; the approval is cached. A destination host
-you haven't used before is a one-time *permanent grant*; same flow.
+Give that link to the user on its own line. Their browser tap is the signal, so
+background `sc op wait <op_id>` (exit 0 means approved), then re-run the exact same
+command; the approval is cached. A destination host you have not used before takes
+the same one-time grant.
 
-No `sc` on your PATH? Same ceremony: GET the approval JSON's absolute
-`poll_url` (with `Authorization: Bearer $SAFECLAW_API_KEY`) every few seconds
-as one background command until `status` is `ok`, then re-run. Can't run
-background commands at all? Ask the user to reply once they've tapped.
-The JSON's `expires_at` bounds how long the op stays approvable.
+When `sc` is not on your PATH, ask the user to reply once they have tapped the link.

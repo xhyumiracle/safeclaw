@@ -196,20 +196,26 @@ pub async fn run(_args: CommonArgs) -> Result<(), String> {
         Err(e) => report.push(Mark::Warn, format!("vault probe: {}", e)),
     }
 
-    // SAFECLAW_API_KEY (informational): the AGENT's identity. The proxy
-    // verifies it before any phantom substitution (§8) — localhost included —
-    // so an agent's env must carry one (minted by `sc agent add`); a human
-    // shell without it just can't broker credentials, everything else works.
-    match std::env::var("SAFECLAW_API_KEY") {
-        Ok(v) if !v.is_empty() => report.push(
-            Mark::Ok,
-            format!("$SAFECLAW_API_KEY: set ({} chars)", v.len()),
-        ),
-        _ => report.push(
-            Mark::Ok,
-            "$SAFECLAW_API_KEY: unset (fine for a human shell — credential \
-             substitution needs an agent env, minted by `sc agent add`)",
-        ),
+    // Agent identity (informational): a current agent authenticates by its AIK
+    // (`SAFECLAW_AGENT_IDENTITY`, a path to an identity file `sc run` signs with);
+    // a legacy agent may instead carry `SAFECLAW_API_KEY`. Either one lets this
+    // shell broker credentials, and a human shell needs neither. Report whichever
+    // is present so a fully set-up keyless agent is never told it has no agent env.
+    match std::env::var("SAFECLAW_AGENT_IDENTITY") {
+        Ok(v) if !v.is_empty() => {
+            report.push(Mark::Ok, format!("$SAFECLAW_AGENT_IDENTITY: set ({})", v))
+        }
+        _ => match std::env::var("SAFECLAW_API_KEY") {
+            Ok(v) if !v.is_empty() => report.push(
+                Mark::Ok,
+                format!("$SAFECLAW_API_KEY: set ({} chars, legacy)", v.len()),
+            ),
+            _ => report.push(
+                Mark::Ok,
+                "agent identity: none in this shell (fine for a human shell; an \
+                 agent gets one from `sc agent add`)",
+            ),
+        },
     }
 
     // Egress proxy (informational): the one upstream the daemon + this CLI use to
