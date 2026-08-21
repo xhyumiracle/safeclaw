@@ -628,3 +628,57 @@ Supersedes the "in-place AIK/DIK upgrade" reading of tasks #72/#75/#81; those sh
 - **Verdict:** optimal for the pre-launch window; **fully settled, no open questions** (§13.5 resolved
   2026-08-20). Net effect on the codebase is *negative* lines (delete 5 compat rows) — the tell that
   the direction is right.
+
+## 14. Agent admission = browser-confirm ceremony (LOCKED 2026-08-21, user-approved · Option A)
+
+**The gap (user-caught).** `sc agent add` on a paired device SILENTLY registers a new agent to the
+account roster — `handleCreateAgent` (`vault-routes.mjs:1458`) auths on `agentMgmtAccount` (session OR
+**device-key**) and just `generateApiKey`s it. No owner browser-confirm. That contradicts §12.1's
+principle ("every new agent, even via a trusted device, goes through browser pairing confirmation" —
+the ONE primitive). The Agents-tab toggle is only the per-VAULT access control, not the ADMISSION
+authorization. Not a hard hole today (an un-toggled agent is inert), but the model is wrong and
+sharpens to a hole under any auto-authorize (§11.4).
+
+**Why the original "elegant handoff" (§12 build) got this wrong.** It CONFLATED two layers that are
+crypto-distinct:
+- **Admission** (account roster: the agent `api_keys` row + registered AIK pubkey) = server-side,
+  needs **NO K**.
+- **Vault access** (E2E UIK-signed `aux:agent/<ag_id>`) = needs **K** (the Agents-tab toggle).
+Believing admission also needed K (which /pair lacks), it shortcut admission to the silent device-key
+path. **Splitting them is the fix:** /pair does admission (session-auth, no K); the toggle keeps vault
+authz (K). This also retires the "can't sign at /pair" objection that drove the handoff.
+
+**Option A (chosen) — the ONE primitive: `sc agent add` runs the device-flow /pair ceremony.**
+1. `sc agent add <name>` mints the AIK (as now) → instead of the silent `POST /api/vault/agents`,
+   initiates `POST /api/pair/authorize` with `{principal:'agent', agent_name, agent_pubkey}` → gets
+   device_code + user_code + /pair link → prints code+link → polls `/api/pair/poll` (like `sc login`).
+2. The agent is **pending** (NOT admitted; not in the active roster; not vault-toggle-able).
+3. Owner opens /pair → the page renders **"Authorize agent `<name>`"** (principal=agent, vs "Connect
+   device") → approves. **Session-auth, NO passkey/K** (admission is a roster entry).
+4. Approve → backend admits it (creates the agent `api_keys` row via `generateApiKey` with the AIK) →
+   poll returns → `sc agent add` completes (prints env).
+5. Admitted agent now appears in Agents tab → owner toggles vault access (K-signed, **unchanged**).
+
+Two clean gates: **admission = browser-confirm (session)**, **vault access = toggle (K)**. "Only an
+admitted agent reaches the vault toggle" — the user's requirement.
+
+**Reuse (extend, not rebuild):** `/api/pair/*` + `/pair` page + poll + `device_pairings` table +
+`sc login`'s device_flow_pair scaffolding all carry over; add a `principal` discriminator (device |
+agent) end-to-end.
+
+**Build list:**
+1. **BE:** `/api/pair/authorize` accepts `principal:'agent'` (+ agent_name, agent_pubkey) → pending row
+   (reuse `device_pairings` + a `principal` column, or a sibling). `/api/pair/lookup` returns principal
+   + name so /pair renders the right copy. `/api/pair/approve` for an agent = session-auth admit:
+   `generateApiKey({tier:'agent', sig_pub, identity_id})`, return token to the poller. `/api/pair/poll`
+   returns the agent token on approval. **Retire/gate** `handleCreateAgent`'s silent path.
+2. **Core:** `sc agent add` → mint AIK → `/api/pair/authorize (principal=agent)` → print code+link →
+   poll → on approved, persist AIK + print env. (Mirrors `device_flow_pair`.)
+3. **FE:** `/pair` handles principal=agent (title "Authorize agent <name>", approve = admit, no
+   vault-pick required for admission). Agents tab shows only ADMITTED agents (pending ones aren't
+   toggle-able).
+
+**Locked decisions:** admission = session-auth (no K); vault access = K-toggle (unchanged); agent uses
+the SAME /pair ceremony as device (ONE primitive); v1 may confirm each principal separately (combined
+device+first-agent multi-principal approval page = later nicety); NEVER auto-admit (retire §11.4
+auto-authorize). **Non-goal:** admission granting vault access automatically (strictly two steps).
