@@ -75,6 +75,15 @@ pub const DS_DELEGATION: &[u8] = b"safeclaw/v1/delegation-event";
 /// [`root_succession_input`].
 pub const DS_ROOT_SUCCESSION: &[u8] = b"safeclaw/v1/root-succession";
 
+/// An owner-signed account principal-ledger event (§15,
+/// design/agent-device-identity-mtls.md): the account owner (UIK) ADMITs or
+/// REVOKEs an account-scoped principal (a device `dev_…` or an agent `ag_…`). The
+/// ACCOUNT-level analog of [`DS_DELEGATION`] (which is per-vault): the anchor is
+/// the account's own owner-UIK (the account id self-certifies it,
+/// `derive_id(User, uik_pub) == account_id`), so a daemon verifies the ledger
+/// against the UIK it already learned at pairing. See [`principal_event_input`].
+pub const DS_PRINCIPAL_EVENT: &[u8] = b"safeclaw/v1/principal-event";
+
 /// UIK lineage succession certificate (old UIK signs the new UIK). See
 /// [`succession_input`].
 pub const DS_SUCCESSION: &[u8] = b"safeclaw/v1/uik-succession";
@@ -585,6 +594,46 @@ pub fn delegation_event_input(
     out
 }
 
+/// Signing input for an owner-signed **account principal-ledger event** (§15,
+/// design/agent-device-identity-mtls.md): the account owner ADMITs or REVOKEs an
+/// account-scoped principal (device / agent). The ACCOUNT-level counterpart of
+/// [`delegation_event_input`] — same shape (append-only, owner-signed, monotone
+/// `seq`), but anchored to the ACCOUNT's owner-UIK instead of a vault genesis
+/// root: devices/agents are account-scoped and must stay revocable even with 0
+/// vaults, so they cannot ride a per-vault anchor.
+///
+/// ```text
+/// lp(DS_PRINCIPAL_EVENT) ‖ lp(account_id) ‖ lp(op) ‖ lp(principal_id)
+///   ‖ u64_be(seq) ‖ lp(owner_id)
+/// ```
+///
+/// `op` ∈ {`"admit"`, `"revoke"`}. `principal_id` is the self-certifying `dev_…`/
+/// `ag_…` id, which already commits to the principal's pubkey — so the event binds
+/// the key WITHOUT carrying it (the principal presents its pubkey at connect time
+/// and the daemon checks `derive_id(kind, pubkey) == principal_id ∈` the folded
+/// ledger). `owner_id` is the signing account owner's `us_…`; the daemon honors
+/// the event iff `owner_id`'s UIK is the account anchor (`derive_id(User,
+/// uik_pub) == account_id`). `seq` is monotone (rollback guard): a daemon refuses
+/// a ledger that drops a higher-seq `revoke`. On a VERIFIED `revoke` of ITSELF, a
+/// device locks + wipes all local vaults + logs out (killing the bearer
+/// device-key alone only parks — delivery-before-hard-kill).
+pub fn principal_event_input(
+    account_id: &str,
+    op: &str,
+    principal_id: &str,
+    seq: u64,
+    owner_id: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_PRINCIPAL_EVENT);
+    push_lp(&mut out, account_id.as_bytes());
+    push_lp(&mut out, op.as_bytes());
+    push_lp(&mut out, principal_id.as_bytes());
+    out.extend_from_slice(&seq.to_be_bytes());
+    push_lp(&mut out, owner_id.as_bytes());
+    out
+}
+
 /// Signing input for a root-succession certificate — the CURRENT root signs the
 /// NEXT root's id + signing pubkey, so a daemon follows a short chain from the
 /// TOFU-pinned genesis root to the current root (creator transfer / offboard;
@@ -1087,5 +1136,50 @@ mod tests {
             root_succession_input("vault-7", "us_alice", "us_bob", &pub_key, 5),
             "role_epoch is bound"
         );
+    }
+
+    #[test]
+    fn principal_event_input_every_field_binds() {
+        let base = principal_event_input("us_acct", "admit", "dev_box", 5, "us_acct");
+        assert_ne!(base, principal_event_input("us_other", "admit", "dev_box", 5, "us_acct"), "account binds");
+        assert_ne!(base, principal_event_input("us_acct", "revoke", "dev_box", 5, "us_acct"), "op binds");
+        assert_ne!(base, principal_event_input("us_acct", "admit", "ag_bot", 5, "us_acct"), "principal binds");
+        assert_ne!(base, principal_event_input("us_acct", "admit", "dev_box", 6, "us_acct"), "seq binds");
+        assert_ne!(base, principal_event_input("us_acct", "admit", "dev_box", 5, "us_other"), "owner binds");
+        assert_eq!(base, principal_event_input("us_acct", "admit", "dev_box", 5, "us_acct"), "deterministic");
+    }
+
+    #[test]
+    fn principal_event_input_lp_ambiguity_resolved() {
+        // ("ab","c") vs ("a","bc") for (account, op) would collide without length
+        // prefixes; with them the inputs differ.
+        let a = principal_event_input("ab", "c", "d", 1, "s");
+        let b = principal_event_input("a", "bc", "d", 1, "s");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn principal_event_roundtrip_and_op_tamper() {
+        // The account owner signs an admit/revoke with their UIK; the daemon
+        // rebuilds the input and verifies against the account anchor (the UIK that
+        // self-certifies account_id). Replaying an `admit` signature as a `revoke`
+        // (or vice versa) must fail — op is bound.
+        let uik = SigningIdentity::from_seed(&UIK_SEED);
+        let acct = uik.user_id();
+        let input = principal_event_input(&acct, "revoke", "dev_box", 9, &acct);
+        let sig = uik.sign(&input);
+        assert!(verify(&uik.public_bytes(), &input, &sig), "own signature verifies");
+        let flipped = principal_event_input(&acct, "admit", "dev_box", 9, &acct);
+        assert!(!verify(&uik.public_bytes(), &flipped, &sig), "a swapped op must not verify");
+    }
+
+    #[test]
+    fn pinned_principal_event_input() {
+        // §15 account principal-ledger golden vector. FIXED inputs: account
+        // "us_acct", op "revoke", principal "dev_box", seq 7, owner "us_acct".
+        // The TS mirror (Phase 3) pins the SAME hex. Do NOT edit an expected value
+        // to make a test pass — find why Rust ↔ TS diverged.
+        let input = principal_event_input("us_acct", "revoke", "dev_box", 7, "us_acct");
+        assert_eq!(hex(&input), "0000001b73616665636c61772f76312f7072696e636970616c2d6576656e740000000775735f61636374000000067265766f6b65000000076465765f626f7800000000000000070000000775735f61636374");
     }
 }
