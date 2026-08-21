@@ -83,6 +83,31 @@ fn run_launchctl(args: &[&str], action: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The REAL liveness signal on macOS: something answers on the daemon's control
+/// port. A launchd job can be *loaded* yet its process *dead* — a clean exit
+/// under `KeepAlive{SuccessfulExit=false}` (which an `sc upgrade` bounce can
+/// leave behind) is not restarted, so `launchctl list` still lists the job while
+/// nothing listens. Reading "loaded" as "running" made `sc up` report success
+/// over a dead daemon; a cheap TCP connect is the honest check.
+#[cfg(target_os = "macos")]
+fn control_port_alive() -> bool {
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, crate::config::CONTROL_PORT));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok()
+}
+
+/// Poll the control port until it answers or we give up (~6s — the daemon binds
+/// in ~2-3s, plus a margin for a cold `pull_on_start`).
+#[cfg(target_os = "macos")]
+fn wait_for_control_port() -> bool {
+    for _ in 0..24 {
+        if control_port_alive() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
+}
+
 #[cfg(target_os = "linux")]
 pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     let bin =
@@ -335,26 +360,45 @@ pub fn run_ensure_running() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 pub fn run_ensure_running() -> Result<(), String> {
     let plist_path = launchd_plist_path()?;
-    let plist_arg = plist_path.to_string_lossy().to_string();
-    // Already loaded? `launchctl list <label>` exits 0 when registered, and
-    // KeepAlive keeps the process itself alive — treat loaded as running.
-    let loaded = ProcCommand::new("launchctl")
-        .args(["list", LAUNCHD_LABEL])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if loaded {
-        return Ok(());
-    }
     if !plist_path.exists() {
         return Err(
             "daemon is not running and no LaunchAgent is installed — run `sc up` once to install it"
                 .to_string(),
         );
     }
-    run_launchctl(&["load", "-w", &plist_arg], "load")?;
-    eprintln!("✓ daemon started");
-    Ok(())
+    // Liveness = the control port answers, NOT `launchctl list` (a job can be
+    // loaded-but-dead; see control_port_alive). If it's already up, done.
+    if control_port_alive() {
+        return Ok(());
+    }
+    let plist_arg = plist_path.to_string_lossy().to_string();
+    let loaded = ProcCommand::new("launchctl")
+        .args(["list", LAUNCHD_LABEL])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if loaded {
+        // Loaded but not listening (an `sc upgrade` bounce left it cleanly
+        // exited). `launchctl start` relaunches an on-demand/exited job by label
+        // (no domain string / uid needed); if the registration is wedged, fall
+        // back to a full unload+load.
+        if run_launchctl(&["start", LAUNCHD_LABEL], "start").is_err() {
+            let _ = run_launchctl(&["unload", &plist_arg], "unload");
+            run_launchctl(&["load", "-w", &plist_arg], "load")?;
+        }
+    } else {
+        run_launchctl(&["load", "-w", &plist_arg], "load")?;
+    }
+    if wait_for_control_port() {
+        eprintln!("✓ daemon started");
+        Ok(())
+    } else {
+        Err(
+            "started the LaunchAgent but the daemon isn't answering on the control port yet — \
+             check `sc logs` (it may still be starting)"
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -409,6 +453,14 @@ pub fn run_restart() -> Result<(), String> {
     // that drops the in-memory keys converges back to ready.
     let _ = run_launchctl(&["unload", &plist_arg], "unload");
     run_launchctl(&["load", "-w", &plist_arg], "load")?;
+    // `load -w` is supposed to RunAtLoad, but on some macOS the reload doesn't
+    // relaunch a job that just exited — the exact failure that stranded an
+    // `sc upgrade` on a dead daemon. Verify the control port and force a
+    // `launchctl start` if nothing came up, so the bounce can't silently no-op.
+    if !wait_for_control_port() {
+        let _ = run_launchctl(&["start", LAUNCHD_LABEL], "start");
+        let _ = wait_for_control_port();
+    }
     eprintln!("✓ daemon restarted");
     Ok(())
 }
