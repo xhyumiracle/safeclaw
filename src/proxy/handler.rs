@@ -382,12 +382,18 @@ impl BrokerHandler {
             // real fix: authorize it in the Console (Agents tab), then retry (the
             // grant syncs into the vault's agents table within seconds).
             if self.agent_id.is_some() {
-                return err_response(
-                    ScCode::AgentNotAuthorized,
-                    "this agent isn't authorized on this vault yet — authorize it in \
-                     the SafeClaw console (Agents tab), then retry",
-                )
-                .into();
+                // Deep-link straight to THIS vault's Agents tab so the agent can
+                // relay a one-click fix. The daemon owns both pieces (origin from
+                // its paired config + the vault_id it's enforcing on) and is the
+                // sole party in this LOCAL-enforcement path — the web isn't in the
+                // loop to supply the URL. Path segment matches the console's
+                // /vault/{id}/{tab} routing.
+                let hint = format!(
+                    "this agent isn't authorized on this vault yet — authorize it in the \
+                     SafeClaw console (Agents tab), then retry: {}/vault/{}/agents",
+                    self.state.config.origin, self.vid.as_deref().unwrap_or_default(),
+                );
+                return err_response(ScCode::AgentNotAuthorized, &hint).into();
             }
             let refreshed =
                 self.key.is_some() && crate::sync::refresh_agent_keys_on_miss(&self.state).await;
