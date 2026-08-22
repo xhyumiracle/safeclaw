@@ -122,9 +122,13 @@ Also DONE since: **Fix-0** (P4 anchor bug → P4 now actually verifies in prod) 
 (membership-loss active-wipe). Commits: backend `27bd766`; core `422bbf5` (Fix-0), `573931a`
 (leg B).
 LEFT:
-- **P5 leg A** (sign delete tombstone) — buildable, large (new `DS_VAULT_TOMBSTONE` ×3 langs +
-  FE delete ceremony + backend store/serve + core verify-before-destroy at 4 trust sites,
-  dual-path so unsigned deletes never brick; require-signed behind a flag = P6). NEXT.
+- **P5 leg A** (sign delete tombstone) — DONE. `DS_VAULT_TOMBSTONE` + `vault_tombstone_input`
+  ×3 langs (three-way parity, pinned vectors); FE delete ceremony signs it (PRF tap →
+  owner UIK); backend stores (handleBlobDelete) + serves it (migration LIVE on dev); core
+  `PerItemVault::tombstone_verified` + `tombstone_should_drop` gate at all 3 trust sites,
+  dual-path (flag OFF = unchanged legacy drop; flag ON = drop only on a verified owner
+  tombstone). Flag `SAFECLAW_REQUIRE_SIGNED_TOMBSTONE`, default OFF. Commits: core
+  `6e94c03`, backend `978e348`, frontend `bc483af`. All green.
 - **P6 cutover** — flip `SAFECLAW_PRINCIPAL_ENFORCE` on + mandatory /pair tap + retire §14
   session-admission + adversarial review. The FLIP is a launch decision (user-gated); the
   adversarial review + making the tap mandatory are buildable.
@@ -133,25 +137,25 @@ LEFT:
   land. All current work is isolated on the branch / additive-dormant, so the user's fresh
   e2e on rc.9 is unaffected.
 
-## Resume pointer → P5 leg A (signed vault-delete tombstone)
-1. **Primitive:** `identity.rs` add `DS_VAULT_TOMBSTONE = b"safeclaw/v1/vault-tombstone"` +
-   `vault_tombstone_input(vault_id, version) = lp(DS)‖lp(vault_id)‖u64(version)` + pinned test.
-   Mirror in `keyset-roles.mjs` (`vaultTombstoneInput` + boot self-check) + `uik-crypto.ts`
-   (`vaultTombstoneInput` + verify-uik-crypto vector). Three-way golden hex parity (like P1-P3).
-2. **FE:** the delete-vault ceremony (find it: `vault-grant.ts deleteVault` / the console delete
-   button) signs `vault_tombstone_input(vaultId, version)` with the owner UIK (reuse
-   `recoverOwnerUik` / the unlocked `cached` if present) and sends `{tombstone_sig, tombstone_signer}`
-   to `DELETE /api/vault/vaults/:id`.
-3. **Backend:** `handleDeleteVault` stores the sig+signer (new `vaults` columns or a JSON);
-   the blob GET tombstone branch (`vault-routes.mjs:2200`) serves them alongside `status:"deleted"`.
-4. **Core (the delicate part):** the 4 sites that act on `status:"deleted"` (`sync.rs`
-   `classify_pull_body:752`, `handle_blob_wake_body:2069`, `watch_loop` SSE arm `:1615`, +
-   `pull_on_start`/`sync_vault_now`/`recover_after_conflict`) VERIFY the tombstone sig against the
-   vault's fold-owner set (`fold_owner_set` / genesis root) BEFORE `drop_local_vault*`. DUAL-PATH:
-   signed+verified → drop; signed+bad → REJECT (park, warn — the forgery-defense win); unsigned →
-   drop (legacy) UNLESS a `require-signed` flag is on (default OFF → flip at P6). Never brick an
-   existing unsigned delete. Personal (fmt1/NoUik) vaults: the owner signs with their sole UIK
-   (creator anchor) — same path.
+## P1-P5 ALL BUILT + green (2026-08-22). Resume pointer → P6 cutover (LAUNCH-GATED).
+The whole §15 line is built additive/flag-gated across 3 repos; nothing enforces until the
+flags flip. P6 = the deliberate cutover, sequenced:
+1. **Ship what's built to dev + real e2e (do first):** push backend `dev` remote + Railway
+   `dev-backend` redeploy; merge core `feat/account-principal-ledger` → core `dev` + cut an rc;
+   push frontend `dev`. Then a fresh-account e2e with the flags STILL OFF (proves zero
+   regression: admit/revoke ledger populates, deletes still work, nothing wipes).
+2. **Adversarial review** (P6 deliverable, run 2026-08-22) — fix anything it surfaces BEFORE
+   flipping. [findings recorded below once the review returns.]
+3. **Flip enforcement (USER decision — destructive for real users):** set
+   `SAFECLAW_PRINCIPAL_ENFORCE=on` + `SAFECLAW_REQUIRE_SIGNED_TOMBSTONE=on` (env or
+   `CliConfig.principal_enforce`/`require_signed_tombstone`) on daemons, staged/census'd. Only
+   after e2e proves: verified device-revoke → wipe+logout; offboard → per-vault wipe; a forged
+   delete → parked.
+4. **Make the /pair admit tap mandatory + retire §14 session-only admission** (couple with the
+   flip — the ledger becomes the authority). Small FE change (drop the best-effort try/catch
+   around the admit sign) + backend: require a ledger `admit` alongside `/api/pair/approve`.
+5. **Deferred non-goals (unchanged):** deliberately-offline device; token-path (`sc login
+   --pair-token`) still vault-binds (new users don't hit it).
 
 ## (superseded) earlier resume pointer
 Next: **P5 per-vault drop hardening** (SSOT §15 "per-vault drop", agent-device-identity-mtls.md:725-736).
