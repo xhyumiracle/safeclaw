@@ -35,41 +35,82 @@ pub struct LocalDaemon {
 }
 
 pub async fn probe_local_daemon(control_root: &str) -> LocalDaemon {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(400))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => {
-            return LocalDaemon {
-                up: false,
-                version: None,
-                vault_count: None,
-            }
-        }
-    };
+    // Liveness must AGREE with the signal `sc up` gates on. `sc up` no-ops when a
+    // raw TCP connect to the control port succeeds (service::control_port_alive),
+    // so `sc status` has to call that same daemon "running" or the two verbs
+    // contradict each other: the fresh-Mac wedge where `sc up` returns done,
+    // `sc status` says not-running, and `sc serve` then fails address-in-use. A
+    // raw connect also refuses instantly when the daemon is truly down, so the
+    // common "down" verdict stays snappy.
+    if !control_port_tcp_alive(control_root).await {
+        return LocalDaemon {
+            up: false,
+            version: None,
+            vault_count: None,
+        };
+    }
+    // Socket is held ⇒ the daemon IS up. Enrich with version/vault_count via an
+    // HTTP /health round-trip, retried briefly: a cold multi-vault start can bind
+    // the port a beat before /health answers, and a proxy-leaked or slow shot must
+    // not erase the "running" verdict the TCP connect already proved.
     let health_url = format!("{}/health", control_root.trim_end_matches('/'));
-    let resp = match client.get(&health_url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => {
-            return LocalDaemon {
-                up: false,
-                version: None,
-                vault_count: None,
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(700))
+        .build()
+        .ok();
+    if let Some(client) = client.as_ref() {
+        for attempt in 0..3u8 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            if let Ok(r) = client.get(&health_url).send().await {
+                if r.status().is_success() {
+                    let body: serde_json::Value =
+                        r.json().await.unwrap_or(serde_json::Value::Null);
+                    let version = body
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let vault_count = body.get("vault_count").and_then(|v| v.as_u64());
+                    return LocalDaemon {
+                        up: true,
+                        version,
+                        vault_count,
+                    };
+                }
             }
         }
-    };
-    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-    let version = body
-        .get("version")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let vault_count = body.get("vault_count").and_then(|v| v.as_u64());
+    }
+    // Socket held but HTTP wouldn't complete (proxy leak / still mid-start). Still
+    // up: report running without version rather than contradict `sc up`.
     LocalDaemon {
         up: true,
-        version,
-        vault_count,
+        version: None,
+        vault_count: None,
     }
+}
+
+/// Raw TCP liveness on the control port — the SAME honest signal
+/// `service::control_port_alive` uses to gate `sc up`, so `sc status` can never
+/// disagree with it. Targets the same host:port the HTTP probe resolves
+/// (loopback in the normal case; an env-pinned host when a shell carries a
+/// `$SAFECLAW_BROKER_URL`). Fully async so it never blocks the runtime; ~600ms
+/// ceiling, but a down daemon refuses immediately.
+async fn control_port_tcp_alive(control_root: &str) -> bool {
+    let authority = control_root
+        .trim_end_matches('/')
+        .split("://")
+        .last()
+        .unwrap_or(control_root)
+        .to_string();
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(600),
+            tokio::net::TcpStream::connect(authority.as_str()),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {

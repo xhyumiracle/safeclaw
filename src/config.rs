@@ -475,11 +475,11 @@ pub struct AgentArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentSubcommand {
-    /// Mint a new agent identity and print its COMPLETE env (dotenv lines:
-    /// BROKER_URL / API_KEY, key shown ONCE) — the agent appends stdout to
-    /// its own `.env`. No vault line: vault is per-call, not identity
-    /// (design/vault-addressing.md). Account-level: works on any of your
-    /// paired devices.
+    /// Mint a new agent identity and print its env: two non-secret dotenv lines,
+    /// SAFECLAW_BROKER_URL + SAFECLAW_AGENT_IDENTITY (a file path, not a secret),
+    /// which the agent appends to its own `.env`. No vault line: vault is per-call,
+    /// not identity (design/vault-addressing.md). Account-level: works on any of
+    /// your paired devices.
     Add(AgentAddArgs),
     /// List this account's agents (name, key prefix, last-used).
     #[command(alias = "list")]

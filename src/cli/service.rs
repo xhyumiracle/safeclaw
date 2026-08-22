@@ -402,6 +402,7 @@ pub fn run_ensure_running() -> Result<(), String> {
         .map(|s| s.success())
         .unwrap_or(false);
     if active {
+        eprintln!("✓ daemon already running");
         return Ok(());
     }
     // Not active. If the unit exists, just start it (no rewrite). Otherwise
@@ -429,6 +430,7 @@ pub fn run_ensure_running() -> Result<(), String> {
     // tear down a healthy daemon on a routine `sc up` (that would drop the
     // in-memory vault keys and re-lock). Only converge when nothing answers.
     if control_port_alive() {
+        eprintln!("✓ daemon already running");
         return Ok(());
     }
     let plist_arg = plist_path.to_string_lossy().to_string();
