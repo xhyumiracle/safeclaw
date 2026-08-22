@@ -290,11 +290,40 @@ pub async fn approve_op(
     // has NO vault.dat — its keyset (credential pubkeys) lives in the per-item
     // store. Read it once so credential lookup + the read grants (Unlock / Use /
     // Export) below work for those vaults too.
-    let existing_per_item = state
+    let mut existing_per_item = state
         .vaults
         .per_item_path(&vault_id)
         .ok()
         .and_then(|p| read_per_item(&p).ok().flatten());
+    // SELF-HEAL a stale keyset registry before validating. If the credential this
+    // grant is signed with isn't resolvable yet, force a FULL membership re-pull
+    // and re-read. An out-of-band x/y backfill (a credential's WebAuthn pubkey
+    // added to an already-synced membership) does NOT bump the membership seq, so
+    // the daemon never re-pulled and `credential_lookup` misses it even though the
+    // cloud offers it ("unknown credential"). Best-effort: a failed re-pull just
+    // leaves the original miss to surface (now as a clear rejection, not a hang).
+    let cred_resolvable = existing_vault
+        .as_ref()
+        .and_then(|v| find_pubkey(v, &grant.credential_id))
+        .or_else(|| {
+            existing_per_item
+                .as_ref()
+                .and_then(|pv| find_pubkey_in_registry(&pv.keyset.registry, &grant.credential_id))
+        })
+        .is_some();
+    if !cred_resolvable {
+        match crate::sync::resync_membership_now(&state, &vault_id).await {
+            Ok(n) => {
+                tracing::info!(op = %op_id, vault = %vault_id, adopted = n, "approve self-heal: re-pulled membership for unresolved credential");
+                existing_per_item = state
+                    .vaults
+                    .per_item_path(&vault_id)
+                    .ok()
+                    .and_then(|p| read_per_item(&p).ok().flatten());
+            }
+            Err(e) => tracing::debug!(op = %op_id, "approve self-heal re-pull failed: {}", e),
+        }
+    }
     let lookup_credential = |cred_id_b64: &str| -> Option<PasskeyEntry> {
         existing_vault
             .as_ref()

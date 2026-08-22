@@ -263,6 +263,30 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
     Ok(SyncOutcome { pulled, connects })
 }
 
+/// Force a FULL `/membership` re-pull for ONE vault, out of band — the approve
+/// path's SELF-HEAL. A backend x/y backfill (a credential's WebAuthn pubkey added
+/// to an already-synced membership) does NOT bump the membership seq, so a normal
+/// delta pull replies "nothing new" and the daemon's `credential_lookup` keeps
+/// missing the credential ("unknown credential") even though the cloud offers it.
+/// On a lookup miss we re-pull the WHOLE triple (since=0) here and retry once.
+/// Returns rows adopted. Best-effort caller: a local-only/unpaired daemon errs.
+pub async fn resync_membership_now(state: &Arc<AppState>, vault_id: &str) -> Result<usize, String> {
+    let cfg = active::load().map_err(|_| "not paired".to_string())?;
+    let cloud = cfg
+        .cloud_backend
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "local-only daemon (no cloud) — cannot resync membership".to_string())?;
+    let dk =
+        device_key().ok_or_else(|| "daemon not paired — cannot resync membership".to_string())?;
+    let n = pull_membership(&state.config.state_dir, cloud, vault_id, &dk, true).await?;
+    if n > 0 {
+        state.record_cloud_contact(vault_id);
+        tracing::info!(vault = %vault_id, adopted = n, "membership resync (self-heal): backfilled keyset");
+    }
+    Ok(n)
+}
+
 /// Drain the post-migration cloud marks for one vault (team §8.3/§5.15):
 /// the owner lock-list registration (config-ids) and the one-way `format=2`
 /// ratchet. Both idempotent server-side; delivered only after the push above
@@ -2841,7 +2865,7 @@ pub async fn pull_keys(
         // fmt>=2 vault: the backend serves the end-to-end verify(anchor, members, proof)
         // TRIPLE at /membership, not row-shaped /keys. Route there. Legacy fmt=1 personal
         // vaults keep the row path below (single request, unchanged).
-        409 => return pull_membership(state_dir, cloud, vault, device_key).await,
+        409 => return pull_membership(state_dir, cloud, vault, device_key, false).await,
         401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
         other => return Err(format!("keys GET HTTP {}", other)),
     }
@@ -2881,6 +2905,7 @@ async fn pull_membership(
     cloud: &str,
     vault: &str,
     device_key: &str,
+    force_full: bool,
 ) -> Result<usize, String> {
     let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
     // The `keyset_seq` cursor is per-FORMAT: the v1 `/keys` sequence and the v2
@@ -2891,7 +2916,12 @@ async fn pull_membership(
     // (local keyset has no `uik` yet) and pull the FULL triple from `since=0`, then
     // adopt the membership's OWN seq (even if numerically lower than the old v1 cursor).
     let first_v2 = pv.keyset.uik.is_none();
-    let since = if first_v2 { 0 } else { pv.keyset_seq };
+    // `force_full` (the approve self-heal path) pulls the WHOLE triple from
+    // since=0: an out-of-band x/y backfill on an already-synced membership does
+    // NOT bump keyset_seq, so a delta pull replies "nothing new" and never
+    // refreshes the registry. A full pull re-adopts the triple (incl. each
+    // credential's x/y) so `credential_lookup` stops missing it.
+    let since = if first_v2 || force_full { 0 } else { pv.keyset_seq };
     let url = format!(
         "{}/v/{}/membership?since={}",
         cloud.trim_end_matches('/'),

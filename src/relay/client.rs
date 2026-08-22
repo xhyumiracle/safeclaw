@@ -249,14 +249,14 @@ async fn run(
                     .map_err(|e| format!("relay poll parse: {}", e))?;
                 let grant = body.get("sealed_grant").cloned().unwrap_or(body);
                 if let Err(e) = apply_grant(state.clone(), op_id, grant).await {
-                    // The human APPROVED but the daemon couldn't apply. The
-                    // canonical cause — a value stash dying under a longer op
-                    // window — is structurally gone (both derive from
-                    // aux.policy.timeout now); this is belt-and-suspenders.
-                    // A consent that silently evaporates is the worst UX
-                    // ("I approved — where did it go?"): terminalize the
-                    // local row as `expired` WITH the reason so it ships to
-                    // the cloud feed instead of sitting `pending`, invisible.
+                    // The human APPROVED but the daemon can't apply this grant.
+                    // The canonical cause now is a tapped passkey that isn't in
+                    // THIS vault's keyset ("unknown credential"), after the approve
+                    // path's self-heal re-pull still couldn't resolve it. Record the
+                    // reason locally, then REJECT the op so `sc unlock` / `sc op
+                    // wait` returns a definitive, actionable error. Ending the poll
+                    // with Err instead (the old behavior) left the relay op
+                    // 'approved' and hung the CLI forever on "Waiting for approval".
                     if let Ok(audit) = state.audits.for_vault(vault_id) {
                         let _ = audit.finalize(
                             op_id,
@@ -267,7 +267,9 @@ async fn run(
                             None,
                         );
                     }
-                    return Err(e);
+                    tracing::warn!(op = %op_id, "approved grant could not be applied ({}); rejecting so the CLI fails clearly instead of hanging", e);
+                    apply_reject(state.clone(), op_id).await;
+                    return Ok(());
                 }
                 return Ok(());
             }
