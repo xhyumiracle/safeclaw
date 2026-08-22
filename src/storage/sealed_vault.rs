@@ -1359,6 +1359,34 @@ impl PerItemVault {
         Ok(())
     }
 
+    /// Adopt a credential's WebAuthn pubkey (`x`/`y` verbatim strings + device_name)
+    /// into the registry WITHOUT creating a v1 `SealedCredential` row. The v2
+    /// (membership) keyset keeps K delivery in `uik.creds`, but the daemon still needs
+    /// each credential's ES256 pubkey to VERIFY its approve/unlock assertion
+    /// (`credential_lookup` + the `/passkeys` handler read the registry). `uik.creds`
+    /// carries only the UIK/K-seal — not the WebAuthn pubkey — so a migrated/born-v2
+    /// keyset had no way to verify a tap ("unknown credential"). Mirrors the registry
+    /// half of [`Self::upsert_key_row`]; idempotent (insert overwrites).
+    pub fn set_registry_pubkey(
+        &mut self,
+        cid_b64: &str,
+        x_b64: &str,
+        y_b64: &str,
+        device_name: &str,
+    ) -> Result<()> {
+        let cid_bytes = decode_credential_id(cid_b64)?;
+        let pk = sudp::passkey::WebAuthnPublicKey {
+            x: x_b64.to_string(),
+            y: y_b64.to_string(),
+            device_name: device_name.to_string(),
+        };
+        self.keyset
+            .registry
+            .insert::<WebAuthn>(&cid_bytes, &pk)
+            .map_err(|e| AppError::Internal(format!("registry insert: {}", e)))?;
+        Ok(())
+    }
+
     /// Drop every credential seal belonging to member `user_id` (offboarding /
     /// re-key removes the departed member's access; SM §3.2). No-op on a v1
     /// keyset. Returns the number of credential seals removed.

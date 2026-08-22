@@ -2883,11 +2883,20 @@ async fn pull_membership(
     device_key: &str,
 ) -> Result<usize, String> {
     let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
+    // The `keyset_seq` cursor is per-FORMAT: the v1 `/keys` sequence and the v2
+    // `/membership` `keyset_seq` are DIFFERENT counters. On a fmt1→fmt2 MIGRATION the
+    // local cursor is still the v1 value (often far ahead of the fresh membership's
+    // seq), so a since-delta would reply "nothing new" and the triple would never land
+    // — the daemon would stay stuck on its stale v1 keyset. Detect the first v2 pull
+    // (local keyset has no `uik` yet) and pull the FULL triple from `since=0`, then
+    // adopt the membership's OWN seq (even if numerically lower than the old v1 cursor).
+    let first_v2 = pv.keyset.uik.is_none();
+    let since = if first_v2 { 0 } else { pv.keyset_seq };
     let url = format!(
         "{}/v/{}/membership?since={}",
         cloud.trim_end_matches('/'),
         vault,
-        pv.keyset_seq
+        since
     );
     let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
         .map_err(|e| format!("http client init: {}", e))?;
@@ -2918,7 +2927,12 @@ async fn pull_membership(
         Some(anchor) if !anchor.is_empty() => adopt_membership_triple(&mut pv, vault, anchor, &body)?,
         _ => 0,
     };
-    if max_seq > pv.keyset_seq {
+    if first_v2 {
+        // Switching from the v1 `/keys` cursor to the v2 `/membership` sequence: adopt
+        // the membership's seq outright (the usual monotonic guard would keep the stale,
+        // higher v1 value and freeze out future v2 deltas).
+        pv.keyset_seq = max_seq;
+    } else if max_seq > pv.keyset_seq {
         pv.keyset_seq = max_seq;
     }
     write_per_item_store(state_dir, vault, &pv)?;
@@ -2957,6 +2971,19 @@ fn adopt_membership_triple(
                     .entry(idid.to_string())
                     .or_default()
                     .push(cid.to_string());
+            }
+            // Adopt this credential's WebAuthn pubkey (x/y) into the registry so the
+            // daemon can VERIFY its approve/unlock assertion — `uik.creds` carries the
+            // K-seal but NOT the ES256 pubkey, so without this a v2 tap fails with
+            // "unknown credential". Own creds only (the serve returns the caller's own).
+            if let (Some(cid), Some(x), Some(y)) = (
+                c.get("cid").and_then(|v| v.as_str()),
+                c.get("x").and_then(|v| v.as_str()),
+                c.get("y").and_then(|v| v.as_str()),
+            ) {
+                let dn = c.get("device_name").and_then(|v| v.as_str()).unwrap_or("");
+                pv.set_registry_pubkey(cid, x, y, dn)
+                    .map_err(|e| format!("adopt registry pubkey {}: {}", cid, e))?;
             }
         }
     }

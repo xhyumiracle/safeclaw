@@ -65,11 +65,19 @@ pub async fn passkeys(
     // enrolled vault that simply had no secrets yet.
     let per_item_path = state.vaults.per_item_path(&vault_id)?;
     let vault_path = state.vaults.vault_path(&vault_id)?;
-    let (registry, credentials) =
+    // Enrolled passkeys come from BOTH keyset shapes: the v1 legacy `credentials` rows
+    // (which carry prf_salt / wc_check / pubkey) AND the v2 membership `uik.creds` (which
+    // carry only identity + K-seal — the recovery material lives in the cloud and is
+    // served to the grant page directly). A migrated / born-v2 keyset has an EMPTY
+    // `credentials` vec, so without the uik pass below this endpoint returned zero
+    // passkeys → the daemon reported "vault has no enrolled passkeys" and could not run
+    // the unlock / approve ceremony.
+    let (registry, credentials, uik_creds) =
         if let Some(pv) = crate::storage::sealed_vault::read_per_item(&per_item_path)? {
-            (pv.keyset.registry, pv.keyset.credentials)
+            let uik_creds = pv.keyset.uik.map(|u| u.creds).unwrap_or_default();
+            (pv.keyset.registry, pv.keyset.credentials, uik_creds)
         } else if let Some(v) = crate::storage::sealed_vault::read(&vault_path)? {
-            (v.registry, v.credentials)
+            (v.registry, v.credentials, Default::default())
         } else {
             return Ok(Json(json!({ "vault_exists": false, "passkeys": [] })));
         };
@@ -91,7 +99,7 @@ pub async fn passkeys(
     if state.is_vault_locked(&vault_id) {
         tracing::debug!(vault = %vault_id, "GET /passkeys while vault locked — prf_salt returned; TODO: gate on session token (F-24)");
     }
-    let metas: Vec<PasskeyMeta> = credentials
+    let mut metas: Vec<PasskeyMeta> = credentials
         .iter()
         .map(|c| {
             // Emit credential_id as base64url-no-pad. credentialId is the one
@@ -116,6 +124,31 @@ pub async fn passkeys(
             }
         })
         .collect();
+    // v2 (membership) keyset: the account's OWN passkeys live in `uik.creds` keyed by
+    // their credential id. OTHER team members are keyed by `us_…` (a person id, not an
+    // offerable credential) — excluded (you can only unlock with your own passkey).
+    // These entries carry identity + K-seal, NOT the recovery material (prf_salt /
+    // wc_check / pubkey): that lives in the cloud and is served straight to the grant
+    // page (backend `grantPasskeyMaterial`), so the credential_id alone is enough to
+    // OFFER the ceremony and to satisfy the non-empty enrolled-passkeys check.
+    {
+        let have: std::collections::HashSet<String> =
+            metas.iter().map(|m| m.credential_id.clone()).collect();
+        for cid in uik_creds.keys() {
+            if cid.starts_with("us_") || have.contains(cid.as_str()) {
+                continue;
+            }
+            metas.push(PasskeyMeta {
+                credential_id: cid.clone(),
+                device_name: String::new(),
+                created_at: 0,
+                prf_salt: String::new(),
+                public_key_x: None,
+                public_key_y: None,
+                wc_check: None,
+            });
+        }
+    }
     // Pending-passkey deposits (Stage 1 done, awaiting Stage 2 Enroll).
     // list() opportunistically GC-sweeps expired files — that's the only
     // place we know the daemon is actively serving this vault. Failure to
