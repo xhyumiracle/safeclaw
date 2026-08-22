@@ -908,6 +908,35 @@ pub(crate) async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) 
     drop_local_vault(state, vault);
 }
 
+/// §15 leg-B: if THIS account's UIK is VERIFIED-not-a-member of a shared vault (an
+/// owner offboarded us), actively LOCK + WIPE it locally. Returns `true` if it wiped
+/// (the caller stops this vault's watcher — a later pull would re-adopt the triple).
+/// SAFE: acts ONLY on a `Verified`, non-empty fold that EXCLUDES our `us_`
+/// ([`PerItemVault::verified_membership`] = `Some(false)`); an untrusted / rolled-back
+/// / bootstrap / personal-`NoUik` vault yields `None` → parks. Flag-gated (default OFF,
+/// P6 flips it). Recoverable if ever wrong: the discovery loop won't re-add a
+/// non-member vault, and a re-invite + passkey re-unlock restores it.
+async fn enforce_membership_presence(state: &Arc<AppState>, vault: &str) -> bool {
+    if !crate::principal_ledger::principal_enforce_enabled() {
+        return false;
+    }
+    let Some(us) = active::account_uik() else {
+        return false;
+    };
+    let Some(pv) = read_per_item_store(&state.config.state_dir, vault) else {
+        return false; // no local keyset yet → nothing to lose
+    };
+    if pv.verified_membership(vault, &us) == Some(false) {
+        tracing::warn!(
+            vault = %vault, us = %us,
+            "membership: this account is VERIFIED not a member of this vault (owner offboarded) — locking + wiping local state"
+        );
+        drop_local_vault_locked(state, vault).await;
+        return true;
+    }
+    false
+}
+
 /// After a runtime pull wrote a new `vault.dat`, refresh the in-memory cache
 /// for an UNLOCKED vault using the retained state key `K` — no passkey. If the
 /// vault is Locked (no retained `K`), nothing is cached to refresh; the next
@@ -1673,6 +1702,10 @@ pub async fn watch_loop(
                 if !pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "sse-wake").await {
                     clean = false;
                 }
+                // §15 leg-B: a just-adopted membership triple may have offboarded us.
+                if enforce_membership_presence(&state, &vault).await {
+                    return; // wiped → stop this watcher (a re-pull would re-adopt)
+                }
             }
 
             // ★ The reconcile floor fires on schedule even under steady
@@ -1709,6 +1742,11 @@ pub async fn watch_loop(
                                 "sse-reconcile",
                             )
                             .await;
+                        // §15 leg-B: periodic fallback catch for an offboard the
+                        // SSE wake missed.
+                        if enforce_membership_presence(&state, &vault).await {
+                            return;
+                        }
                     }
                     Ok(BlobWake::Handled {
                         persist_failed,

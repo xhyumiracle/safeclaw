@@ -1761,6 +1761,23 @@ impl PerItemVault {
         MembershipTrust::Verified(self.fold_owner_set(vault_id))
     }
 
+    /// §15 leg-B: is `us_id` a VERIFIED member of this vault right now? Answers the
+    /// "did the owner offboard me?" question SAFELY, so a caller can drop a lost vault:
+    /// - `Some(true)`  = the owner-verified fold seats this id (owner or member).
+    /// - `Some(false)` = the fold is TRUSTED (`Verified`) + non-empty and does NOT seat
+    ///   this id → an owner-signed removal (or never-granted). The caller MAY drop.
+    /// - `None`        = can't decide safely: legacy/`NoUik`, no resolvable root, or a
+    ///   rolled-back/`Untrusted` log (a dropped-grant rollback fails `membership_prefix_ok`
+    ///   → `Untrusted` here, so it can never masquerade as a removal). The caller PARKS.
+    /// Trust comes from [`resolve_membership_trust`], which fails closed — so this never
+    /// reports a false removal from a tampered or partial triple.
+    pub(crate) fn verified_membership(&self, vault_id: &str, us_id: &str) -> Option<bool> {
+        match self.resolve_membership_trust(vault_id) {
+            MembershipTrust::Verified(map) if !map.is_empty() => Some(map.contains_key(us_id)),
+            _ => None, // NoUik / Untrusted / empty bootstrap → park, never wipe
+        }
+    }
+
     /// Compute the current derived OWNER-SET (`user_id → role`) = the FOLD of the
     /// root-signed CHECKPOINT (each cred's `role_sig` @ the current `role_epoch`)
     /// followed by the append-only `delegation_log` (design/identity-uik-aik.md
