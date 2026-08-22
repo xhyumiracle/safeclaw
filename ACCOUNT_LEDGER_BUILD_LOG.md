@@ -144,8 +144,20 @@ flags flip. P6 = the deliberate cutover, sequenced:
    `dev-backend` redeploy; merge core `feat/account-principal-ledger` → core `dev` + cut an rc;
    push frontend `dev`. Then a fresh-account e2e with the flags STILL OFF (proves zero
    regression: admit/revoke ledger populates, deletes still work, nothing wipes).
-2. **Adversarial review** (P6 deliverable, run 2026-08-22) — fix anything it surfaces BEFORE
-   flipping. [findings recorded below once the review returns.]
+2. **Adversarial review** (P6 deliverable, run 2026-08-22) — DONE. Found 1 HIGH + 2 LOW, ALL
+   FIXED (commit `50425fa`); the crypto foundation, cross-lang parity, backend write-gate,
+   tombstone verify, and flag-OFF non-regression were confirmed solid.
+   - **F1 (HIGH, fixed):** the self-revoke latch was not monotone — a compromised server could
+     un-revoke a device by omitting the revoke event while serving any newer event. Now
+     monotone (`apply_fold_to_floor`, unit-tested with the exact attack); enforcement reads the
+     LATCH every iteration, not the current pull.
+   - **F2 (LOW, fixed):** self-wipe now evicts K from all vaults up-front (closes the serve window).
+   - **F3 (LOW, fixed):** require-signed no longer strands legacy fmt1/NoUik deletes (legacy-drop
+     fallback; only fmt2 requires a verified tombstone).
+   - **KNOWN RESIDUAL F1c (documented, post-flip hardening):** a revoke the daemon has NEVER
+     observed (server withholds on every poll) can't latch — needs an owner-signed ledger head
+     (max-seq/count). Out of scope for the flag flip; do BEFORE relying on revoke against a
+     fully-adversarial backend.
 3. **Flip enforcement (USER decision — destructive for real users):** set
    `SAFECLAW_PRINCIPAL_ENFORCE=on` + `SAFECLAW_REQUIRE_SIGNED_TOMBSTONE=on` (env or
    `CliConfig.principal_enforce`/`require_signed_tombstone`) on daemons, staged/census'd. Only
