@@ -1815,6 +1815,14 @@ impl PerItemVault {
         crate::identity::verify(&pub32, &crate::identity::vault_tombstone_input(vault_id), &sig)
     }
 
+    /// §15 leg A: is this a legacy fmt1 / NoUik vault (no signed owner set)? Such a vault
+    /// has no fold-owner to verify a tombstone against, so the require-signed gate cannot
+    /// apply — the caller keeps the legacy UNSIGNED drop for it (fmt1 is being retired; a
+    /// fmt2 vault's owner signs the tombstone). Never blocks a legacy delete from propagating.
+    pub(crate) fn is_legacy_nouik(&self, vault_id: &str) -> bool {
+        matches!(self.resolve_membership_trust(vault_id), MembershipTrust::NoUik)
+    }
+
     /// Compute the current derived OWNER-SET (`user_id → role`) = the FOLD of the
     /// root-signed CHECKPOINT (each cred's `role_sig` @ the current `role_epoch`)
     /// followed by the append-only `delegation_log` (design/identity-uik-aik.md

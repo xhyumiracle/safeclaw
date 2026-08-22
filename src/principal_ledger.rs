@@ -18,7 +18,7 @@
 //!   and a later pull whose max `seq` regresses below the recorded floor is ignored, so
 //!   a malicious server dropping the revoke event cannot un-revoke a device.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,21 +72,39 @@ struct LedgerJson {
 /// The folded outcome of a verified ledger.
 #[derive(Debug, Default)]
 struct Folded {
-    /// principal ids whose FINAL folded state is revoked.
-    revoked: HashSet<String>,
+    /// principal id → (final live-state, seq of its latest applied event). A principal
+    /// ABSENT from the map has NO verified event in this pull (e.g. the server omitted
+    /// it) — distinct from a present-but-revoked `(false, seq)`.
+    state: HashMap<String, (bool, u64)>,
     /// highest `seq` among applied (verified) events.
     max_seq: u64,
+}
+
+impl Folded {
+    /// The latest verified `(live, seq)` for a principal, or `None` if this pull carries
+    /// no verified event about it. `None` must NEVER clear a latched decision — omission
+    /// is not an owner action.
+    fn status(&self, id: &str) -> Option<(bool, u64)> {
+        self.state.get(id).copied()
+    }
 }
 
 /// Persisted, rollback-resistant decision floor (`<state_dir>/principal_floor.json`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct LedgerFloor {
+    /// Monotone high-water of applied `seq` (never regresses).
     #[serde(default)]
     seq: u64,
-    /// Latched once THIS device's own revoke is verified; a later regressed pull
-    /// (server dropped the event) can never clear it.
+    /// MONOTONE self-revoke latch: set once THIS device's own revoke is VERIFIED, and
+    /// cleared ONLY by a verified LATER admit (`seq > self_revoke_seq`) — NEVER because a
+    /// pull merely omits the revoke event. So a compromised server that drops the revoke
+    /// cannot un-revoke the device (the wave's headline invariant).
     #[serde(default)]
     self_revoked: bool,
+    /// The `seq` at which `self_revoked` was latched (0 when not latched). A re-admit only
+    /// clears the latch if it is strictly newer than this.
+    #[serde(default)]
+    self_revoke_seq: u64,
 }
 
 // ── Flag ────────────────────────────────────────────────────────────────────
@@ -182,7 +200,7 @@ fn fold_verified(ledger: &LedgerJson, anchor_uik: &str) -> Option<Folded> {
     let mut events: Vec<&PrincipalEventJson> = ledger.events.iter().collect();
     events.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.sig.cmp(&b.sig)));
 
-    let mut present: HashMap<String, bool> = HashMap::new();
+    let mut state: HashMap<String, (bool, u64)> = HashMap::new();
     let mut last_seq: Option<u64> = None;
     let mut max_seq: u64 = 0;
     for e in events {
@@ -213,20 +231,15 @@ fn fold_verified(ledger: &LedgerJson, anchor_uik: &str) -> Option<Folded> {
         max_seq = max_seq.max(e.seq);
         match e.op.as_str() {
             "admit" => {
-                present.insert(e.principal_id.clone(), true);
+                state.insert(e.principal_id.clone(), (true, e.seq));
             }
             "revoke" => {
-                present.insert(e.principal_id.clone(), false);
+                state.insert(e.principal_id.clone(), (false, e.seq));
             }
             other => tracing::warn!(op = %other, "principal ledger: unknown op; skipping"),
         }
     }
-    let revoked = present
-        .into_iter()
-        .filter(|(_, live)| !*live)
-        .map(|(id, _)| id)
-        .collect();
-    Some(Folded { revoked, max_seq })
+    Some(Folded { state, max_seq })
 }
 
 // ── Floor persistence (rollback resistance) ─────────────────────────────────
@@ -250,6 +263,34 @@ fn store_floor(state_dir: &Path, floor: &LedgerFloor) {
     }
 }
 
+/// Fold a NON-REGRESSED pull into the decision floor — the F1 MONOTONE self-revoke latch,
+/// as a pure function so it is directly testable. `my_dev` is THIS device's id. Rules:
+/// - a verified self-`revoke` LATCHES `self_revoked` (raising `self_revoke_seq`);
+/// - a verified self-`admit` clears it ONLY if strictly newer (`seq > self_revoke_seq`);
+/// - the server OMITTING the revoke → `status(my_dev)` is `None` (or an OLDER admit) →
+///   the latch is left UNTOUCHED, so a compromised server can never un-revoke by dropping
+///   the event. `seq` only moves forward.
+fn apply_fold_to_floor(mut floor: LedgerFloor, folded: &Folded, my_dev: Option<&str>) -> LedgerFloor {
+    floor.seq = folded.max_seq.max(floor.seq);
+    if let Some(dev) = my_dev {
+        match folded.status(dev) {
+            Some((false, rseq)) => {
+                if !floor.self_revoked || rseq > floor.self_revoke_seq {
+                    floor.self_revoked = true;
+                    floor.self_revoke_seq = rseq;
+                }
+            }
+            Some((true, aseq)) => {
+                if floor.self_revoked && aseq > floor.self_revoke_seq {
+                    floor.self_revoked = false;
+                }
+            }
+            None => { /* omission is not an owner action — keep the latch */ }
+        }
+    }
+    floor
+}
+
 // ── Enforcement ──────────────────────────────────────────────────────────────
 
 /// Self-revoke enforcement: the owner revoked THIS device. Lock + wipe every local
@@ -268,8 +309,14 @@ async fn self_wipe_and_logout(state: &Arc<AppState>) -> ! {
         .map(|kv| kv.vault)
         .filter(|v| !v.is_empty())
         .collect();
-    for vid in vaults {
-        crate::sync::drop_local_vault_locked(state, &vid).await;
+    // F2: evict retained K from EVERY vault UP-FRONT (synchronous, in-memory) so the
+    // serve window closes immediately — no in-flight request can be handed K for a
+    // not-yet-dropped vault while the per-vault disk wipe below iterates.
+    for vid in &vaults {
+        state.lock_vault(vid);
+    }
+    for vid in &vaults {
+        crate::sync::drop_local_vault_locked(state, vid).await;
     }
     // 2. Delete the device-key (this host's cloud credential): once gone, the bearer
     //    can never be matched again.
@@ -299,55 +346,59 @@ pub async fn principal_ledger_loop(state: Arc<AppState>, cloud: String, dk: Stri
     const INTERVAL: Duration = Duration::from_secs(120);
     let state_dir = state.config.state_dir.clone();
 
-    // Honor a latch that survived a restart FIRST: if this device was already
-    // verified-revoked and enforcement is on, wipe immediately on start.
+    // The self-revoke decision is a MONOTONE, on-disk LATCH (F1): once a verified revoke
+    // of THIS device is seen it stays latched — a later pull that merely OMITS the revoke
+    // can NEVER clear it (only a verified LATER admit does). Enforcement reads the LATCH,
+    // not the current pull, so a compromised server cannot un-revoke by dropping the event.
     let mut floor = load_floor(&state_dir);
-    if floor.self_revoked && principal_enforce_enabled() {
-        self_wipe_and_logout(&state).await;
-    }
+    let my_dev = crate::device_auth::device_signer().map(|s| s.device_id().to_string());
 
     loop {
-        // Work first (immediate check on start), then wait — a fresh revoke enforces
-        // within one poll of daemon start rather than after a full INTERVAL.
+        // Enforce the LATCHED decision every iteration, independent of the current pull.
+        // Covers a latch that survived a restart AND the enforce flag being flipped ON
+        // mid-run (it is read live, so no restart is needed to start biting).
+        if floor.self_revoked && principal_enforce_enabled() {
+            self_wipe_and_logout(&state).await; // does not return
+        }
+
+        // Work first (immediate on start), then wait — a fresh revoke enforces within one
+        // poll rather than after a full INTERVAL.
         if let Some(ledger) = fetch_ledger(&cloud, &dk).await {
             if let Some(folded) = fold_verified(&ledger, &anchor_uik) {
                 if folded.max_seq < floor.seq {
-                    // Rollback: the server dropped a higher-seq event we already saw.
-                    // Ignore this pull and keep the prior (latched) decision.
+                    // Wholesale regression (max seq below our high-water). Ignore the pull;
+                    // the monotone latch above already protects an already-observed revoke.
                     tracing::warn!(
                         max = folded.max_seq,
                         floor = floor.seq,
-                        "principal ledger: pull regressed below the known seq (rollback?); ignoring, keeping prior decision"
+                        "principal ledger: pull regressed below the known seq (rollback?); ignoring"
                     );
                 } else {
-                    let my_dev = crate::device_auth::device_signer()
-                        .map(|s| s.device_id().to_string());
-                    let self_revoked = my_dev
-                        .as_deref()
-                        .map(|d| folded.revoked.contains(d))
-                        .unwrap_or(false);
-                    // Adopt this (non-regressed) fold's decision; latch is monotone in
-                    // seq, so a real re-admit at a higher seq can clear it but a rollback
-                    // cannot.
-                    if folded.max_seq > floor.seq || self_revoked != floor.self_revoked {
-                        floor = LedgerFloor { seq: folded.max_seq.max(floor.seq), self_revoked };
+                    let before = (floor.seq, floor.self_revoked, floor.self_revoke_seq);
+                    floor = apply_fold_to_floor(floor, &folded, my_dev.as_deref());
+                    if (floor.seq, floor.self_revoked, floor.self_revoke_seq) != before {
                         store_floor(&state_dir, &floor);
                     }
-                    if self_revoked {
+                    // Enforce immediately after a fresh latch so a just-seen revoke wipes
+                    // this round rather than next.
+                    if floor.self_revoked {
                         if principal_enforce_enabled() {
                             self_wipe_and_logout(&state).await;
                         } else {
                             tracing::warn!(
                                 device = ?my_dev,
-                                "principal ledger: THIS device is revoked (VERIFIED) but enforcement is OFF \
-                                 (SAFECLAW_PRINCIPAL_ENFORCE); NOT wiping — the P6 cutover flips the default"
+                                "principal ledger: THIS device is revoked (VERIFIED, latched) but enforcement \
+                                 is OFF (SAFECLAW_PRINCIPAL_ENFORCE); NOT wiping — the P6 cutover flips the default"
                             );
                         }
                     }
-                    // Agent revokes need no separate action in P4: the existing
-                    // /agents/hashes sync already stops serving a revoked agent's key
-                    // (the backend drops it). The ledger is the account-level record +
-                    // the daemon-verifiable authority the P6 cutover enforces directly.
+                    // Agent revokes ride the existing /agents/hashes sync (backend drops
+                    // the key); the ledger is the account-level record + daemon-verifiable
+                    // authority the P6 cutover enforces directly.
+                    // KNOWN RESIDUAL (F1c): a revoke the daemon has NEVER observed (server
+                    // withholds it on every poll) can't latch — closing that needs an
+                    // owner-signed ledger head (max-seq/count) so tail omission is
+                    // detectable. Tracked for a P6 hardening; out of scope for the flag flip.
                 }
             }
         }
@@ -402,7 +453,7 @@ mod tests {
             signed_event(&o, &acct, "revoke", "dev_box", 2),
         ]);
         let folded = fold_verified(&l, &acct).expect("trusted anchor folds");
-        assert!(folded.revoked.contains("dev_box"), "final state is revoked");
+        assert_eq!(folded.status("dev_box"), Some((false, 2)), "final state is revoked @ seq 2");
         assert_eq!(folded.max_seq, 2);
     }
 
@@ -416,7 +467,7 @@ mod tests {
             signed_event(&o, &acct, "admit", "dev_box", 3),
         ]);
         let folded = fold_verified(&l, &acct).unwrap();
-        assert!(!folded.revoked.contains("dev_box"), "a higher-seq re-admit un-revokes");
+        assert_eq!(folded.status("dev_box"), Some((true, 3)), "a higher-seq re-admit un-revokes");
         assert_eq!(folded.max_seq, 3);
     }
 
@@ -440,8 +491,8 @@ mod tests {
         forged.sig = STANDARD.encode([0u8; 64]);
         let l = ledger(&o, vec![signed_event(&o, &acct, "admit", "ag_bot", 1), forged]);
         let folded = fold_verified(&l, &acct).expect("valid anchor");
-        assert!(!folded.revoked.contains("dev_box"), "forged revoke is skipped");
-        assert!(!folded.revoked.contains("ag_bot"), "ag_bot was admitted, not revoked");
+        assert_eq!(folded.status("dev_box"), None, "forged revoke is skipped (no verified event about dev_box)");
+        assert_eq!(folded.status("ag_bot"), Some((true, 1)), "ag_bot was admitted, not revoked");
         assert_eq!(folded.max_seq, 1, "only the verified admit counts");
     }
 
@@ -455,6 +506,40 @@ mod tests {
         ev.owner_id = "us_someone_else".to_string();
         let l = ledger(&o, vec![ev]);
         let folded = fold_verified(&l, &acct).unwrap();
-        assert!(folded.revoked.is_empty(), "foreign-owner event does not revoke");
+        assert!(folded.state.is_empty(), "foreign-owner event does not fold");
+    }
+
+    // F1 regression: the MONOTONE self-revoke latch (`apply_fold_to_floor`). Once a revoke
+    // of self is verified, a later pull that OMITS it — even while serving an OLDER admit
+    // and a NEWER unrelated event — must NOT un-revoke. Only a verified LATER admit clears it.
+    #[test]
+    fn monotone_latch_survives_omitted_revoke() {
+        let o = owner();
+        let acct = o.user_id();
+        let dev = "dev_me";
+
+        // Pull 1: dev_me revoked at seq 2 → latch {revoked, revoke_seq: 2, seq: 2}.
+        let p1 = ledger(&o, vec![
+            signed_event(&o, &acct, "admit", dev, 1),
+            signed_event(&o, &acct, "revoke", dev, 2),
+        ]);
+        let f1 = apply_fold_to_floor(LedgerFloor::default(), &fold_verified(&p1, &acct).unwrap(), Some(dev));
+        assert!(f1.self_revoked && f1.self_revoke_seq == 2 && f1.seq == 2);
+
+        // Pull 2 (malicious): revoke(2) OMITTED, admit(1) kept (dev_me looks "admitted" @1),
+        // plus a genuine NEWER unrelated event (admit dev_other @3) so max_seq advances. The
+        // OLDER admit (seq 1 <= revoke seq 2) must NOT clear the latch.
+        let p2 = ledger(&o, vec![
+            signed_event(&o, &acct, "admit", dev, 1),
+            signed_event(&o, &acct, "admit", "dev_other", 3),
+        ]);
+        let f2 = apply_fold_to_floor(f1, &fold_verified(&p2, &acct).unwrap(), Some(dev));
+        assert!(f2.self_revoked, "an omitted revoke (only an OLDER admit served) must NOT un-revoke");
+        assert_eq!(f2.seq, 3, "high-water still advances on the unrelated event");
+
+        // Pull 3: a genuine re-admit at seq > the revoke seq is the ONLY thing that clears it.
+        let p3 = ledger(&o, vec![signed_event(&o, &acct, "admit", dev, 4)]);
+        let f3 = apply_fold_to_floor(f2, &fold_verified(&p3, &acct).unwrap(), Some(dev));
+        assert!(!f3.self_revoked, "a verified LATER admit clears the latch");
     }
 }

@@ -954,16 +954,21 @@ fn tombstone_should_drop(state_dir: &Path, vault: &str, body: &serde_json::Value
     if !crate::principal_ledger::require_signed_tombstone() {
         return true; // legacy dual-path: unsigned deletes still drop until the P6 flip
     }
+    // No per-item keyset at all (a pure legacy fmt1 vault, or one never synced here) → no
+    // fold-owner to verify against and no fmt2 K/blob to protect → keep the legacy drop
+    // (F3: require-signed must never STRAND a legacy delete, only harden fmt2).
+    let Some(pv) = read_per_item_store(state_dir, vault) else {
+        return true;
+    };
+    if pv.is_legacy_nouik(vault) {
+        return true; // legacy NoUik vault: no signed owner set → legacy drop
+    }
+    // fmt2 vault: require a verified owner tombstone; an unsigned/forged delete parks.
     let (Some(sig), Some(signer)) = (
         body.get("tombstone_sig").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
         body.get("tombstone_signer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
     ) else {
         tracing::warn!(vault = %vault, "tombstone: require-signed ON but the delete carries no owner signature; NOT dropping");
-        return false;
-    };
-    let Some(pv) = read_per_item_store(state_dir, vault) else {
-        // No local keyset to verify against (fmt1/NoUik, or nothing synced) → fail closed.
-        tracing::warn!(vault = %vault, "tombstone: require-signed ON but no local keyset to verify; NOT dropping");
         return false;
     };
     if pv.tombstone_verified(vault, signer, sig) {
