@@ -564,16 +564,16 @@ pub fn spawn_watchers(state: Arc<AppState>) {
     let watched: std::collections::HashSet<String> =
         synced_vault_ids(&cfg).into_iter().collect();
     // §15 account principal ledger: pull + verify + (flag-gated) enforce a VERIFIED
-    // self-revoke (lock + wipe all + logout). Spawned for a paired daemon that knows
-    // its account anchor (persisted at login); dormant until SAFECLAW_PRINCIPAL_ENFORCE
-    // is on (the P6 cutover flips the default). Uses clones so the discovery loop below
-    // still takes ownership.
-    if let Some(account_id) = active::account_id() {
+    // self-revoke (lock + wipe all + logout). The anchor is the account's owner-UIK
+    // us_ pinned at login (NOT the account UUID) — self-certifying. Dormant until
+    // SAFECLAW_PRINCIPAL_ENFORCE is on (the P6 cutover flips the default). Uses clones
+    // so the discovery loop below still takes ownership.
+    if let Some(anchor_uik) = active::account_uik() {
         tokio::spawn(crate::principal_ledger::principal_ledger_loop(
             state.clone(),
             cloud.clone(),
             dk.clone(),
-            account_id,
+            anchor_uik,
         ));
     }
     tokio::spawn(discovery_reconcile_loop(state, cloud, dk, watched));

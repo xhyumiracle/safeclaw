@@ -3,7 +3,7 @@
 //! The cloud serves an append-only, owner-UIK-signed log of device/agent ADMIT +
 //! REVOKE events at `GET /api/vault/principals`. This module pulls it, verifies
 //! every event against the ACCOUNT ANCHOR (the owner UIK, self-certifying:
-//! `derive_id(User, uik_pub) == account_id`), folds by monotone `seq`, and — behind
+//! `derive_id(User, uik_pub) == anchor_uik`), folds by monotone `seq`, and — behind
 //! a flag, DEFAULT OFF until the P6 cutover — ENFORCES a verified revoke of THIS
 //! device by locking + wiping every local vault + logging out.
 //!
@@ -11,7 +11,7 @@
 //! - Destructive action fires ONLY on a daemon-VERIFIED owner signature, NEVER on a
 //!   bare 401 (that class caused the transient-403 mass-outage incident; a fetch
 //!   failure just parks and keeps the prior decision).
-//! - The `account_id`, trusted-on-pairing (TOFU), IS the anchor: a swapped anchor
+//! - The `anchor_uik`, trusted-on-pairing (TOFU), IS the anchor: a swapped anchor
 //!   pubkey fails the self-cert check and the whole pull is rejected. No separate
 //!   pin file is needed (the per-vault genesis-anchor trick, lifted to account scope).
 //! - Rollback-resistant: a verified self-revoke LATCHES to disk (`principal_floor.json`),
@@ -147,15 +147,15 @@ async fn fetch_ledger(cloud: &str, dk: &str) -> Option<LedgerJson> {
 
 /// Verify every event against the account anchor and fold admit/revoke by monotone
 /// `seq`. Returns `None` (fail closed → park) iff the anchor is missing or does NOT
-/// self-certify against `account_id` (a swapped anchor = untrusted source). An
+/// self-certify against `anchor_uik` (a swapped anchor = untrusted source). An
 /// individually invalid event (bad sig, foreign owner, unknown op) is SKIPPED, not
 /// fatal — mirrors the per-vault `fold_owner_set`.
-fn fold_verified(ledger: &LedgerJson, account_id: &str) -> Option<Folded> {
+fn fold_verified(ledger: &LedgerJson, anchor_uik: &str) -> Option<Folded> {
     let anchor = ledger.anchor.as_ref()?;
     let anchor_pub = decode_pub32(&anchor.uik_pub)?;
-    // Self-cert: the anchor pubkey MUST derive to the account_id we pinned at pairing.
-    if identity::derive_id(IdKind::User, &anchor_pub) != account_id {
-        tracing::warn!("principal ledger: anchor pubkey does not self-certify against account_id; rejecting pull");
+    // Self-cert: the anchor pubkey MUST derive to the anchor_uik we pinned at pairing.
+    if identity::derive_id(IdKind::User, &anchor_pub) != anchor_uik {
+        tracing::warn!("principal ledger: anchor pubkey does not self-certify against anchor_uik; rejecting pull");
         return None;
     }
 
@@ -172,11 +172,11 @@ fn fold_verified(ledger: &LedgerJson, account_id: &str) -> Option<Folded> {
         }
         // The signer must be the account owner (owner_id == the anchor id), and the
         // event's own anchor_uik (when carried) must match too.
-        if e.owner_id != account_id {
+        if e.owner_id != anchor_uik {
             tracing::warn!(seq = e.seq, "principal ledger: event owner_id != account anchor; skipping");
             continue;
         }
-        if !e.anchor_uik.is_empty() && e.anchor_uik != account_id {
+        if !e.anchor_uik.is_empty() && e.anchor_uik != anchor_uik {
             tracing::warn!(seq = e.seq, "principal ledger: event anchor_uik mismatch; skipping");
             continue;
         }
@@ -184,8 +184,8 @@ fn fold_verified(ledger: &LedgerJson, account_id: &str) -> Option<Folded> {
             tracing::warn!(seq = e.seq, "principal ledger: undecodable signature; skipping");
             continue;
         };
-        // account_id is the first signed field (== anchor for a personal account).
-        let input = identity::principal_event_input(account_id, &e.op, &e.principal_id, e.seq, &e.owner_id);
+        // anchor_uik is the first signed field (== anchor for a personal account).
+        let input = identity::principal_event_input(anchor_uik, &e.op, &e.principal_id, e.seq, &e.owner_id);
         if !identity::verify(&anchor_pub, &input, &sig) {
             tracing::warn!(seq = e.seq, "principal ledger: signature does not verify; skipping");
             continue;
@@ -272,8 +272,9 @@ async fn self_wipe_and_logout(state: &Arc<AppState>) -> ! {
 
 /// Periodic principal-ledger poll: pull → verify + fold → (flag-gated) enforce a
 /// verified self-revoke. Spawned once per paired daemon (like the vault-discovery
-/// reconcile loop). The `account_id` is the pairing-time TOFU anchor.
-pub async fn principal_ledger_loop(state: Arc<AppState>, cloud: String, dk: String, account_id: String) {
+/// reconcile loop). `anchor_uik` is the account's owner-UIK id (`us_…`) pinned at
+/// pairing — the self-certifying ledger anchor (NOT the Supabase account UUID).
+pub async fn principal_ledger_loop(state: Arc<AppState>, cloud: String, dk: String, anchor_uik: String) {
     /// Poll cadence. A revoke propagates within one interval of the owner tapping
     /// (or instantly on the next daemon start via the latched floor).
     const INTERVAL: Duration = Duration::from_secs(120);
@@ -290,7 +291,7 @@ pub async fn principal_ledger_loop(state: Arc<AppState>, cloud: String, dk: Stri
         // Work first (immediate check on start), then wait — a fresh revoke enforces
         // within one poll of daemon start rather than after a full INTERVAL.
         if let Some(ledger) = fetch_ledger(&cloud, &dk).await {
-            if let Some(folded) = fold_verified(&ledger, &account_id) {
+            if let Some(folded) = fold_verified(&ledger, &anchor_uik) {
                 if folded.max_seq < floor.seq {
                     // Rollback: the server dropped a higher-seq event we already saw.
                     // Ignore this pull and keep the prior (latched) decision.
@@ -347,16 +348,16 @@ mod tests {
         SigningIdentity::from_seed(&OWNER_SEED)
     }
 
-    fn signed_event(owner: &SigningIdentity, account_id: &str, op: &str, principal: &str, seq: u64) -> PrincipalEventJson {
-        let input = identity::principal_event_input(account_id, op, principal, seq, account_id);
+    fn signed_event(owner: &SigningIdentity, anchor_uik: &str, op: &str, principal: &str, seq: u64) -> PrincipalEventJson {
+        let input = identity::principal_event_input(anchor_uik, op, principal, seq, anchor_uik);
         let sig = owner.sign(&input);
         PrincipalEventJson {
             seq,
             op: op.to_string(),
             principal_id: principal.to_string(),
             principal_kind: if principal.starts_with("dev_") { "device" } else { "agent" }.to_string(),
-            anchor_uik: account_id.to_string(),
-            owner_id: account_id.to_string(),
+            anchor_uik: anchor_uik.to_string(),
+            owner_id: anchor_uik.to_string(),
             sig: STANDARD.encode(sig),
             created_at: String::new(),
         }
@@ -405,7 +406,7 @@ mod tests {
         let o = owner();
         let acct = o.user_id();
         let mut l = ledger(&o, vec![signed_event(&o, &acct, "revoke", "dev_box", 1)]);
-        // Swap the anchor pubkey to a different key: self-cert (derive_id == account_id) fails.
+        // Swap the anchor pubkey to a different key: self-cert (derive_id == anchor_uik) fails.
         let imposter = SigningIdentity::from_seed(&[9u8; 32]);
         l.anchor = Some(AnchorJson { uik_id: imposter.user_id(), uik_pub: STANDARD.encode(imposter.public_bytes()) });
         assert!(fold_verified(&l, &acct).is_none(), "a swapped anchor is untrusted → park");

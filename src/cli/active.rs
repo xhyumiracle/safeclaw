@@ -93,6 +93,13 @@ pub struct CliConfig {
     /// then simply doesn't start). Cleared by logout / self-revoke.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    /// §15: the account's owner-UIK id (`us_…`) — the REAL principal-ledger anchor
+    /// (the `account_id` above is the Supabase UUID, NOT the anchor). Self-certifying:
+    /// `derive_id(User, uik_pub) == account_uik`. Delivered + pinned at pairing; the
+    /// daemon verifies the ledger anchor + its own per-vault membership against it.
+    /// Absent on an older backend / pre-UIK account (the ledger loop then doesn't run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uik: Option<String>,
     /// §15 principal-ledger enforcement switch: DEFAULT OFF — a verified revoke of
     /// THIS device only locks+wipes when this is "on". `SAFECLAW_PRINCIPAL_ENFORCE`
     /// overrides (and survives an old binary's config save). Flipped on at the P6
@@ -343,6 +350,7 @@ pub fn put_cloud_coords(
     cloud_backend: &str,
     frontend_origin: Option<&str>,
     account_id: Option<&str>,
+    account_uik: Option<&str>,
 ) -> Result<PathBuf, String> {
     let mut cfg = load().unwrap_or_default();
     cfg.daemon = Some(daemon.to_string());
@@ -351,18 +359,28 @@ pub fn put_cloud_coords(
     cfg.frontend_origin = frontend_origin
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_string());
-    // §15: persist the paired account id as the principal-ledger anchor (TOFU).
-    // Keep a previously-known value if this pairing response omits it (older backend).
+    // §15: persist the paired account UUID (reference) + the owner-UIK us_ (the
+    // real, self-certifying principal-ledger anchor). Keep prior values if this
+    // pairing response omits them (older backend / pre-UIK account).
     if let Some(a) = account_id.filter(|s| !s.is_empty()) {
         cfg.account_id = Some(a.to_string());
+    }
+    if let Some(u) = account_uik.filter(|s| !s.is_empty()) {
+        cfg.account_uik = Some(u.to_string());
     }
     save(&cfg)
 }
 
-/// The account id captured at pairing (§15 principal-ledger anchor). `None` for a
-/// local-only / pre-§15 daemon (the ledger loop then doesn't start).
+/// The account (Supabase) id captured at pairing. `None` for a local-only daemon.
 pub fn account_id() -> Option<String> {
     load().ok()?.account_id.filter(|s| !s.is_empty())
+}
+
+/// The account's owner-UIK id (`us_…`) captured at pairing — the §15 principal-ledger
+/// ANCHOR + the daemon's own per-vault member identity. `None` on an older backend /
+/// pre-UIK account (the ledger loop then doesn't start; membership-loss wipe is skipped).
+pub fn account_uik() -> Option<String> {
+    load().ok()?.account_uik.filter(|s| !s.is_empty())
 }
 
 /// Clear the cloud pairing from config + the known-vaults catalog (the inverse of
@@ -376,6 +394,7 @@ pub fn clear_pairing() -> Result<(), String> {
     cfg.cloud_backend = None;
     cfg.frontend_origin = None;
     cfg.account_id = None;
+    cfg.account_uik = None;
     cfg.vault_deleted_upstream = None;
     cfg.known_vaults.clear();
     save(&cfg)?;

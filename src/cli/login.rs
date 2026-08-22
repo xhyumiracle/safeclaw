@@ -98,6 +98,11 @@ mod tests {
 #[derive(Debug, Deserialize)]
 struct ExchangeResp {
     account_id: String,
+    /// §15: the account's owner-UIK id (`us_…`) — the principal-ledger ANCHOR the
+    /// daemon pins here (NOT the `account_id` UUID). Optional: absent on an older
+    /// backend or a pre-UIK account, in which case the ledger loop simply doesn't run.
+    #[serde(default)]
+    account_uik_id: Option<String>,
     /// The vault the pairing was scoped to, when the server sends one. Device
     /// pairing is now account-level and vault-agnostic, so this is optional and
     /// unused for selection — the daemon auto-discovers the account's vaults.
@@ -133,6 +138,8 @@ struct PollResp {
     status: String,
     #[serde(default)]
     account_id: Option<String>,
+    #[serde(default)]
+    account_uik_id: Option<String>,
     #[serde(default)]
     vault_id: Option<String>,
     #[serde(default)]
@@ -235,6 +242,7 @@ async fn device_flow_pair(
             "approved" => {
                 return Ok(ExchangeResp {
                     account_id: poll.account_id.unwrap_or_default(),
+                    account_uik_id: poll.account_uik_id,
                     // Vault-agnostic pairing: a vault_id is no longer required to
                     // finish. The daemon discovers the account's vaults on start.
                     vault_id: poll.vault_id,
@@ -409,9 +417,10 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         &local_custodian,
         &pro_backend_url,
         parsed.console_url.as_deref(),
-        // §15: persist the account id as the principal-ledger anchor (both the token
-        // and device-flow paths converge here with `parsed.account_id` in hand).
+        // §15: persist the account UUID (for reference) AND the owner-UIK us_ (the
+        // real principal-ledger anchor). Both pairing paths converge here.
         (!parsed.account_id.is_empty()).then_some(parsed.account_id.as_str()),
+        parsed.account_uik_id.as_deref(),
     )
     .map_err(|e| format!("save active config: {}", e))?;
 
