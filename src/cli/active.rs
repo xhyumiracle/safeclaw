@@ -86,11 +86,15 @@ pub struct CliConfig {
     /// `sc vault forget` never sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_deleted_upstream: Option<String>,
-    /// The account id this device paired to, captured at `sc login` (TOFU). §15
-    /// uses it as the account principal-ledger ANCHOR: the ledger's owner-UIK pubkey
-    /// self-certifies against it (`derive_id(User, uik_pub) == account_id`), so no
-    /// separate anchor pin is needed. Absent on pre-§15 pairings (the ledger loop
-    /// then simply doesn't start). Cleared by logout / self-revoke.
+    /// The account's Supabase UUID, captured at `sc login`. ROLE = logging / debug /
+    /// support identification ONLY: it matches the id shown in the web console, so a
+    /// human can tie this machine to an account. It is NOT an identity or verification
+    /// anchor — a database UUID cannot be checked against a signature. Everything that
+    /// verifies OWNER intent (the principal ledger, membership, tombstones) uses
+    /// `account_uik` (the self-certifying `us_…`) below. Keeping the two apart is the
+    /// fix for the Fix-0 confusion: an earlier build wrongly pinned THIS UUID as the
+    /// ledger anchor, so `derive_id(uik_pub) == account_id` never matched and nothing
+    /// verified. Cleared by logout / self-revoke.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     /// §15: the account's owner-UIK id (`us_…`) — the REAL principal-ledger anchor
@@ -378,7 +382,9 @@ pub fn put_cloud_coords(
     save(&cfg)
 }
 
-/// The account (Supabase) id captured at pairing. `None` for a local-only daemon.
+/// The account's Supabase UUID, for logging / debug / support display ONLY (matching a
+/// daemon to a console account). NEVER an identity or verification anchor — use
+/// [`account_uik`] for anything that checks owner intent. `None` for a local-only daemon.
 pub fn account_id() -> Option<String> {
     load().ok()?.account_id.filter(|s| !s.is_empty())
 }

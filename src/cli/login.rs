@@ -428,8 +428,13 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
         "Paired to {}; your agent talks to {}.",
         pro_backend_url, local_custodian
     );
+    // Show the user's IDENTITY (the us_ UIK) as the account line; the Supabase UUID rides
+    // as a secondary `id:` for support / console matching (debug only, never an anchor).
+    if let Some(uik) = parsed.account_uik_id.as_deref().filter(|s| !s.is_empty()) {
+        eprintln!("  account: {}", uik);
+    }
     if !parsed.account_id.is_empty() {
-        eprintln!("  account: {}", parsed.account_id);
+        eprintln!("  id:      {}", parsed.account_id);
     }
 
     // Bring SafeClaw to a ready state right after pairing: get the daemon
