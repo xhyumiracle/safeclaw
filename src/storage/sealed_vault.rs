@@ -28,7 +28,8 @@ use crate::error::{AppError, Result};
 use crate::passkey::PasskeyEntry;
 use crate::protocol::operation::decode_credential_id;
 use crate::storage::item::{
-    item_id, item_id_bytes, seal_item, unseal_item, ItemCtx, ItemNs, ItemPayload, VaultKeys,
+    aad_id_from_wire, item_id, item_id_bytes, seal_item, unseal_item, wire_id_for, ItemCtx, ItemNs,
+    ItemPayload, VaultKeys,
 };
 
 /// On-disk vault is exactly the sudp sealed-state JSON.
@@ -1458,7 +1459,9 @@ impl PerItemVault {
     ) -> Result<String> {
         let ctx = ItemCtx::for_item::<S>(keys.id_seed, vault_id, ns, name, version)?;
         let ct = seal_item::<S>(keys.content, &ctx, payload)?;
-        let id = ctx.item_id_b64();
+        // Agent-authz items address by the cleartext ag_id (== name) so the backend
+        // can gate the write by ownership (T2); the seal AAD is still ctx (the HMAC).
+        let id = if ns == ItemNs::Agent { name.to_string() } else { ctx.item_id_b64() };
         // A local write leaves `synced_version` where it was (the new version
         // is by definition not on the cloud yet) — the row is dirty until pushed.
         let synced_version = self.items.get(&id).map(|s| s.synced_version).unwrap_or(0);
@@ -1493,7 +1496,7 @@ impl PerItemVault {
     ) -> Result<Option<ItemPayload>> {
         // DP-S1: address by the STABLE id-seed, unseal with the CURRENT content
         // key (they're the same at gen 0; distinct after a re-key).
-        let id = item_id::<S>(keys.id_seed, ns.as_str(), name)?;
+        let id = wire_id_for::<S>(keys.id_seed, ns, name)?;
         let Some(stored) = self.items.get(&id) else {
             return Ok(None);
         };
@@ -2022,8 +2025,6 @@ impl PerItemVault {
         vault_id: &str,
     ) -> Result<crate::storage::plaintext::VaultPlaintextView> {
         use crate::storage::plaintext::{VaultAux, VaultPlaintextView};
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
 
         // Start from the fresh-vault defaults; config items OVERRIDE their
         // subtree, secret/connection/connecting/agent items fill their maps.
@@ -2075,13 +2076,9 @@ impl PerItemVault {
             // (seal-parity mismatch, a body shape from a newer client, a rotated
             // K) must NOT hide EVERY other secret. Skip + log it; keep the rest.
             let one: crate::error::Result<()> = (|| {
-                let raw_vec = URL_SAFE_NO_PAD
-                    .decode(id_b64.as_bytes())
-                    .map_err(|e| AppError::Internal(format!("item id base64url decode: {}", e)))?;
-                let raw: [u8; 32] = raw_vec
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| AppError::Internal("item id is not 32 bytes".into()))?;
+                // Seal AAD id: blinded ids decode; a cleartext agent wire id
+                // recomputes its HMAC (design/agent-authz-cleartext-cutover.md).
+                let raw = aad_id_from_wire::<S>(keys.id_seed, id_b64)?;
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
                 let payload = unseal_item::<S>(keys.content, &ctx, &stored.ct)?;
                 if payload.is_tombstone() {
@@ -2111,6 +2108,14 @@ impl PerItemVault {
                         aux.connecting.insert(name, c);
                     }
                     ItemNs::Agent => {
+                        // T2 (design/agent-authz-cleartext-cutover.md): a native agent
+                        // item MUST live at its own cleartext id (wire id == ag_id ==
+                        // name). Drop a body smuggled at any other id, so the backend
+                        // ownership gate on the ag_id cannot be dodged.
+                        if id_b64.as_str() != name.as_str() {
+                            tracing::warn!(vault = %vault_id, agent = %name, wire = %id_b64, "fold: dropping agent grant — wire id != ag_id");
+                            return Ok(());
+                        }
                         let raw_body = payload.body.clone();
                         let cfg = format!("agent/{}", name);
                         let Some((data, was_signed)) = fold_agent_record(
@@ -2466,18 +2471,11 @@ impl PerItemVault {
         vault_id: &str,
         want: ItemNs,
     ) -> Result<Vec<String>> {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
         let mut out = Vec::new();
         for (id_b64, stored) in &self.items {
             let one: crate::error::Result<()> = (|| {
-                let raw_vec = URL_SAFE_NO_PAD
-                    .decode(id_b64.as_bytes())
-                    .map_err(|e| AppError::Internal(format!("item id decode: {}", e)))?;
-                let raw: [u8; 32] = raw_vec
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| AppError::Internal("item id is not 32 bytes".into()))?;
+                // Cleartext agent wire ids recompute their HMAC AAD; blinded decode.
+                let raw = aad_id_from_wire::<S>(keys.id_seed, id_b64)?;
                 let ctx = ItemCtx::new(vault_id, raw, stored.version);
                 let payload = unseal_item::<S>(keys.content, &ctx, &stored.ct)?;
                 if payload.ns == want && !payload.is_tombstone() {
@@ -2916,6 +2914,56 @@ mod tests {
         assert!(
             !after.aux.agents.contains_key("ag_bob"),
             "dropped agent tombstoned"
+        );
+    }
+
+    /// T2 cutover — native `ns=Agent` items address by the CLEARTEXT ag_id: the row
+    /// PK == the ag_id (so the backend can gate the write by ownership), while the
+    /// seal AAD stays the HMAC. Proves the daemon seal/open/enumerate half of the
+    /// scheme (the signed fold path is covered by the FE↔daemon parity vector + e2e).
+    #[test]
+    fn native_agent_cleartext_seal_open_roundtrip() {
+        use crate::storage::plaintext::AgentEntry;
+        use sudp::primitives::StdPrimitives;
+        let k = [0x66u8; 32];
+        let vid = "vault-agent-ct";
+        let mut pv = PerItemVault::build_initial(
+            b"c".to_vec(),
+            "x".into(),
+            "y".into(),
+            "Dev".into(),
+            vec![0u8; 32],
+            vec![0u8; 48],
+        )
+        .unwrap();
+        let ag = "ag_abcdefghijklmnopqrstuvwxyz234567";
+        let body = serde_json::to_value(AgentEntry::default()).unwrap();
+        // seal_and_upsert stores the row at wire == ag_id (not a blinded HMAC).
+        let id = pv
+            .seal_and_upsert::<StdPrimitives>(
+                VaultKeys::single(&k),
+                vid,
+                ItemNs::Agent,
+                ag,
+                1,
+                &ItemPayload::live(ItemNs::Agent, ag.to_string(), body),
+            )
+            .unwrap();
+        assert_eq!(id.as_str(), ag, "native agent item addresses by the cleartext ag_id");
+        // open_item finds it by (ns,name) and unseals via the recomputed HMAC AAD.
+        let opened = pv
+            .open_item::<StdPrimitives>(VaultKeys::single(&k), vid, ItemNs::Agent, ag)
+            .unwrap()
+            .expect("native cleartext agent item opens");
+        assert_eq!(opened.ns, ItemNs::Agent);
+        assert_eq!(opened.name.as_str(), ag);
+        // the cleartext-aware enumerate lists it under the agent ns.
+        let names = pv
+            .live_names_in_ns::<StdPrimitives>(VaultKeys::single(&k), vid, ItemNs::Agent)
+            .unwrap();
+        assert!(
+            names.contains(&ag.to_string()),
+            "cleartext agent shows in live_names_in_ns(Agent)"
         );
     }
 
