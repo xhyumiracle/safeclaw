@@ -1778,6 +1778,43 @@ impl PerItemVault {
         }
     }
 
+    /// §15 leg A: verify an owner-signed vault-DELETE tombstone. Returns true iff
+    /// `signer` is an OWNER in this vault's fold-owner set AND `sig_b64` is a valid
+    /// Ed25519 signature over `identity::vault_tombstone_input(vault_id)` under the
+    /// signer's SELF-CERTIFYING pubkey (looked up from the keyset creds; its id must
+    /// derive from it). A fmt1/NoUik vault has no fold-owner set → false (the caller
+    /// falls back to the legacy unsigned drop under the dual-path flag).
+    pub(crate) fn tombstone_verified(&self, vault_id: &str, signer: &str, sig_b64: &str) -> bool {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use crate::storage::plaintext::MemberRole;
+        // Authority: only an OWNER may tombstone the vault.
+        if self.fold_owner_set(vault_id).get(signer) != Some(&MemberRole::Owner) {
+            return false;
+        }
+        // The signer's verifying key rides the keyset creds; self-certify it (its id
+        // must derive from the pubkey) so a poisoned cred row can't seat a phantom key.
+        let Some(uik) = self.keyset.uik.as_ref() else {
+            return false;
+        };
+        let Some(cred) = uik.creds.values().find(|c| c.user_id == signer) else {
+            return false;
+        };
+        let Ok(pub32) = <[u8; 32]>::try_from(cred.sig_pub.as_slice()) else {
+            return false;
+        };
+        if crate::identity::derive_id(crate::identity::IdKind::User, &pub32) != signer {
+            return false;
+        }
+        let Some(sig) = STANDARD
+            .decode(sig_b64)
+            .ok()
+            .and_then(|v| <[u8; 64]>::try_from(v.as_slice()).ok())
+        else {
+            return false;
+        };
+        crate::identity::verify(&pub32, &crate::identity::vault_tombstone_input(vault_id), &sig)
+    }
+
     /// Compute the current derived OWNER-SET (`user_id → role`) = the FOLD of the
     /// root-signed CHECKPOINT (each cred's `role_sig` @ the current `role_epoch`)
     /// followed by the append-only `delegation_log` (design/identity-uik-aik.md

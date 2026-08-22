@@ -750,7 +750,13 @@ fn classify_pull_body(
     // Tombstone: an explicit deleted status is the ONLY drop trigger. Checked
     // before `unchanged`/`blob` so a tombstone is never mistaken for content.
     if body.get("status").and_then(|v| v.as_str()) == Some("deleted") {
-        return Ok(PullOutcome::Deleted);
+        // §15 leg A: gate the drop on the (dual-path) tombstone check. Flag OFF (default)
+        // → always Deleted (unchanged). Flag ON → Deleted only for a verified owner
+        // tombstone; an unsigned/forged delete parks as Unchanged (a later valid pull drops).
+        if tombstone_should_drop(state_dir, vault, body) {
+            return Ok(PullOutcome::Deleted);
+        }
+        return Ok(PullOutcome::Unchanged);
     }
 
     // `{ unchanged: true }` — the cheap freshness probe said local is current.
@@ -935,6 +941,37 @@ async fn enforce_membership_presence(state: &Arc<AppState>, vault: &str) -> bool
         return true;
     }
     false
+}
+
+/// §15 leg A: decide whether a `status:"deleted"` tombstone should DROP local state.
+/// Dual-path: with the require-signed flag OFF (default) ANY tombstone drops — the
+/// legacy behavior, byte-for-byte unchanged. With it ON, drop ONLY on an owner-signed
+/// tombstone (`tombstone_sig`/`tombstone_signer` in the body) that verifies against the
+/// vault's fold-owner set; a server flipping `status` without a valid owner signature is
+/// then REJECTED (parked), not obeyed. NEVER acts on a bare 401 (that path parks
+/// upstream) — this only gates an explicit deleted-status body.
+fn tombstone_should_drop(state_dir: &Path, vault: &str, body: &serde_json::Value) -> bool {
+    if !crate::principal_ledger::require_signed_tombstone() {
+        return true; // legacy dual-path: unsigned deletes still drop until the P6 flip
+    }
+    let (Some(sig), Some(signer)) = (
+        body.get("tombstone_sig").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+        body.get("tombstone_signer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+    ) else {
+        tracing::warn!(vault = %vault, "tombstone: require-signed ON but the delete carries no owner signature; NOT dropping");
+        return false;
+    };
+    let Some(pv) = read_per_item_store(state_dir, vault) else {
+        // No local keyset to verify against (fmt1/NoUik, or nothing synced) → fail closed.
+        tracing::warn!(vault = %vault, "tombstone: require-signed ON but no local keyset to verify; NOT dropping");
+        return false;
+    };
+    if pv.tombstone_verified(vault, signer, sig) {
+        true
+    } else {
+        tracing::warn!(vault = %vault, signer = %signer, "tombstone: owner signature did NOT verify; NOT dropping (possible server-forged delete)");
+        false
+    }
 }
 
 /// After a runtime pull wrote a new `vault.dat`, refresh the in-memory cache
@@ -1643,12 +1680,19 @@ pub async fn watch_loop(
             // explicit "deleted" stays the ONLY local-state destroyer.
             if let Some((version, status)) = work.vault {
                 if status == VaultStatus::Deleted {
-                    drop_local_vault_locked(&state, &vault).await;
-                    tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
-                    // Task exit drops the sole strong ref to the cell; the
-                    // dispatcher prunes this vid from `?vids` at its next
-                    // reconnect.
-                    return;
+                    // §15 leg A: the SSE vault EVENT carries no tombstone signature, so
+                    // it can direct-drop only under the legacy (flag-OFF) path. With
+                    // require-signed ON, do NOT drop/stop here — fall through so the
+                    // reconcile blob probe re-fetches the SIGNED tombstone body, which
+                    // `handle_blob_wake_body` gates against the fold-owner set.
+                    if !crate::principal_ledger::require_signed_tombstone() {
+                        drop_local_vault_locked(&state, &vault).await;
+                        tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
+                        // Task exit drops the sole strong ref to the cell; the
+                        // dispatcher prunes this vid from `?vids` at its next
+                        // reconnect.
+                        return;
+                    }
                 }
                 // ★ Cursor re-read from disk at use time, never cached across
                 // parks — the loop-top discipline the long-poll shape gets
@@ -2105,11 +2149,16 @@ async fn handle_blob_wake_body(
     channel: &str,
 ) -> BlobWake {
     if body.get("status").and_then(|v| v.as_str()) == Some("deleted") {
-        // Drop under the per-vault write lock so the destroy can't race a
-        // concurrent approve.rs / connect write to vault.dat.
-        drop_local_vault_locked(state, vault).await;
-        tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
-        return BlobWake::Stopped;
+        // §15 leg A: gate the drop (dual-path). Flag OFF (default) → drop as today.
+        // Flag ON → drop only on a verified owner tombstone; else park (keep watching).
+        if tombstone_should_drop(state_dir, vault, body) {
+            // Drop under the per-vault write lock so the destroy can't race a
+            // concurrent approve.rs / connect write to vault.dat.
+            drop_local_vault_locked(state, vault).await;
+            tracing::info!(vault = %vault, "cloud sync: vault deleted upstream (owner-verified); dropped local state");
+            return BlobWake::Stopped;
+        }
+        return BlobWake::Unchanged;
     }
     // Server-authoritative operational facts (team §4/§9): trust `kind` + advance
     // the offline-lease clock only from a server signature we can verify against

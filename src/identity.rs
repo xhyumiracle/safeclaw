@@ -84,6 +84,13 @@ pub const DS_ROOT_SUCCESSION: &[u8] = b"safeclaw/v1/root-succession";
 /// against the UIK it already learned at pairing. See [`principal_event_input`].
 pub const DS_PRINCIPAL_EVENT: &[u8] = b"safeclaw/v1/principal-event";
 
+/// Domain tag for a vault-DELETE tombstone (§15 leg A, per-vault drop). The vault
+/// OWNER signs this so a daemon destroys local state on OWNER intent, not a server
+/// flipping a cleartext `status:"deleted"` field. Verified against the vault's
+/// fold-owner set (the same genesis-anchored authority as [`DS_DELEGATION`]). See
+/// [`vault_tombstone_input`].
+pub const DS_VAULT_TOMBSTONE: &[u8] = b"safeclaw/v1/vault-tombstone";
+
 /// UIK lineage succession certificate (old UIK signs the new UIK). See
 /// [`succession_input`].
 pub const DS_SUCCESSION: &[u8] = b"safeclaw/v1/uik-succession";
@@ -634,6 +641,27 @@ pub fn principal_event_input(
     out
 }
 
+/// Canonical bytes a vault OWNER signs to tombstone (delete) a vault (§15 leg A):
+///
+/// ```text
+/// lp(DS_VAULT_TOMBSTONE) ‖ lp(vault_id)
+/// ```
+///
+/// The `vault_id` is a unique, never-reused UUID, so binding it alone is replay-safe
+/// (a signed tombstone can only ever name the one vault it deletes; there is no later
+/// vault with the same id to replay it onto). A daemon honors the tombstone iff the
+/// signer is an owner in the vault's fold-owner set — the same genesis-anchored
+/// authority that gates [`delegation_event_input`]. This raises "delete a vault
+/// locally" from "the server flips a cleartext status field" to "forge an owner
+/// signature": [`DS_SERVER_ENVELOPE`] is server-signed and does NOT cover `status`,
+/// so the destroy signal needed its own OWNER-signed channel.
+pub fn vault_tombstone_input(vault_id: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_lp(&mut out, DS_VAULT_TOMBSTONE);
+    push_lp(&mut out, vault_id.as_bytes());
+    out
+}
+
 /// Signing input for a root-succession certificate — the CURRENT root signs the
 /// NEXT root's id + signing pubkey, so a daemon follows a short chain from the
 /// TOFU-pinned genesis root to the current root (creator transfer / offboard;
@@ -1181,5 +1209,24 @@ mod tests {
         // to make a test pass — find why Rust ↔ TS diverged.
         let input = principal_event_input("us_acct", "revoke", "dev_box", 7, "us_acct");
         assert_eq!(hex(&input), "0000001b73616665636c61772f76312f7072696e636970616c2d6576656e740000000775735f61636374000000067265766f6b65000000076465765f626f7800000000000000070000000775735f61636374");
+    }
+
+    #[test]
+    fn pinned_vault_tombstone_input() {
+        // §15 leg-A golden vector. FIXED input: vault "vault-7". The Node (keyset-roles)
+        // + TS (uik-crypto) mirrors pin the SAME hex. Do NOT edit an expected value to
+        // make a test pass — find why Rust ↔ Node ↔ TS diverged.
+        let input = vault_tombstone_input("vault-7");
+        assert_eq!(hex(&input), "0000001b73616665636c61772f76312f7661756c742d746f6d6273746f6e65000000077661756c742d37");
+    }
+
+    #[test]
+    fn vault_tombstone_roundtrip_and_vault_tamper() {
+        // The owner signs a tombstone; the daemon rebuilds the input and verifies. A
+        // signature over vault A must NOT verify as a tombstone for vault B (vault_id bound).
+        let owner = SigningIdentity::from_seed(&UIK_SEED);
+        let sig = owner.sign(&vault_tombstone_input("vault-a"));
+        assert!(verify(&owner.public_bytes(), &vault_tombstone_input("vault-a"), &sig));
+        assert!(!verify(&owner.public_bytes(), &vault_tombstone_input("vault-b"), &sig), "vault_id is bound");
     }
 }

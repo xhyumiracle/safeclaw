@@ -109,6 +109,25 @@ pub fn principal_enforce_enabled() -> bool {
     matches!(v.as_deref(), Some("on" | "1" | "true" | "yes" | "enabled"))
 }
 
+/// §15 leg-A require-signed-tombstone flag — DEFAULT OFF (an unsigned `status:"deleted"`
+/// still drops local state, the legacy behavior). `SAFECLAW_REQUIRE_SIGNED_TOMBSTONE`
+/// wins over `CliConfig.require_signed_tombstone`. Flipped on at the P6 cutover so a
+/// server can no longer force a local wipe by flipping `status` without a valid
+/// owner-signed tombstone (verified against the vault's fold-owner set).
+pub fn require_signed_tombstone() -> bool {
+    let v = std::env::var("SAFECLAW_REQUIRE_SIGNED_TOMBSTONE")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            crate::cli::active::load()
+                .ok()
+                .and_then(|c| c.require_signed_tombstone)
+                .map(|s| s.trim().to_ascii_lowercase())
+        });
+    matches!(v.as_deref(), Some("on" | "1" | "true" | "yes" | "enabled"))
+}
+
 // ── base64 → fixed arrays ────────────────────────────────────────────────────
 
 fn decode_pub32(b64: &str) -> Option<[u8; 32]> {

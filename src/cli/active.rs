@@ -106,6 +106,13 @@ pub struct CliConfig {
     /// cutover. See [`crate::principal_ledger::principal_enforce_enabled`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal_enforce: Option<String>,
+    /// §15 leg-A require-signed-tombstone switch: DEFAULT OFF — an unsigned
+    /// `status:"deleted"` still drops local state (legacy). When "on", the daemon drops
+    /// only on an owner-signed tombstone that verifies against the vault fold-owner set.
+    /// `SAFECLAW_REQUIRE_SIGNED_TOMBSTONE` overrides. Flipped on at the P6 cutover. See
+    /// [`crate::principal_ledger::require_signed_tombstone`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_signed_tombstone: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
