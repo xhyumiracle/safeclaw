@@ -79,7 +79,20 @@ while online: a revoked device/agent loses the ability to use secrets. Universal
     + 3 golden vectors; FE delete ceremony signs it (owner passkey tap); backend stores+serves
     it; core verifies-before-destroy, DUAL-PATH (accept unsigned OR verified-signed; only
     REQUIRE signed behind a flag, so existing deletes never brick). Large but unambiguous.
-  - **Leg B — membership-loss active-wipe — BLOCKED ON A DESIGN QUESTION (do NOT guess).**
+  - **Leg B — membership-loss active-wipe — DONE (branch `573931a`; green).** Design fork
+    RESOLVED by the user: the daemon's per-vault member identity = the account owner-UIK
+    `us_` pinned at pairing (Fix-0). `PerItemVault::verified_membership(vault, us) ->
+    Option<bool>` (`Some(false)` = a `Verified`, non-empty owner-fold that EXCLUDES us;
+    `None` = NoUik/Untrusted/bootstrap → park). `sync.rs enforce_membership_presence` →
+    `drop_local_vault_locked` + stop watcher, wired after the sse-wake + reconcile pulls.
+    Flag-gated (default OFF). A rolled-back/dropped-grant triple → `Untrusted` → never a
+    false wipe; a wrong wipe is recoverable (discovery won't re-add a non-member vault).
+  - **Fix-0 — CRITICAL P4 anchor bug fixed (backend `27bd766` dev; core `422bbf5`).** P4
+    pinned the Supabase account UUID and passed it to `fold_verified`, whose self-cert
+    `derive_id(User,uik_pub)==anchor` never matches a UUID → P4 verified nothing in prod
+    (parked, never enforced). Now: pairing delivers `account_uik_id` (`accountOwnerUik`);
+    daemon pins `CliConfig.account_uik`; the ledger loop + leg B both anchor on that `us_`.
+  - **(original leg-B blocker, now resolved) design question was:**
     Today a removed team member's daemon only "stops serving" weakly: `adopt_membership_triple`
     (`sync.rs:2844`) adopts only PRESENT members, never prunes an absent self, never wipes;
     stale K stays retained while unlocked + `vault.dat` stays on disk. The VERIFIED signal
@@ -105,9 +118,13 @@ rollback-resistant, flag-gated default OFF). This fully covers the originating r
 ("owner revokes device → device can't use secrets, online case"). Commits: core P1 `1970d03`
 + P4 `a5704b3` (branch `feat/account-principal-ledger`); backend P2 `778bb63` (dev, migration
 LIVE on dev DB); frontend P3 `622670b` (dev).
-LEFT (paused for user input / launch-gated):
-- **P5 leg A** (sign delete tombstone) — buildable, large; see above. Ready to build on request.
-- **P5 leg B** (membership-loss wipe) — BLOCKED on the daemon-identity design question above.
+Also DONE since: **Fix-0** (P4 anchor bug → P4 now actually verifies in prod) + **P5 leg B**
+(membership-loss active-wipe). Commits: backend `27bd766`; core `422bbf5` (Fix-0), `573931a`
+(leg B).
+LEFT:
+- **P5 leg A** (sign delete tombstone) — buildable, large (new `DS_VAULT_TOMBSTONE` ×3 langs +
+  FE delete ceremony + backend store/serve + core verify-before-destroy at 4 trust sites,
+  dual-path so unsigned deletes never brick; require-signed behind a flag = P6). NEXT.
 - **P6 cutover** — flip `SAFECLAW_PRINCIPAL_ENFORCE` on + mandatory /pair tap + retire §14
   session-admission + adversarial review. The FLIP is a launch decision (user-gated); the
   adversarial review + making the tap mandatory are buildable.
@@ -115,6 +132,26 @@ LEFT (paused for user input / launch-gated):
   rush); merge core branch `feat/account-principal-ledger` → core `dev` + cut an rc when P5/P6
   land. All current work is isolated on the branch / additive-dormant, so the user's fresh
   e2e on rc.9 is unaffected.
+
+## Resume pointer → P5 leg A (signed vault-delete tombstone)
+1. **Primitive:** `identity.rs` add `DS_VAULT_TOMBSTONE = b"safeclaw/v1/vault-tombstone"` +
+   `vault_tombstone_input(vault_id, version) = lp(DS)‖lp(vault_id)‖u64(version)` + pinned test.
+   Mirror in `keyset-roles.mjs` (`vaultTombstoneInput` + boot self-check) + `uik-crypto.ts`
+   (`vaultTombstoneInput` + verify-uik-crypto vector). Three-way golden hex parity (like P1-P3).
+2. **FE:** the delete-vault ceremony (find it: `vault-grant.ts deleteVault` / the console delete
+   button) signs `vault_tombstone_input(vaultId, version)` with the owner UIK (reuse
+   `recoverOwnerUik` / the unlocked `cached` if present) and sends `{tombstone_sig, tombstone_signer}`
+   to `DELETE /api/vault/vaults/:id`.
+3. **Backend:** `handleDeleteVault` stores the sig+signer (new `vaults` columns or a JSON);
+   the blob GET tombstone branch (`vault-routes.mjs:2200`) serves them alongside `status:"deleted"`.
+4. **Core (the delicate part):** the 4 sites that act on `status:"deleted"` (`sync.rs`
+   `classify_pull_body:752`, `handle_blob_wake_body:2069`, `watch_loop` SSE arm `:1615`, +
+   `pull_on_start`/`sync_vault_now`/`recover_after_conflict`) VERIFY the tombstone sig against the
+   vault's fold-owner set (`fold_owner_set` / genesis root) BEFORE `drop_local_vault*`. DUAL-PATH:
+   signed+verified → drop; signed+bad → REJECT (park, warn — the forgery-defense win); unsigned →
+   drop (legacy) UNLESS a `require-signed` flag is on (default OFF → flip at P6). Never brick an
+   existing unsigned delete. Personal (fmt1/NoUik) vaults: the owner signs with their sole UIK
+   (creator anchor) — same path.
 
 ## (superseded) earlier resume pointer
 Next: **P5 per-vault drop hardening** (SSOT §15 "per-vault drop", agent-device-identity-mtls.md:725-736).
