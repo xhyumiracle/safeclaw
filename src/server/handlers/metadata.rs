@@ -340,24 +340,33 @@ pub fn acquire_k_from_keyset(
         // v1: `secret` is W_c → unwrap K directly.
         return unwrap_k_from_keyset(keyset, secret, credential_id_bytes);
     };
-    // v2: `secret` is the UIK root → open K from this credential's seal.
+    // v2: `secret` is the UIK root → open K from this member's K-seal.
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    let cid_b64 = URL_SAFE_NO_PAD.encode(credential_id_bytes);
-    let entry = uik
-        .creds
-        .get(&cid_b64)
-        .ok_or_else(|| AppError::Unauthorized("no UIK seal for credential".into()))?;
     if secret.len() != 32 {
         return Err(AppError::Unauthorized("UIK root must be 32 bytes".into()));
     }
     let mut root = zeroize::Zeroizing::new([0u8; 32]);
     root.copy_from_slice(secret);
-    crate::crypto::vault_key::UikRoot::from_root(*root).open_k(
-        vault_id,
-        &entry.k_encapped,
-        &entry.k_ct,
-    )
+    let uik_root = crate::crypto::vault_key::UikRoot::from_root(*root);
+    // The K seal (`k_encapped`/`k_ct`) is per-PERSON: it seals K to this member's UIK
+    // encryption key, so EVERY credential of the person carries the SAME seal (the
+    // membership fold copies `m.k_encapped` onto each cred row). Prefer this
+    // credential's own entry, but if it isn't in the synced keyset yet — an
+    // upgraded/newly-added passkey the daemon's since-cursor hasn't caught (e.g.
+    // `putCredentialWrap` doesn't bump `keyset_seq`) — fall back to ANY entry for the
+    // SAME person, resolved from the delivered root's `us_…`. Safe: the delivered root
+    // proves the approver controls THIS person's UIK, so opening with that person's own
+    // seal is exactly right and never crosses to another member (open_k is
+    // authenticated, so a mismatched root fails closed anyway).
+    let cid_b64 = URL_SAFE_NO_PAD.encode(credential_id_bytes);
+    let us_id = uik_root.user_id();
+    let entry = uik
+        .creds
+        .get(&cid_b64)
+        .or_else(|| uik.creds.values().find(|c| c.user_id == us_id))
+        .ok_or_else(|| AppError::Unauthorized("no UIK seal for this member".into()))?;
+    uik_root.open_k(vault_id, &entry.k_encapped, &entry.k_ct)
 }
 
 /// Blinded item ids of the owner-only config aux items under this vault's `K`
