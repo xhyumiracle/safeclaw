@@ -50,12 +50,26 @@ the blast radius:
   but forces `ItemCtx.id: [u8;32]` → variable across the daemon — a sprawling,
   risky refactor touching every ItemCtx construction/use + the 32-byte row-PK
   decode assumptions (`sealed_vault.rs:2081/2477`).
-- **(Y) fixed-32 (CHOSEN)**: wire `item_id = ag_id` (cleartext, backend-visible),
-  but AAD id bytes = `H(ag_id)` domain-separated 32 bytes (e.g. HKDF/HMAC label
-  `"safeclaw/agent-aad/v1"`). Keeps `[u8;32]` everywhere → NO ItemCtx refactor, NO
-  relaxing the 32-byte decode. The ONLY change is the per-namespace rule "how to
-  get AAD bytes from the wire id": agents → `H(ag_id)`; others → `decode(wire)`
-  (unchanged). Same set of id→bytes sites, but each keeps 32 bytes.
+- **(Y′) fixed-32, reuse the EXISTING HMAC (CHOSEN, refined 2026-08-23)**: wire
+  `item_id = ag_id` (cleartext, backend-visible, 35 chars), but the seal/sig AAD id
+  bytes = the UNCHANGED `item_id_bytes(K, "agent", ag_id)` HMAC (the same 32-byte
+  derivation everything else uses — NOT a new hash). So `ItemCtx.id` stays
+  `[u8;32]`, `seal_ctx()` unchanged, existing HMAC parity vectors already cover the
+  AAD. The ONLY changes: (a) the WIRE id (row PK / URL) for an agent item = `ag_id`
+  instead of `item_id_b64` (base64url of the HMAC); (b) on READ, reconstruct the
+  AAD for an agent row by RECOMPUTING `item_id_bytes(K,"agent",ag_id)` from the
+  `ag_id` in the wire id, instead of `decode(wire_id)`.
+
+  **Recognition is collision-proof by LENGTH, no prefix guessing:** `ag_id` =
+  `"ag_" + base32_nopad(sha256(pk)[:20])` = **35 chars, `[a-z2-7]`** (identity.rs
+  derive_id). Blinded ids = **43-char base64url**. Disjoint sets. Rule everywhere
+  (FE + daemon + backend): `wire_id.length == 35 && startsWith("ag_")` ⇒ agent
+  (recompute HMAC AAD; backend reads the ag_id straight off the wire id); else ⇒
+  blinded (decode as today). A 43-char blinded id that happens to start `ag_` is
+  length 43 ⇒ never misclassified.
+
+  This is strictly less invasive than (X)/(Y): no ItemCtx type change, no new hash,
+  no new AAD parity vector (only a trivial "wire id for agent == ag_id" check).
 
 Trade: (Y) decouples AAD-id from wire-id for the agent ns (a contained asymmetry)
 in exchange for avoiding a sprawling variable-length refactor across seal/unseal on

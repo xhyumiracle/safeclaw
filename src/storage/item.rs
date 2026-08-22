@@ -83,6 +83,49 @@ pub fn item_id<S: PrimitiveSuite>(k: &[u8], ns: &str, name: &str) -> Result<Stri
     Ok(URL_SAFE_NO_PAD.encode(item_id_bytes::<S>(k, ns, name)?))
 }
 
+// ── Cleartext agent-authz item ids (T2 / aux→agent cutover) ──────────────────
+// An authorized-agents item is addressed by its CLEARTEXT `ag_id` (not a blinded
+// HMAC), so the backend can read the ag_id off the wire id and gate the write by
+// ownership — see design/agent-authz-cleartext-cutover.md. The seal/sig AAD is
+// STILL the HMAC `item_id_bytes(k,"agent",ag_id)` (unchanged 32 bytes); only the
+// WIRE string (row PK / URL) differs. Recognition is collision-proof by LENGTH:
+// `ag_id` = `"ag_"` + 32 base32 chars = 35 (identity::derive_id); every blinded
+// item id is 43-char base64url. Disjoint sets — no prefix guessing can misfire.
+
+/// Length of a cleartext agent wire id: `"ag_"` (3) + 32 base32 chars.
+pub const AGENT_WIRE_ID_LEN: usize = 35;
+
+/// True iff `wire_id` is a cleartext agent-authz item id (`ag_…`, 35 chars).
+pub fn is_agent_wire_id(wire_id: &str) -> bool {
+    wire_id.len() == AGENT_WIRE_ID_LEN && wire_id.starts_with("ag_")
+}
+
+/// The WIRE id (row PK / URL) for `(ns, name)`. `agent` ns ⇒ the cleartext ag_id
+/// (`== name`); every other ns ⇒ the blinded base64url HMAC.
+pub fn wire_id_for<S: PrimitiveSuite>(k: &[u8], ns: ItemNs, name: &str) -> Result<String> {
+    if ns == ItemNs::Agent {
+        Ok(name.to_string())
+    } else {
+        item_id::<S>(k, ns.as_str(), name)
+    }
+}
+
+/// Reconstruct the 32-byte seal/sig AAD id from a stored WIRE id. Blinded ids are
+/// base64url of the 32 AAD bytes (decode). A cleartext agent wire id IS the ag_id,
+/// so recompute its HMAC `item_id_bytes(k,"agent",ag_id)` — the SAME bytes the
+/// writer sealed under. Mirrors the FE read path (`unsealItem`).
+pub fn aad_id_from_wire<S: PrimitiveSuite>(k: &[u8], wire_id: &str) -> Result<[u8; 32]> {
+    if is_agent_wire_id(wire_id) {
+        item_id_bytes::<S>(k, ItemNs::Agent.as_str(), wire_id)
+    } else {
+        let raw = URL_SAFE_NO_PAD
+            .decode(wire_id.as_bytes())
+            .map_err(|e| AppError::Internal(format!("item id base64url decode: {}", e)))?;
+        <[u8; 32]>::try_from(raw.as_slice())
+            .map_err(|_| AppError::Internal("item id is not 32 bytes".into()))
+    }
+}
+
 /// Deterministic **conflict-copy** id (contract §4/§5): the same HMAC
 /// construction as [`item_id_bytes`] with an extra `"conflict"` label and the
 /// loser's version folded in, so a retry of the same conflict is idempotent
@@ -472,6 +515,37 @@ mod tests {
         let k = [0x42u8; 32];
         let id = item_id::<StdPrimitives>(&k, "secret", "GMAIL_REFRESH_TOKEN").unwrap();
         assert_eq!(id, "25fAyYNRxgkF3WqLCKweefkv-JCd5UECrQP7LCgApiQ");
+    }
+
+    /// The cleartext agent wire-id scheme (design/agent-authz-cleartext-cutover):
+    /// the wire id IS the ag_id, but its seal/sig AAD is the SAME HMAC the blinded
+    /// scheme derives for (ns=agent, name=ag_id). Blinded ids stay 43-char base64url
+    /// and are decoded; the two id spaces are disjoint by length (35 vs 43). The FE
+    /// mirror (lib/vault-items.ts) must agree byte-for-byte.
+    #[test]
+    fn agent_cleartext_wire_id_scheme() {
+        let k = [0x42u8; 32];
+        // ag_id = "ag_" + 32 lowercase base32 chars = 35 chars.
+        let ag = "ag_abcdefghijklmnopqrstuvwxyz234567";
+        assert_eq!(ag.len(), AGENT_WIRE_ID_LEN);
+        assert!(is_agent_wire_id(ag));
+        // wire id for an agent item is the ag_id verbatim.
+        assert_eq!(wire_id_for::<StdPrimitives>(&k, ItemNs::Agent, ag).unwrap(), ag);
+        // its AAD reconstructs to the SAME HMAC the writer sealed under.
+        assert_eq!(
+            aad_id_from_wire::<StdPrimitives>(&k, ag).unwrap(),
+            item_id_bytes::<StdPrimitives>(&k, "agent", ag).unwrap(),
+        );
+        // a blinded secret id is 43 chars, NOT an agent id, and round-trips by decode.
+        let blinded = item_id::<StdPrimitives>(&k, "secret", "X").unwrap();
+        assert_eq!(blinded.len(), 43);
+        assert!(!is_agent_wire_id(&blinded));
+        assert_eq!(
+            aad_id_from_wire::<StdPrimitives>(&k, &blinded).unwrap(),
+            item_id_bytes::<StdPrimitives>(&k, "secret", "X").unwrap(),
+        );
+        // wire id for a non-agent ns is the blinded base64url.
+        assert_eq!(wire_id_for::<StdPrimitives>(&k, ItemNs::Secret, "X").unwrap(), blinded);
     }
 
     /// Pin `K_id` too (cross-checked against an independent Python HKDF that
