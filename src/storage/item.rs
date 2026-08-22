@@ -536,6 +536,12 @@ mod tests {
             aad_id_from_wire::<StdPrimitives>(&k, ag).unwrap(),
             item_id_bytes::<StdPrimitives>(&k, "agent", ag).unwrap(),
         );
+        // Cross-lang PINNED — the FE (lib/vault-items.ts assertItemVectors) pins the
+        // identical string. A drift here would silently drop agent rows on one side.
+        assert_eq!(
+            item_id::<StdPrimitives>(&k, "agent", ag).unwrap(),
+            "9s_KpuijM0bNw-GnGuEAB5Jf0gupmsycI8H46UdSnow"
+        );
         // a blinded secret id is 43 chars, NOT an agent id, and round-trips by decode.
         let blinded = item_id::<StdPrimitives>(&k, "secret", "X").unwrap();
         assert_eq!(blinded.len(), 43);
