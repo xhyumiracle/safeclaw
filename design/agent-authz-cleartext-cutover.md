@@ -1,8 +1,29 @@
 # Agent-authz cleartext id + `aux`→`agent` cutover + T2 close (LOCKED design)
 
-Status: PROPOSED (2026-08-22). Extends `agent-device-identity-mtls.md` §11.1/§14.
-SSOT for the authorized-agents item scheme, its server-side ownership gate (T2),
-and the one-shot forced-upgrade migration.
+Status: BUILT (2026-08-23, dev branches, UNPUSHED). Extends
+`agent-device-identity-mtls.md` §11.1/§14. SSOT for the authorized-agents item
+scheme, its server-side ownership gate (T2), and the one-shot forced-upgrade
+migration.
+
+Commits (local dev): daemon `8f142af` + pin `f6a07c9`; backend gate `adb579e`;
+FE parity `a7de6d0` + lazy migration `d42bda1`. Verified: 46 daemon storage tests,
+backend `node --check`, FE `tsc`, cross-lang AAD vector `9s_Kpu…` pinned both sides
+(node reproduces the Rust secret vector → algorithm byte-identical). NOT
+browser-e2e'd (VM can't run the console).
+
+## ⚠️ DEPLOY ORDER (critical — daemon FIRST)
+
+The new FE WRITES cleartext-native agent items; an OLD daemon decodes the 35-char
+ag_id wire as base64url → fails → DROPS the row → the agent silently loses access.
+So the daemon must read the new scheme BEFORE the FE writes it. Order:
+
+1. Tag a core rc containing the daemon changes; the client `sc upgrade`s to it
+   (NEW daemon reads cleartext-native + legacy → dual-read, still works with the
+   old FE).
+2. THEN deploy backend (the gate) + FE (native writes) to the same env.
+3. Never leave "old daemon + new FE" reachable. For PROD, bump §12.9
+   `MIN_DAEMON_VERSION` so old daemons are locked out (403) until upgraded — that
+   IS the safe window; reuse it (dev tests it now, prod one-shots later).
 
 ## Why
 
