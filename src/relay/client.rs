@@ -74,6 +74,10 @@ pub fn spawn_register_and_poll(
     op: Value,
     r: String,
     expires_at: u64,
+    // The triggering agent's id (api-key prefix / AIK id), forwarded to the
+    // relay so the approve page can name WHO asked. None for user-initiated
+    // lifecycle ceremonies (unlock/lock/delete).
+    agent_id: Option<String>,
 ) {
     let (relay_url, auth_token) = match resolve_relay(&state) {
         Some(v) => v,
@@ -89,6 +93,7 @@ pub fn spawn_register_and_poll(
             &op,
             &r,
             expires_at,
+            agent_id.as_deref(),
         )
         .await
         {
@@ -165,6 +170,7 @@ async fn run(
     op: &Value,
     r: &str,
     expires_at: u64,
+    agent_id: Option<&str>,
 ) -> Result<(), String> {
     let base = relay_url.trim_end_matches('/');
     // v1.1: register for `op` stream events before anything can flip the
@@ -193,6 +199,10 @@ async fn run(
         "passkeys": passkeys,
         "r": r,
         "expires_at": expires_at,
+        // WHO triggered this op — the agent the local broker authenticated.
+        // Advisory attribution for the approve page (the backend resolves it to
+        // a label); null for user-initiated lifecycle ceremonies.
+        "agent_id": agent_id,
     });
     let reg = client
         .post(&reg_url)

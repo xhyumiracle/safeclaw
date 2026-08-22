@@ -90,7 +90,7 @@ pub fn register_pending_use(
 
     if let Ok(audit_store) = state.audits.for_vault(vault_id) {
         let mut row = audit::row_from_op(&op_id, &op, now as i64, expires_at as i64);
-        row.agent_prefix = agent_prefix;
+        row.agent_prefix = agent_prefix.clone();
         if let Err(e) = audit_store.insert(&row) {
             tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending (use) failed: {}", e);
         }
@@ -103,6 +103,7 @@ pub fn register_pending_use(
         serde_json::to_value(&op).unwrap_or(Value::Null),
         r.clone(),
         expires_at,
+        agent_prefix,
     );
 
     state.emit_event(ApprovalEvent {
