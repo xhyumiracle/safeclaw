@@ -83,6 +83,16 @@ pub fn item_id<S: PrimitiveSuite>(k: &[u8], ns: &str, name: &str) -> Result<Stri
     Ok(URL_SAFE_NO_PAD.encode(item_id_bytes::<S>(k, ns, name)?))
 }
 
+/// Blinded row-id for a vault AUX config item ([`ItemNs::Aux`], given `name`)
+/// under vault key `k`, using the standard primitive suite. A NEUTRAL primitive
+/// (the same derivation a personal vault uses for its own aux items); exposed so
+/// the closed team overlay can compute the shared-vault owner lock-list without
+/// pulling the primitive suite. The POLICY (which aux names are owner-gated) stays
+/// in the overlay. See team-edition §9.
+pub fn aux_item_id(k: &[u8], name: &str) -> Result<String> {
+    item_id::<sudp::primitives::StdPrimitives>(k, ItemNs::Aux.as_str(), name)
+}
+
 // ── Cleartext agent-authz item ids (T2 / aux→agent cutover) ──────────────────
 // An authorized-agents item is addressed by its CLEARTEXT `ag_id` (not a blinded
 // HMAC), so the backend can read the ag_id off the wire id and gate the write by

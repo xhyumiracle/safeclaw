@@ -402,22 +402,6 @@ pub fn acquire_k_from_keyset(
     uik_root.open_k(vault_id, &entry.k_encapped, &entry.k_ct)
 }
 
-/// Blinded item ids of the owner-only config aux items under this vault's `K`
-/// — the owner lock list the backend write-gates (team §5.15). `aux:*`
-/// addressing. Non-secret by design (the aux-id registration decision):
-/// naming WHICH ids are config reveals category, never content. Includes
-/// `members` (owner-managed: only owners approve joins / change roles), so a
-/// member can't rewrite the membership. `agents` is NOT here — each agent mask is
-/// its own `aux:agent/<id>` item, member-edited (edit tier); its per-author
-/// gate is a T2 concern (needs the agent-id→member registration).
-fn config_aux_item_ids(k: &[u8], vault_id: &str) -> Result<Vec<String>> {
-    use crate::storage::item::ItemNs;
-    let _ = vault_id;
-    ["policy", "stores", "store_order", "audit_retention_days", "services", "members"]
-        .into_iter()
-        .map(|name| crate::storage::item::item_id::<StdPrimitives>(k, ItemNs::Aux.as_str(), name))
-        .collect()
-}
 
 /// Per-item analogue of [`decrypt_vault_view`]: unwrap `K` from the keyset via
 /// the grant, then fold all live item rows into a [`VaultPlaintextView`]. Used
@@ -508,31 +492,11 @@ pub fn open_view_for_grant_keep_key(
                 &pv,
                 vault_id,
             )?;
-            // Shared vault: queue the owner lock-list registration — the
-            // blinded ids of the config aux items the backend write-gates as
-            // owner-only (team §5.15). The sync loop delivers it once.
-            //
-            // Sharedness is the server-authoritative `kind` bit (SM §4), NOT the
-            // in-vault member count. The role rework removed `aux.members` (roles
-            // now ride the keyset cred, design/identity-uik-aik.md §4.3), so this
-            // MUST gate on `vault_is_shared`, not `!aux.members.is_empty()` — else
-            // shared vaults never register their lock-list and a non-owner could
-            // overwrite owner-config (the daemon drops it → falls to allow-by-
-            // default masks = self-escalation). The lock-list stays until plaintext
-            // record-type (B2) enables role×type gating to replace it (§0.7(5)).
-            //
-            // NOTE: T1 keeps config at LEGACY `aux:<name>` addressing (the console
-            // still reads/writes it), so the gated ids are the `aux:*` ids, NOT the
-            // not-yet-active unified per-ns ids (the §8.3 cutover is later).
-            if state.vault_is_shared(vault_id) {
-                if let Ok(ids) = config_aux_item_ids(&k, vault_id) {
-                    state
-                        .pending_config_ids
-                        .lock()
-                        .unwrap()
-                        .insert(vault_id.to_string(), ids);
-                }
-            }
+            // Team serve-time policy (the shared-vault owner lock-list: which
+            // owner-only config the backend write-gates) is CLOSED: it lives in
+            // the private safeclaw-ee overlay behind this seam, so a personal /
+            // open-source build (NoopHooks) registers nothing. team-edition §9.
+            state.team.on_vault_unlocked(state, vault_id, &k);
             return Ok((view, k));
         }
     }

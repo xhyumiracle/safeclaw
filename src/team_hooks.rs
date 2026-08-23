@@ -33,6 +33,15 @@ pub trait TeamHooks: Send + Sync {
     fn serve_gate(&self, _state: &AppState, _vault_id: &str) -> Option<GateDenial> {
         None
     }
+
+    /// Called on the serve path right after a vault is unlocked (K in hand). The
+    /// overlay uses it to register serve-time team policy that depends on the
+    /// unlocked key, e.g. the SHARED-vault owner lock-list (the blinded ids of the
+    /// owner-only config the backend write-gates so a non-owner member can't
+    /// overwrite it). The gated set is team POLICY and lives in the closed overlay;
+    /// core exposes only the neutral id primitive ([`crate::storage::item::aux_item_id`]).
+    /// Default: no-op (a personal / open-source build registers nothing).
+    fn on_vault_unlocked(&self, _state: &AppState, _vault_id: &str, _k: &[u8]) {}
 }
 
 /// The open-source build's hooks: no team behavior whatsoever. A personal vault
