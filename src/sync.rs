@@ -701,6 +701,16 @@ async fn pull(
     vault: &str,
     device_key: &str,
 ) -> Result<PullOutcome, String> {
+    // Personal build: a SHARED (team) vault is left to the official build, so its
+    // whole-blob is never pulled here either. The main sync loop and the discovery
+    // reconcile already pre-filter shared vaults, but the arbitrary-vid callers
+    // (`sync_vault_now` via `POST /v/{vid}/sync`, `recover_after_conflict`) do not,
+    // so gate at the primitive to keep team material off disk regardless of
+    // caller, the same single-chokepoint rule the per-item primitives use.
+    // Reporting `Unchanged` (not an error) keeps those callers benign. §9.
+    if leave_shared_to_official(vault) {
+        return Ok(PullOutcome::Unchanged);
+    }
     let local_ver = read_local_version(state_dir, vault);
     let url = format!(
         "{}/v/{}/blob?since={}",
