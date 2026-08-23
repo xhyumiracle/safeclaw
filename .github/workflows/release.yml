@@ -1,14 +1,26 @@
-name: Release
+name: Release (official = open core + private team overlay)
+
+# The OFFICIAL binary everyone downloads (stable AND pre-release) is the ASSEMBLED
+# build: this public core pinned at the release tag + the PRIVATE team overlay
+# (SafeClaw-OSS/safeclaw-ee). team-edition §9 (VS Code / Code-OSS model).
+#
+# Single trigger: a version tag on THIS repo. The overlay repo has no release CI,
+# so there is exactly one build per tag (no duplicate). To ship an overlay change,
+# cut a new core patch tag; it re-assembles with the overlay's latest main.
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*'          # stable vX.Y.Z AND pre-release vX.Y.Z-rc.N
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
   id-token: write       # sigstore OIDC — build-provenance attestation
-  attestations: write   # publish the attestation to the GitHub/sigstore log
+  attestations: write
 
 jobs:
   build:
@@ -31,13 +43,39 @@ jobs:
             artifact: safeclaw-macos-aarch64
 
     steps:
-      - uses: actions/checkout@v4
+      # We build the PRIVATE overlay crate; its Cargo.toml pins the public core by
+      # THIS git tag (below), so cargo fetches the public core itself. No core
+      # checkout is needed, and the cross container gets the core from the cargo
+      # cache (avoids the path-dep-outside-mount problem).
+      #
+      # EE_READ_TOKEN = a fine-grained PAT with ONLY `Contents: Read` on
+      # SafeClaw-OSS/safeclaw-ee (the org has deploy keys disabled, so a read
+      # token is the minimal way for this public repo's CI to fetch the private
+      # overlay). Store it in this repo's Actions secrets.
+      - name: Checkout private overlay (safeclaw-ee)
+        uses: actions/checkout@v4
+        with:
+          repository: SafeClaw-OSS/safeclaw-ee
+          ref: main
+          token: ${{ secrets.EE_READ_TOKEN }}
+          path: safeclaw-ee
 
-      # build.rs embeds this as SC_BUILD_TAG so the binary self-reports the
-      # full release identity (incl. -rc.N) — a file, not an env var, so it
-      # reaches cross's build container via the workspace mount.
-      - name: Stamp build tag
-        run: echo "${{ github.ref_name }}" > .build-tag
+      # Reproducible: pin the core dependency to THIS release tag, replacing the
+      # local `path = "../safeclaw"` used for dev. A given tag always assembles the
+      # core at that tag + the overlay's main at build time.
+      - name: Pin core to the release tag
+        run: |
+          cd safeclaw-ee
+          sed -i -E "s#^safeclaw = .*#safeclaw = { git = \"https://github.com/SafeClaw-OSS/safeclaw\", tag = \"${{ github.ref_name }}\" }#" Cargo.toml
+          echo "--- pinned core dep ---"; grep '^safeclaw = ' Cargo.toml
+          echo "core=${{ github.ref_name }} overlay=$(git rev-parse HEAD)" > ../assembly.txt
+
+      - name: Record overlay revision (once)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        uses: actions/upload-artifact@v4
+        with:
+          name: assembly
+          path: assembly.txt
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -50,20 +88,30 @@ jobs:
         with:
           tool: cross
 
-      - name: Build (cross, Linux aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cross build --release --target ${{ matrix.target }}
-
       - name: Install musl tools (Linux x86_64)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get install -y musl-tools
 
+      # build.rs stamps SC_BUILD_TAG from a `.build-tag` FILE when present; the
+      # git-pinned core has none, so we pass the tag via the ambient env instead —
+      # `option_env!("SC_BUILD_TAG")` in the core's lib.rs picks it up, so the
+      # binary still self-reports vX.Y.Z(-rc.N).
+      - name: Build (cross, Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        working-directory: safeclaw-ee
+        env:
+          SC_BUILD_TAG: ${{ github.ref_name }}
+        run: cross build --release --target ${{ matrix.target }} --bin safeclaw
+
       - name: Build (cargo, native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
-        run: cargo build --release --target ${{ matrix.target }}
+        working-directory: safeclaw-ee
+        env:
+          SC_BUILD_TAG: ${{ github.ref_name }}
+        run: cargo build --release --target ${{ matrix.target }} --bin safeclaw
 
       - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/safeclaw ${{ matrix.artifact }}
+        run: cp safeclaw-ee/target/${{ matrix.target }}/release/safeclaw ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -76,18 +124,15 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      # The service catalog is a pure function of the compiled-in recipes, so
-      # the released binary itself renders it offline (no daemon). This ships
-      # `registry.json` as a per-release asset the console fetches — the catalog
-      # can never drift from what this daemon version actually supports.
+      # The service catalog is a pure function of the compiled-in recipes, so the
+      # released binary itself renders it offline. Ships `registry.json` as a
+      # per-release asset the console fetches — never drifts from this build.
       - name: Render service catalog (registry.json)
         run: |
           chmod +x artifacts/safeclaw-linux-x86_64
@@ -110,8 +155,8 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
-          # Semver channel: a hyphenated tag (v1.2.3-rc.1) is a pre-release, so
-          # GitHub never moves the "latest" pointer to it and `sc upgrade` /
-          # install.sh (which pull releases/latest) skip it. A bare vX.Y.Z is
-          # stable and becomes latest. `sc upgrade --pre` opts into pre-releases.
+          # Hyphenated tag (v1.2.3-rc.1) = pre-release: GitHub never moves "latest"
+          # to it and `sc upgrade` / install.sh (which pull releases/latest) skip
+          # it; a bare vX.Y.Z becomes latest. `sc upgrade --pre` opts in. BOTH
+          # channels are the assembled official (team) binary.
           prerelease: ${{ contains(github.ref_name, '-') }}
