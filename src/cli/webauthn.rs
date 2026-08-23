@@ -173,8 +173,8 @@ pub async fn create_op(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        // Surface the daemon's human message (e.g. the 423 "vault locked — run
-        // `sc up` to unlock" hint) instead of a raw JSON error envelope.
+        // Surface the daemon's human message (e.g. the 423 "vault locked. Run
+        // `sc unlock`" hint) instead of a raw JSON error envelope.
         let msg = serde_json::from_str::<Value>(&body)
             .ok()
             .and_then(|v| v["message"].as_str().map(str::to_string))

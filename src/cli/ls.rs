@@ -2,8 +2,9 @@
 //!
 //! Hits the custodian's `GET /v/{vid}/secret-keys` (cache-driven; no passkey
 //! ceremony). Vault must be Unlocked — the custodian answers `vault_locked`
-//! (423) otherwise, rendered with the one canonical unlock hint (`sc up`;
-//! unlock is invisible by design, there is no separate unlock command).
+//! (423) otherwise, rendered with the canonical locked hint (`sc unlock`): a
+//! daemon that returned 423 is by definition running, so unlock is the precise
+//! fix, not the broader `sc up` (which also covers a down daemon).
 //!
 //! Output is one row per key with its source tag. Same key surfacing from
 //! multiple sources prints multiple rows; whichever source wins resolution

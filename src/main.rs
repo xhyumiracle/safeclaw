@@ -8,6 +8,16 @@
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    safeclaw::entry::run_cli(Arc::new(safeclaw::team_hooks::NoopHooks)).await
+async fn main() {
+    // Every command in `entry::run_cli` already prints its own friendly
+    // "safeclaw <cmd>: <msg>" line on failure (per-arm `eprintln!` / `daemon_err`).
+    // Returning the error from `main` would make Rust ALSO print its default
+    // `Error: "<msg>"` (Debug, quoted) — a confusing double. Consume the error
+    // here and just set a non-zero exit code.
+    if safeclaw::entry::run_cli(Arc::new(safeclaw::team_hooks::NoopHooks))
+        .await
+        .is_err()
+    {
+        std::process::exit(1);
+    }
 }

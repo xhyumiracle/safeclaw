@@ -251,7 +251,7 @@ impl ScCode {
 /// The ONE canonical remediation line for a locked vault — every surface
 /// (control 423, proxy 423, CLI) says exactly this, so the agent sees one
 /// consistent state and relays one consistent fix.
-pub const VAULT_LOCKED_MSG: &str = "vault locked — run `sc up` to unlock, then retry";
+pub const VAULT_LOCKED_MSG: &str = "vault locked. Run `sc unlock`, then retry";
 
 /// RFC 9457 `application/problem+json` body for a code + detail message.
 /// Extension members: `code` / `action` / `cause` (see [`ScCode::row`]),
@@ -281,7 +281,7 @@ pub enum AppError {
     NotFound,
     Conflict(String),
     /// Vault is locked (no in-memory key). Distinct from `Conflict` so the agent
-    /// can tell "unlock needed → run `sc up`" apart from other 409s. HTTP 423.
+    /// can tell "unlock needed → run `sc unlock`" apart from other 409s. HTTP 423.
     VaultLocked,
     TooManyRequests,
     Internal(String),

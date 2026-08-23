@@ -411,7 +411,7 @@ pub fn print_status(s: &VaultStatus) {
             println!("  state:    not found (run `sc vault create`, or pick a different URL with `sc vault use`)");
         }
         VaultState::Locked { passkeys } => {
-            println!("  state:    locked (run `sc up` to unlock)");
+            println!("  state:    locked (run `sc unlock`)");
             println!("  passkeys: {}", passkeys);
         }
         VaultState::Unlocked { passkeys, secrets } => {
