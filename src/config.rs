@@ -45,10 +45,12 @@ pub const DEFAULT_BODY_CAP: u64 = 32 * 1024 * 1024;
     about = "SafeClaw — passkey-gated credential broker"
 )]
 pub struct Cli {
-    /// Target vault id for this invocation (any subcommand, any position).
-    /// Overrides the shell's `$SAFECLAW_VAULT_ID` pin and the device default —
-    /// the top of the resolution chain (design/vault-addressing.md).
-    #[arg(long, global = true, value_name = "VAULT_ID")]
+    /// Target vault for this invocation (any subcommand, any position): an id, a
+    /// unique id prefix, or the exact name (`sc vault ls`; quote a name with
+    /// spaces). An ambiguous name or prefix errors with the candidates. Overrides
+    /// the shell's `$SAFECLAW_VAULT_ID` pin and the device default (top of the
+    /// resolution chain, design/vault-addressing.md).
+    #[arg(long, global = true, value_name = "VAULT")]
     pub vault: Option<String>,
     #[command(subcommand)]
     pub command: Command,
@@ -566,9 +568,9 @@ pub enum VaultSubcommand {
     /// device default with `*`. `--json` for scripts/agents.
     #[command(alias = "list")]
     Ls(VaultLsArgs),
-    /// Switch the active vault. Pass a vault URL (`<daemon>/v/<vault_id>`),
-    /// an index from `sc vault ls`, --local for the localhost default vault,
-    /// or nothing for an interactive prompt.
+    /// Switch the active vault. Pass an id, a unique id prefix, or the exact name
+    /// (quote if it has spaces); also an `sc vault ls` index, a vault URL, --local
+    /// for the localhost default, or nothing for an interactive prompt.
     Use(VaultUseArgs),
     /// Remove a vault from the local known list (does NOT touch the
     /// daemon — for that use `sc vault delete`). Pass URL or index.
