@@ -407,7 +407,15 @@ fn synced_vault_ids(cfg: &crate::cli::active::CliConfig) -> Vec<String> {
 /// device with no `sc vault use`. Best-effort: any failure returns an empty list
 /// and the caller leaves the locally-known set untouched. This never REMOVES a
 /// vault; deletion is the tombstone path (`PullOutcome::Deleted`).
-async fn discover_account_vault_ids(cloud: &str, dk: &str) -> Vec<String> {
+/// One account vault as `/api/vault/vaults` returns it: the id plus the
+/// cloud-authoritative label/kind the daemon mirrors into the local catalog.
+struct DiscoveredVault {
+    id: String,
+    label: Option<String>,
+    kind: Option<String>,
+}
+
+async fn discover_account_vault_ids(cloud: &str, dk: &str) -> Vec<DiscoveredVault> {
     let cloud = cloud.trim_end_matches('/');
     let url = format!("{}/api/vault/vaults", cloud);
     let Ok(client) = crate::cli::egress_proxy::client(Duration::from_secs(15)) else {
@@ -443,7 +451,20 @@ async fn discover_account_vault_ids(cloud: &str, dk: &str) -> Vec<String> {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.get("id").and_then(|i| i.as_str()).map(String::from))
+                .filter_map(|v| {
+                    let id = v.get("id").and_then(|i| i.as_str())?.to_string();
+                    let label = v
+                        .get("label")
+                        .and_then(|i| i.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    let kind = v
+                        .get("kind")
+                        .and_then(|i| i.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    Some(DiscoveredVault { id, label, kind })
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -454,7 +475,10 @@ async fn discover_account_vault_ids(cloud: &str, dk: &str) -> Vec<String> {
 /// the ids that were NOT already known (the ones freshly adopted this call), so
 /// the caller can spawn a watcher for each new one. Setting a DEFAULT is a
 /// separate act (`sc vault use`); discovery only makes vaults AVAILABLE.
-fn remember_discovered(cfg: &crate::cli::active::CliConfig, ids: &[String]) -> Vec<String> {
+fn remember_discovered(
+    cfg: &crate::cli::active::CliConfig,
+    discovered: &[DiscoveredVault],
+) -> Vec<String> {
     let daemon = cfg
         .daemon
         .clone()
@@ -465,13 +489,23 @@ fn remember_discovered(cfg: &crate::cli::active::CliConfig, ids: &[String]) -> V
         .map(|kv| kv.vault)
         .collect();
     let mut fresh = Vec::new();
-    for id in ids {
-        if known.contains(id) {
-            continue;
-        }
-        match crate::cli::active::remember(&daemon, id) {
-            Ok(()) => fresh.push(id.clone()),
-            Err(e) => tracing::debug!(vault = %id, "vault discovery: remember failed: {}", e),
+    for dv in discovered {
+        let is_new = !known.contains(&dv.id);
+        // Upsert EVERY discovered vault (not just new ones) so a cloud rename
+        // refreshes the mirrored label/kind; only NEW ids are returned as fresh
+        // (the caller spawns a per-vault watcher for each).
+        match crate::cli::active::remember_discovered_vault(
+            &daemon,
+            &dv.id,
+            dv.label.clone(),
+            dv.kind.clone(),
+        ) {
+            Ok(()) => {
+                if is_new {
+                    fresh.push(dv.id.clone());
+                }
+            }
+            Err(e) => tracing::debug!(vault = %dv.id, "vault discovery: remember failed: {}", e),
         }
     }
     fresh
@@ -4996,10 +5030,14 @@ mod tests {
                 KnownVault {
                     daemon: "http://localhost:1".into(),
                     vault: "vid-A".into(),
+                    label: None,
+                    kind: None,
                 },
                 KnownVault {
                     daemon: "http://localhost:1".into(),
                     vault: "vid-B".into(),
+                    label: None,
+                    kind: None,
                 },
             ],
             ..Default::default()

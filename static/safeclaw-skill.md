@@ -79,13 +79,16 @@ your replies.
 
 ### Which vault
 
-`sc run` targets your default vault. `sc vault ls` lists your vaults, with `*`
-marking the default; `sc run --vault <id> -- <cmd>` targets a specific one.
+`sc run` targets your default vault. `sc vault ls` lists your vaults as
+`name (kind) <id>`, with `*` marking the default; `sc run --vault <ref> -- <cmd>`
+targets a specific one. `<ref>` is an id, a unique id prefix, or the exact name
+(quote a name with spaces, or just use a short id prefix).
 
-A vault is a security boundary, so the right one matters. With one vault, use it.
-When the choice is ambiguous, meaning several vaults with no default and none named
-for the task, ask the user which to use. Offer `sc vault use <id>` to set a default
-so the next task runs without asking.
+A vault is a security boundary, so the right one matters. When the user names a
+vault ("the team vault", "work"), run `sc vault ls`, map that to the matching
+`<id>`, and use THAT id. Never guess: if it is ambiguous (several match, or none
+clearly does), ask which to use. Offer `sc vault use <ref>` to set a default so
+the next task runs without asking.
 
 ## Using a connection
 

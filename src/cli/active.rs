@@ -149,6 +149,17 @@ pub struct KnownVault {
     #[serde(alias = "custodian")]
     pub daemon: String,
     pub vault: String,
+    /// Cloud-authoritative display label, mirrored on every discovery. Human /
+    /// agent facing ONLY — the `vault` id stays the canonical, unique, STABLE
+    /// handle (labels can be renamed and are not unique). `None` for a legacy
+    /// catalog entry until the next discovery refresh fills it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Vault kind (`personal` / `team` / `shared`), mirrored on discovery.
+    /// DISPLAY-only (shown by `sc vault ls`); never an addressing token, so a
+    /// vault literally labeled "team" can't collide with the kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 pub fn config_path() -> Result<PathBuf, String> {
@@ -270,20 +281,53 @@ pub fn clear_known_vaults() -> Result<(), String> {
     update_known_vaults(|l| l.clear())
 }
 
-/// Dedupe-append one vault to the catalog.
-fn remember_vault(daemon: &str, vault: &str) -> Result<(), String> {
-    let new = KnownVault {
-        daemon: daemon.to_string(),
-        vault: vault.to_string(),
-    };
-    if known_vaults().contains(&new) {
-        return Ok(());
-    }
+/// Upsert one vault into the catalog, keyed by `(daemon, vault)`. Refreshes the
+/// cloud-mirrored `label`/`kind` when the caller supplies them (a rename lands on
+/// the next discovery); a meta-less caller (`sc vault use`) never wipes an
+/// existing label. Keying on the id — not full-struct equality — is what lets a
+/// label change in place instead of leaving a stale duplicate row.
+fn upsert_vault(
+    daemon: &str,
+    vault: &str,
+    label: Option<String>,
+    kind: Option<String>,
+) -> Result<(), String> {
+    let daemon = daemon.to_string();
+    let vault = vault.to_string();
     update_known_vaults(move |l| {
-        if !l.contains(&new) {
-            l.push(new);
+        if let Some(e) = l.iter_mut().find(|kv| kv.daemon == daemon && kv.vault == vault) {
+            if label.is_some() {
+                e.label = label;
+            }
+            if kind.is_some() {
+                e.kind = kind;
+            }
+        } else {
+            l.push(KnownVault {
+                daemon,
+                vault,
+                label,
+                kind,
+            });
         }
     })
+}
+
+/// Dedupe-append one vault to the catalog (no cloud meta — `sc vault use`/create).
+fn remember_vault(daemon: &str, vault: &str) -> Result<(), String> {
+    upsert_vault(daemon, vault, None, None)
+}
+
+/// Upsert a DISCOVERED account vault together with its cloud `label`/`kind`. The
+/// daemon calls this on every discovery so `sc vault ls` and `--vault <name>`
+/// resolution ([`resolve_vault_token`]) stay fresh across renames.
+pub fn remember_discovered_vault(
+    daemon: &str,
+    vault: &str,
+    label: Option<String>,
+    kind: Option<String>,
+) -> Result<(), String> {
+    upsert_vault(daemon, vault, label, kind)
 }
 
 /// Remove a vault from the catalog. If it was active, clears active — even
@@ -642,9 +686,12 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
                 .filter(|s| !s.is_empty())
         })
         .or_else(|| cfg.vault.clone());
-    if let Some(vault) = explicit {
-        validate_vault_id_arg(&vault)?;
-        return Ok((control_root(&cfg), vault));
+    if let Some(token) = explicit {
+        let (daemon, vault) = resolve_vault_token(&token, &cfg)?;
+        return Ok((
+            control_root_from(env_daemon_host(), Some(&daemon), control_port()),
+            vault,
+        ));
     }
     // Single-vault auto-select: the catalog entry records WHICH daemon that
     // vault lives behind — pair them, so a cleared active selection can't
@@ -687,6 +734,88 @@ fn validate_vault_id_arg(v: &str) -> Result<(), String> {
             v
         ))
     }
+}
+
+/// Resolve a user/agent `--vault` token to `(daemon, vault_id)` the
+/// git/docker/kubectl way: an exact id, an exact label (case-insensitive), or a
+/// unique id-prefix — whichever is UNAMBIGUOUS. Ambiguity is an error listing
+/// the candidates, never a guess (the failure mode this exists to kill: an agent
+/// told "the team vault" picking one at random). A syntactically-valid id not
+/// yet in the catalog (a just-created vault) is accepted verbatim. Spaces belong
+/// to a label: quote it, or pass a short id-prefix (no spaces, no quoting).
+pub fn resolve_vault_token(token: &str, cfg: &CliConfig) -> Result<(String, String), String> {
+    let token = token.trim();
+    let known = known_vaults();
+    // 1. exact id — the canonical handle always wins.
+    if let Some(kv) = known.iter().find(|kv| kv.vault == token) {
+        return Ok((kv.daemon.clone(), kv.vault.clone()));
+    }
+    // 2. exact label, case-insensitive — unique or fail loud.
+    let by_label: Vec<&KnownVault> = known
+        .iter()
+        .filter(|kv| {
+            kv.label
+                .as_deref()
+                .map(|l| l.trim().eq_ignore_ascii_case(token))
+                .unwrap_or(false)
+        })
+        .collect();
+    match by_label.as_slice() {
+        [kv] => return Ok((kv.daemon.clone(), kv.vault.clone())),
+        [] => {}
+        many => return Err(ambiguous_vault_err(token, "name", many)),
+    }
+    // 3. unique id-prefix (docker/git style); >=4 chars so a stray word can't sweep.
+    if token.len() >= 4
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        let by_prefix: Vec<&KnownVault> =
+            known.iter().filter(|kv| kv.vault.starts_with(token)).collect();
+        match by_prefix.as_slice() {
+            [kv] => return Ok((kv.daemon.clone(), kv.vault.clone())),
+            [] => {}
+            many => return Err(ambiguous_vault_err(token, "id prefix", many)),
+        }
+    }
+    // 4. a full-length valid id the catalog hasn't recorded yet (just created /
+    //    catalog lag) — accept verbatim against the default daemon.
+    if validate_vault_id_arg(token).is_ok() && token.len() >= 20 {
+        let daemon = cfg
+            .daemon
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT));
+        return Ok((daemon, token.to_string()));
+    }
+    Err(format!(
+        "no vault matches '{}' — run `sc vault ls` and pass its id, a unique id prefix, or its exact name (quote a name with spaces)",
+        token
+    ))
+}
+
+/// Render the "be specific" error when a token matches multiple vaults — lists
+/// each candidate's name + short id so the caller can disambiguate.
+fn ambiguous_vault_err(token: &str, by: &str, cands: &[&KnownVault]) -> String {
+    let list = cands
+        .iter()
+        .map(|kv| {
+            let short = kv.vault.get(..8).unwrap_or(&kv.vault);
+            match kv.label.as_deref() {
+                Some(l) => format!("  {} ({})", l, short),
+                None => format!("  {}", kv.vault),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "'{}' matches {} vaults by {} — be specific (use the id or a unique prefix):\n{}",
+        token,
+        cands.len(),
+        by,
+        list
+    )
 }
 
 /// Single-vault auto-select (§5): exactly one known vault defaults to it, so a

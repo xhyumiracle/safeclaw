@@ -56,6 +56,8 @@ async fn run_ls(args: crate::config::VaultLsArgs) -> Result<(), String> {
                     "url": join_vault_url(&kv.daemon, &kv.vault),
                     "daemon": kv.daemon,
                     "vault": kv.vault,
+                    "label": kv.label,
+                    "kind": kv.kind,
                     "default": active == (Some(kv.daemon.as_str()), Some(kv.vault.as_str())),
                 })
             })
@@ -76,12 +78,11 @@ async fn run_ls(args: crate::config::VaultLsArgs) -> Result<(), String> {
         } else {
             " "
         };
-        println!(
-            "  {} {}) {}",
-            marker,
-            i + 1,
-            join_vault_url(&kv.daemon, &kv.vault)
-        );
+        // Lead with the human name + kind so an agent told "the team vault" can
+        // pick the right one; the id trails as the canonical, copyable handle.
+        let name = kv.label.as_deref().unwrap_or("(unnamed)");
+        let kind = kv.kind.as_deref().unwrap_or("?");
+        println!("  {} {}) {} ({})  {}", marker, i + 1, name, kind, kv.vault);
     }
     Ok(())
 }
@@ -101,22 +102,13 @@ fn resolve_url_or_idx(arg: &str) -> Result<(String, String), String> {
     if let Some(pair) = split_vault_url(arg) {
         return Ok(pair);
     }
-    // A bare vault id — the SAME handle `sc vault ls --json`, `sc run --vault`, the
-    // /pair page, and the console all use. Recover which daemon serves it from the
-    // known-vaults catalog (the daemon auto-discovers account vaults into it, so a
-    // just-paired device already has them); fall back to the local daemon for an id
-    // the catalog hasn't recorded yet. Without this, `sc vault use <id>` rejected
-    // the one form every other surface accepts.
-    let looks_like_id = !arg.is_empty()
-        && arg.len() <= 128
-        && arg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if looks_like_id {
-        if let Some(kv) = known_vaults().into_iter().find(|kv| kv.vault == arg) {
-            return Ok((kv.daemon, kv.vault));
-        }
-        return Ok((LOCAL_CUSTODIAN.to_string(), arg.to_string()));
-    }
-    Err(format!("not a vault id, URL, or index: {} (see `sc vault ls`)", arg))
+    // Otherwise resolve it as a vault TOKEN — id, unique id-prefix, or exact name
+    // (case-insensitive) — via the same git/docker/kubectl resolver `--vault`
+    // uses, so `sc vault use` and `sc run --vault` accept identical handles
+    // (including a quoted name). Ambiguity fails loud with candidates; a name
+    // with spaces just needs quoting.
+    let cfg = load_config().unwrap_or_default();
+    crate::cli::active::resolve_vault_token(arg, &cfg)
 }
 
 async fn run_use(args: VaultUseArgs) -> Result<(), String> {
