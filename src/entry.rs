@@ -341,12 +341,22 @@ async fn run_daemon(
     // serving, so a freshly-paired device serves a vault sealed in the
     // browser. Best-effort — a local-only or offline daemon serves whatever
     // vault.dat is already on disk.
+    // Record this build's team-serve identity so the sync path can leave SHARED
+    // (team) vaults to the official SafeClaw build. A no-op for the official build
+    // (which serves team, so nothing is filtered). team-edition §9.
+    crate::team_hooks::init_serves_shared(hooks.serves_shared_vaults());
     crate::sync::pull_on_start(&config.state_dir).await;
 
     // Inject the team-edition hooks (team-edition §9): the open build passes
     // `NoopHooks`, the closed `safeclaw-ee` overlay its real ones. This is the
     // single point where the official binary's team behavior enters the daemon.
     let state = Arc::new(AppState::new(config.clone()).with_team_hooks(hooks));
+
+    // Seed server-authoritative sharedness from the discovered catalog so the
+    // personal-edition team gate and the offline lease have a reliable signal
+    // before the first serve (not only after the first signed blob envelope).
+    // team-edition §9.
+    state.hydrate_shared_from_catalog();
 
     // Agent-centric auth: sync the account-level agent-key hash-set once
     // before serving (so account agent-keys are accepted from the start),

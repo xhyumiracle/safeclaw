@@ -12,6 +12,8 @@
 //! (`vault_is_shared`, `cloud_contact_age_secs`); what a hook DECIDES with it
 //! (deny service, redeem an invite, offboard a member) is the closed policy.
 
+use std::sync::OnceLock;
+
 use crate::error::ScCode;
 use crate::state::AppState;
 
@@ -42,6 +44,15 @@ pub trait TeamHooks: Send + Sync {
     /// core exposes only the neutral id primitive ([`crate::storage::item::aux_item_id`]).
     /// Default: no-op (a personal / open-source build registers nothing).
     fn on_vault_unlocked(&self, _state: &AppState, _vault_id: &str, _k: &[u8]) {}
+
+    /// Does this build SERVE shared (team) vaults at all? The open-source PERSONAL
+    /// edition returns `false`: it does not sync or serve team vaults, leaving them
+    /// to the official SafeClaw build (team-edition §9). The closed `safeclaw-ee`
+    /// overlay returns `true`. Default `false` — a build that injects no team
+    /// policy is the personal edition.
+    fn serves_shared_vaults(&self) -> bool {
+        false
+    }
 }
 
 /// The open-source build's hooks: no team behavior whatsoever. A personal vault
@@ -49,3 +60,27 @@ pub trait TeamHooks: Send + Sync {
 pub struct NoopHooks;
 
 impl TeamHooks for NoopHooks {}
+
+/// This build's team-serve identity, materialized once at daemon boot from the
+/// injected [`TeamHooks`]. It lets the sync-path free functions (which run
+/// without an `AppState` in hand, e.g. `pull_on_start` before the state exists)
+/// leave SHARED (team) vaults to the official build. It is a BUILD constant (the
+/// open build never sets it `true`), not runtime config.
+static SERVES_SHARED: OnceLock<bool> = OnceLock::new();
+
+/// Record whether THIS build serves shared (team) vaults. Called once in
+/// `run_daemon` with `hooks.serves_shared_vaults()`.
+pub fn init_serves_shared(v: bool) {
+    let _ = SERVES_SHARED.set(v);
+}
+
+/// Whether this build serves shared (team) vaults. Set once at daemon boot by
+/// `init_serves_shared`, which runs before any pull, so in practice this always
+/// reflects the injected hooks. Defaults to `false` when never initialized: an
+/// unexpected pre-init pull fails CLOSED for the personal-only invariant (leaves a
+/// shared vault UNSYNCED) rather than silently landing team material — there is no
+/// serve-side backstop, so this default is the last line. The official daemon
+/// always inits `true` before it pulls, so it is never affected.
+pub fn build_serves_shared() -> bool {
+    *SERVES_SHARED.get().unwrap_or(&false)
+}

@@ -1341,6 +1341,33 @@ impl AppState {
             .insert(vault_id.to_string(), shared);
     }
 
+    /// Eagerly seed `vault_shared` from the known-vaults catalog `kind` (server-
+    /// authoritative, mirrored on every discovery, available WITHOUT unlocking a
+    /// blob). Called at startup and after discovery so `vault_is_shared` is
+    /// reliable before the first serve. DENYLIST normalization (shared iff `kind`
+    /// is `team`/`shared`; `personal`/`private`/anything else = not shared) so a
+    /// vocabulary drift never strips a personal vault. Only vaults with a known
+    /// `kind` are seeded; the signed-envelope path still refreshes the live value.
+    pub fn hydrate_shared_from_catalog(&self) {
+        for kv in crate::cli::active::known_vaults() {
+            if kv.kind.is_some() {
+                self.set_vault_shared(&kv.vault, Self::kind_str_is_shared(kv.kind.as_deref()));
+            }
+        }
+    }
+
+    /// DENYLIST normalization of a server `kind` string to sharedness: shared iff
+    /// `kind` is `team` or `shared` (case-insensitive); `personal` / `private` /
+    /// `None` / anything else = NOT shared, so a vocabulary drift or a renamed kind
+    /// never strips a personal vault from serving. Bridges the two `kind`
+    /// vocabularies (discovery `personal/team/shared`, blob envelope `shared/private`).
+    pub fn kind_str_is_shared(kind: Option<&str>) -> bool {
+        matches!(
+            kind.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+            Some("team") | Some("shared")
+        )
+    }
+
     /// Mark (or clear) a vault as needing a daemon upgrade — the cloud returned
     /// `SC_UPGRADE_REQUIRED` for its sync (design 甲). Set by the sync path on that
     /// signal, cleared on a successful sync. The broker reads it to fail loudly with
@@ -1635,6 +1662,29 @@ mod tests {
             body_cap: crate::config::DEFAULT_BODY_CAP,
         };
         AppState::new(cfg)
+    }
+
+    #[test]
+    fn kind_str_is_shared_is_a_denylist() {
+        // Shared iff team/shared (case- and space-tolerant).
+        assert!(AppState::kind_str_is_shared(Some("team")));
+        assert!(AppState::kind_str_is_shared(Some("shared")));
+        assert!(AppState::kind_str_is_shared(Some("  TEAM ")));
+        // Everything else (incl. unknown / None) is NOT shared, so a personal
+        // vault is never stripped from serving by a vocabulary drift.
+        assert!(!AppState::kind_str_is_shared(Some("personal")));
+        assert!(!AppState::kind_str_is_shared(Some("private")));
+        assert!(!AppState::kind_str_is_shared(Some("solo")));
+        assert!(!AppState::kind_str_is_shared(None));
+    }
+
+    #[test]
+    fn default_build_is_personal_edition() {
+        // The default build wires NoopHooks: the open-source PERSONAL edition,
+        // which does not serve team vaults. The sync path leaves SHARED vaults to
+        // the official build (see `build_serves_shared` / `leave_shared_to_official`
+        // in sync.rs); the official build's EeHooks override this to `true`.
+        assert!(!test_state().team.serves_shared_vaults());
     }
 
     /// The op-payload stash is single-use and digest-verified: a deposit is

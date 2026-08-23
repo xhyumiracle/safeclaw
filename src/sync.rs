@@ -389,16 +389,55 @@ fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
 /// `known_vaults` (added by `sc vault use` / `sc vault create`), deduped. The
 /// agent reaches any of them by vid; `sc vault use` is only the CLI default.
 fn synced_vault_ids(cfg: &crate::cli::active::CliConfig) -> Vec<String> {
+    // A personal build (open source) syncs only PERSONAL vaults: a SHARED (team)
+    // vault is handled by the official SafeClaw build, so it is left out of this
+    // device's synced set here (never pulled, watched, or audit-shipped). The
+    // official build serves team, so `build_serves_shared()` is true there and
+    // nothing is filtered. Classification is the server-authoritative catalog
+    // `kind` (mirrored on discovery, no unlock needed); an UNKNOWN kind is kept
+    // (fail-safe: a personal vault is never dropped from sync).
+    let serves_shared = crate::team_hooks::build_serves_shared();
+    let known = crate::cli::active::known_vaults();
+    let leave_to_official = |vid: &str| -> bool {
+        !serves_shared
+            && known
+                .iter()
+                .find(|kv| kv.vault == vid)
+                .map(|kv| crate::state::AppState::kind_str_is_shared(kv.kind.as_deref()))
+                .unwrap_or(false)
+    };
     let mut ids: Vec<String> = Vec::new();
     if let Some(v) = cfg.vault.as_deref().filter(|s| !s.is_empty()) {
-        ids.push(v.to_string());
+        if !leave_to_official(v) {
+            ids.push(v.to_string());
+        }
     }
-    for kv in crate::cli::active::known_vaults() {
-        if !kv.vault.is_empty() && !ids.iter().any(|x| x == &kv.vault) {
-            ids.push(kv.vault);
+    for kv in &known {
+        if !kv.vault.is_empty() && !leave_to_official(&kv.vault) && !ids.iter().any(|x| x == &kv.vault)
+        {
+            ids.push(kv.vault.clone());
         }
     }
     ids
+}
+
+/// A personal build (open source) leaves SHARED (team) vaults to the official
+/// SafeClaw build: it never syncs their material. `true` iff this build does NOT
+/// serve team AND `vid` is shared per the server-authoritative catalog `kind`
+/// (unknown kind is NOT shared, so a personal vault is never dropped). This is the
+/// single guard the pull primitives share, so every adopt path (main loop,
+/// watchers, `sync_vault_now`, `resync_membership_now`, conflict recovery) is
+/// covered at one point. The official build serves team, so it is always `false`
+/// there. team-edition §9.
+fn leave_shared_to_official(vid: &str) -> bool {
+    if crate::team_hooks::build_serves_shared() {
+        return false;
+    }
+    crate::cli::active::known_vaults()
+        .iter()
+        .find(|kv| kv.vault == vid)
+        .map(|kv| crate::state::AppState::kind_str_is_shared(kv.kind.as_deref()))
+        .unwrap_or(false)
 }
 
 /// GET the account's vault ids from the cloud — the same `/api/vault/vaults` the
@@ -540,7 +579,20 @@ async fn discovery_reconcile_loop(
         };
         let discovered = discover_account_vault_ids(&cloud, &dk).await;
         let fresh = remember_discovered(&cfg, &discovered);
+        let serves_shared = crate::team_hooks::build_serves_shared();
         for vid in fresh {
+            // Personal build: leave a SHARED (team) vault to the official build
+            // (do not live-adopt it). Kind is the server-authoritative discovery
+            // value; unknown is kept (fail-safe for personal vaults).
+            if !serves_shared
+                && discovered
+                    .iter()
+                    .find(|d| d.id == vid)
+                    .map(|d| crate::state::AppState::kind_str_is_shared(d.kind.as_deref()))
+                    .unwrap_or(false)
+            {
+                continue;
+            }
             if !watched.insert(vid.clone()) {
                 continue;
             }
@@ -2473,6 +2525,11 @@ pub async fn pull_items(
     vault: &str,
     device_key: &str,
 ) -> Result<usize, String> {
+    // Personal build: a SHARED (team) vault's content is left to the official
+    // build; never lands on disk here (team-edition §9). Covers every caller.
+    if leave_shared_to_official(vault) {
+        return Ok(0);
+    }
     let Some(mut pv) = read_per_item_store(state_dir, vault) else {
         return Ok(0); // no per-item store yet (vault not enrolled per-item)
     };
@@ -2874,6 +2931,11 @@ pub async fn pull_keys(
     vault: &str,
     device_key: &str,
 ) -> Result<usize, String> {
+    // Personal build: a SHARED (team) vault's keyset is left to the official
+    // build; never lands on disk here (team-edition §9). Covers every caller.
+    if leave_shared_to_official(vault) {
+        return Ok(0);
+    }
     // Create an empty per-item store on demand so a device that pulls keys
     // before it has ever seeded items still ends up with a keyset on disk.
     let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
@@ -2941,6 +3003,11 @@ async fn pull_membership(
     device_key: &str,
     force_full: bool,
 ) -> Result<usize, String> {
+    // Personal build: a SHARED (team) vault's membership triple is left to the
+    // official build; never lands on disk here (team-edition §9).
+    if leave_shared_to_official(vault) {
+        return Ok(0);
+    }
     let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
     // The `keyset_seq` cursor is per-FORMAT: the v1 `/keys` sequence and the v2
     // `/membership` `keyset_seq` are DIFFERENT counters. On a fmt1→fmt2 MIGRATION the
