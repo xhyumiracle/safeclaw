@@ -31,24 +31,24 @@ fn is_localhost(custodian: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
+pub async fn run(sub: VaultSubcommand, json: bool) -> Result<(), String> {
     match sub {
-        VaultSubcommand::Status(a) => crate::cli::status::run(a).await,
-        VaultSubcommand::Ls(a) => run_ls(a).await,
+        VaultSubcommand::Status(_a) => crate::cli::status::run(json).await,
+        VaultSubcommand::Ls(_a) => run_ls(json).await,
         VaultSubcommand::Use(a) => run_use(a).await,
         VaultSubcommand::Forget(a) => run_forget(a).await,
         VaultSubcommand::Create(a) => run_create(a).await,
-        VaultSubcommand::Delete(a) => run_delete(a).await,
+        VaultSubcommand::Rm(a) => run_rm(a).await,
         VaultSubcommand::Unlock(a) => crate::cli::unlock::run_unlock(a).await,
         VaultSubcommand::Lock(a) => crate::cli::unlock::run_lock(a).await,
     }
 }
 
-async fn run_ls(args: crate::config::VaultLsArgs) -> Result<(), String> {
+async fn run_ls(json: bool) -> Result<(), String> {
     let cfg = load_config()?;
     let known = known_vaults();
     let active = (cfg.daemon.as_deref(), cfg.vault.as_deref());
-    if args.json {
+    if json {
         let rows: Vec<serde_json::Value> = known
             .iter()
             .map(|kv| {
@@ -487,9 +487,9 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
-    if !args.yes_i_mean_it {
-        return Err("destructive — pass --yes-i-mean-it to confirm vault deletion".into());
+async fn run_rm(args: VaultDeleteArgs) -> Result<(), String> {
+    if !args.yes {
+        return Err("destructive; pass -y/--yes to confirm vault deletion".into());
     }
     let (custodian, _) = resolve_active(Some(args.vault.as_str()))?;
     let vault = args.vault.trim().to_string();
@@ -529,7 +529,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
         &opts,
     )
     .await?;
-    eprintln!("safeclaw vault delete — ok (vault {} wiped)", vault);
+    eprintln!("safeclaw vault rm — ok (vault {} wiped)", vault);
     Ok(())
 }
 

@@ -13,7 +13,6 @@
 use std::time::Duration;
 
 use crate::cli::active::{config_path, resolve_active};
-use crate::config::CommonArgs;
 
 #[derive(Debug, Clone, Copy)]
 enum Mark {
@@ -26,6 +25,14 @@ impl Mark {
     fn label(self) -> &'static str {
         match self {
             Mark::Ok => "ok  ",
+            Mark::Warn => "warn",
+            Mark::Fail => "fail",
+        }
+    }
+    /// Untrimmed key for machine output (`--json`).
+    fn key(self) -> &'static str {
+        match self {
+            Mark::Ok => "ok",
             Mark::Warn => "warn",
             Mark::Fail => "fail",
         }
@@ -49,9 +56,29 @@ impl Report {
         }
         !self.rows.iter().any(|(m, _)| matches!(m, Mark::Fail))
     }
+    /// Render the report either as the human check list or (when `json`) as a
+    /// `{ ok, checks: [{ level, message }] }` object mirroring the same rows.
+    /// Returns the overall pass/fail status either way.
+    fn emit(&self, json: bool) -> bool {
+        if !json {
+            return self.print_and_status();
+        }
+        let checks: Vec<serde_json::Value> = self
+            .rows
+            .iter()
+            .map(|(m, msg)| serde_json::json!({ "level": m.key(), "message": msg }))
+            .collect();
+        let ok = !self.rows.iter().any(|(m, _)| matches!(m, Mark::Fail));
+        let out = serde_json::json!({ "ok": ok, "checks": checks });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into())
+        );
+        ok
+    }
 }
 
-pub async fn run(_args: CommonArgs) -> Result<(), String> {
+pub async fn run(json: bool) -> Result<(), String> {
     let mut report = Report::new();
 
     // Platform + build (debug aid): the first thing a bug report needs — which
@@ -127,7 +154,7 @@ pub async fn run(_args: CommonArgs) -> Result<(), String> {
         }
         Err(e) => {
             report.push(Mark::Fail, format!("active config: {}", e));
-            let _ = report.print_and_status();
+            let _ = report.emit(json);
             return Err("active-config resolution failed".into());
         }
     };
@@ -277,7 +304,7 @@ pub async fn run(_args: CommonArgs) -> Result<(), String> {
         Err(_) => {}
     }
 
-    let ok = report.print_and_status();
+    let ok = report.emit(json);
     if ok {
         Ok(())
     } else {

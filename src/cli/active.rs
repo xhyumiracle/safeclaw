@@ -720,7 +720,7 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
 /// typo at the argument boundary with a pointer to `sc vault ls`, instead of
 /// letting it travel to the daemon and surface as a deep, opaque
 /// "passkeys HTTP 400 Bad Request" (after the user already typed a
-/// confirmation, in `sc vault delete`'s case).
+/// confirmation, in `sc vault rm`'s case).
 fn validate_vault_id_arg(v: &str) -> Result<(), String> {
     let ok = !v.is_empty()
         && v.len() <= 128
@@ -838,8 +838,8 @@ mod tests {
     use super::*;
 
     /// A display name / typo passed as `--vault` must fail at the argument
-    /// boundary with the `sc vault ls` pointer — not travel to the daemon and
-    /// come back as an opaque "passkeys HTTP 400" (the `sc vault delete
+    /// boundary with the `sc vault ls` pointer, not travel to the daemon and
+    /// come back as an opaque "passkeys HTTP 400" (the `sc vault rm
     /// "test vault2"` report).
     #[test]
     fn vault_id_arg_rejects_names_and_accepts_ids() {

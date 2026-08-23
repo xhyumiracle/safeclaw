@@ -16,10 +16,10 @@ use crate::cli::active::load as load_config;
 use crate::config::{AgentAddArgs, AgentRmArgs, AgentSubcommand};
 use crate::device_auth::DikRequestExt;
 
-pub async fn run(sub: AgentSubcommand) -> Result<(), String> {
+pub async fn run(sub: AgentSubcommand, json: bool) -> Result<(), String> {
     match sub {
         AgentSubcommand::Add(a) => add(a).await,
-        AgentSubcommand::Ls => ls().await,
+        AgentSubcommand::Ls => ls(json).await,
         AgentSubcommand::Rm(a) => rm(a).await,
     }
 }
@@ -243,11 +243,30 @@ async fn fetch_agents(cloud: &str, key: &str) -> Result<Vec<ListKey>, String> {
     Ok(r.keys)
 }
 
-async fn ls() -> Result<(), String> {
+async fn ls(json: bool) -> Result<(), String> {
     let (cloud, key) = cloud_and_key()?;
     let agents = fetch_agents(&cloud, &key).await?;
+    if json {
+        // Machine-readable mirror of the human list: one object per agent.
+        let arr: Vec<serde_json::Value> = agents
+            .iter()
+            .map(|k| {
+                serde_json::json!({
+                    "id": k.id,
+                    "prefix": k.prefix,
+                    "label": k.label,
+                    "last_used_at": k.last_used_at,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".into())
+        );
+        return Ok(());
+    }
     if agents.is_empty() {
-        println!("(no agents yet — `sc agent add <name>`)");
+        println!("(no agents yet, `sc agent add <name>`)");
         return Ok(());
     }
     for k in &agents {

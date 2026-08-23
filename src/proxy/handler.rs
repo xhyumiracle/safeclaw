@@ -324,7 +324,7 @@ impl BrokerHandler {
             // caller simply forgot it; left untouched the request goes upstream
             // unauthenticated and the puzzling result is a bare 401/403 with no
             // hint that the credential was never in the request. Leave a greppable
-            // breadcrumb (`sc logs --raw | grep phantom`) for exactly that debug.
+            // breadcrumb (`sc log --raw | grep phantom`) for exactly that debug.
             tracing::debug!(
                 host = %dest_host,
                 "routed to an anchored host but the request carries no phantom — \

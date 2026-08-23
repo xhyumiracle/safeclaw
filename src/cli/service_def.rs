@@ -99,7 +99,7 @@ pub async fn run_add(args: ServiceAddArgs) -> Result<(), String> {
 /// console only shows a definition through its connections — so a broken or
 /// orphaned def is invisible everywhere but here. One passkey gesture (over SSH:
 /// the cloud grant link).
-pub async fn run_ls(args: ServiceLsArgs) -> Result<(), String> {
+pub async fn run_ls(args: ServiceLsArgs, json: bool) -> Result<(), String> {
     let (custodian, vault) = resolve_active(None)?;
     let op = json!({
         "act": { "type": { "custom": "service-ls" }, "target": "", "scope": null },
@@ -118,6 +118,16 @@ pub async fn run_ls(args: ServiceLsArgs) -> Result<(), String> {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    if json {
+        // Machine-readable mirror: the daemon's per-definition rows verbatim
+        // (id, valid, connections, problems), the same data the table renders.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Array(services))
+                .unwrap_or_else(|_| "[]".into())
+        );
+        return Ok(());
+    }
     if services.is_empty() {
         println!("(no custom service definitions in this vault)");
         return Ok(());

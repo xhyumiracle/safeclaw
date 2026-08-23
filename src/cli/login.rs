@@ -32,14 +32,14 @@ const DEFAULT_DAEMON_PORT: u16 = crate::config::CONTROL_PORT;
 /// Resolve which cloud the pair-token is exchanged against. Precedence:
 ///   1. `SAFECLAW_CLOUD_URL` — runtime self-host escape hatch (any URL; HTTPS
 ///      enforced below). Undocumented; for people running their own custodian.
-///   2. `--env {prod,dev}` — the FIRST-PARTY selector the console's install
+///   2. `--profile {prod,dev}` — the FIRST-PARTY selector the console's install
 ///      prompt uses. It is a SYMBOL, not a URL: it resolves only against the
-///      compiled-in allowlist below. This is deliberate — `sc login` has no
+///      compiled-in allowlist below. This is deliberate, `sc login` has no
 ///      `--custodian <url>` flag, because a malicious skill prompt could
 ///      otherwise redirect pairing to an attacker host. A symbol bounded to
 ///      first-party domains means a hostile prompt can at worst flip you
 ///      between your OWN prod/dev, never to a third party. The prod console
-///      omits the flag (→ default prod); the dev console appends `--env dev`.
+///      omits the flag (→ default prod); the dev console appends `--profile dev`.
 ///   3. `SAFECLAW_BAKED_CLOUD_URL` — compile-time self-host bake.
 ///   4. Default: prod. Every real user only ever deals with prod.
 /// The resolved value is only the target at `sc login` time; once paired, the
@@ -62,15 +62,15 @@ fn resolve_custodian(env_flag: Option<&str>) -> Result<String, String> {
     Ok("https://safeclaw.pro".to_string())
 }
 
-/// The `--env` allowlist. A SYMBOL → first-party URL only; anything else is a
+/// The `--profile` allowlist. A SYMBOL → first-party URL only; anything else is a
 /// hard error. This is the gate that keeps a hostile install prompt from
-/// steering pairing off first-party domains — do not widen it to accept URLs.
+/// steering pairing off first-party domains; do not widen it to accept URLs.
 fn env_selector_to_url(env: &str) -> Result<String, String> {
     match env {
         "prod" => Ok("https://safeclaw.pro".to_string()),
         "dev" => Ok("https://dev.safeclaw.pro".to_string()),
         other => Err(format!(
-            "unknown --env '{}': expected 'prod' or 'dev'",
+            "unknown --profile '{}': expected 'prod' or 'dev'",
             other
         )),
     }
@@ -88,7 +88,7 @@ mod tests {
             "https://dev.safeclaw.pro"
         );
         // Anything that is not an exact first-party symbol is rejected — a
-        // hostile prompt cannot smuggle a custodian URL through `--env`.
+        // hostile prompt cannot smuggle a custodian URL through `--profile`.
         assert!(env_selector_to_url("https://attacker.com").is_err());
         assert!(env_selector_to_url("staging").is_err());
         assert!(env_selector_to_url("").is_err());
@@ -261,8 +261,8 @@ async fn device_flow_pair(
 }
 
 pub async fn run(args: LoginArgs) -> Result<(), String> {
-    // ── Resolve cloud endpoint: env override > --env selector > baked ─────
-    let custodian = resolve_custodian(args.env.as_deref())?;
+    // ── Resolve cloud endpoint: env override > --profile selector > baked ─────
+    let custodian = resolve_custodian(args.profile.as_deref())?;
     let custodian = custodian.trim_end_matches('/').to_string();
 
     // ── Enforce HTTPS for the custodian URL ──────────────────────────────
@@ -272,10 +272,10 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
     // `http://` custodian leaks the token on the wire AND lets an on-path
     // attacker swap the response for an attacker-controlled daemon. Reject
     // by default; the only legitimate cleartext case is dev-loopback.
-    if !args.insecure_http && !custodian.starts_with("https://") && !is_localhost_http(&custodian) {
+    if !args.insecure && !custodian.starts_with("https://") && !is_localhost_http(&custodian) {
         return Err(format!(
             "custodian URL must use HTTPS ({} is plaintext); \
-             pass --insecure-http to override (test-only)",
+             pass --insecure to override (test-only)",
             custodian
         ));
     }
@@ -476,7 +476,7 @@ pub async fn run(args: LoginArgs) -> Result<(), String> {
 
 /// Loopback-exemption check for the HTTPS gate: `http://localhost[:PORT]`
 /// and `http://127.0.0.1[:PORT]` (with optional trailing path) are allowed
-/// without `--insecure-http` because the traffic never leaves the host. We
+/// without `--insecure` because the traffic never leaves the host. We
 /// intentionally do NOT exempt `0.0.0.0`, `[::1]`, or arbitrary RFC1918
 /// addresses — those can be reachable from off-host on misconfigured nets,
 /// and the gate is the conservative call.

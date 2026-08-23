@@ -1,4 +1,4 @@
-//! `sc up` / `down` / `restart` / `logs` — user-level daemon lifecycle.
+//! `sc up` / `down` / `restart` / `log` — user-level daemon lifecycle.
 //!
 //! Two backends, one mental model ("bring the daemon up in the background,
 //! auto-restart on crash, state under `$HOME`, no sudo"):
@@ -20,7 +20,7 @@
 //! shape) should write their own `/etc/systemd/system/safeclaw.service`
 //! and not touch these commands.
 
-use crate::config::LogsArgs;
+use crate::config::LogArgs;
 use std::process::Command as ProcCommand;
 
 const UNIT_BASENAME: &str = "safeclaw.service";
@@ -160,8 +160,8 @@ fn launchd_converge(plist_arg: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(
-            "the LaunchAgent was (re)started but nothing is answering on the control port — \
-             check `sc logs`"
+            "the LaunchAgent was (re)started but nothing is answering on the control port, \
+             check `sc log`"
                 .to_string(),
         )
     }
@@ -264,7 +264,7 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     eprintln!("  broker:   requires an agent key (synced from your account); mint one with `sc agent add` or the dashboard's \"Connect a new agent\"");
     eprintln!();
     eprintln!("  next: `sc login --pair-token <token>` to connect this daemon to your vault (token from the dashboard)");
-    eprintln!("        `sc logs -f` to tail, `sc down` to stop, `sc restart` to reload");
+    eprintln!("        `sc log -f` to tail, `sc down` to stop, `sc restart` to reload");
     Ok(())
 }
 
@@ -379,7 +379,7 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     eprintln!("  logs:     {}", log_str);
     eprintln!();
     eprintln!("  next: `sc login --pair-token <token>` to connect this daemon to your vault (token from the dashboard)");
-    eprintln!("        `sc logs -f` to tail, `sc down` to stop, `sc restart` to reload");
+    eprintln!("        `sc log -f` to tail, `sc down` to stop, `sc restart` to reload");
     Ok(())
 }
 
@@ -504,9 +504,9 @@ pub fn run_restart() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn run_logs(args: LogsArgs) -> Result<(), String> {
+pub fn run_log(args: LogArgs) -> Result<(), String> {
     ensure_unit_installed()?;
-    let n = args.lines.to_string();
+    let n = args.tail.to_string();
     let mut cmd = ProcCommand::new("journalctl");
     cmd.args(["--user", "-u", UNIT_BASENAME, "-n", &n]);
     // `-o cat` prints only the daemon's own log line — which already carries an
@@ -531,7 +531,7 @@ pub fn run_logs(args: LogsArgs) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn run_logs(args: LogsArgs) -> Result<(), String> {
+pub fn run_log(args: LogArgs) -> Result<(), String> {
     // launchd has no journal; the daemon's stdout/stderr land in the plist's
     // StandardOutPath. Tail that file (the daemon already prefixes each line
     // with an ISO timestamp + level + module, so there's no journald-style
@@ -543,7 +543,7 @@ pub fn run_logs(args: LogsArgs) -> Result<(), String> {
             log_path.display()
         ));
     }
-    let n = args.lines.to_string();
+    let n = args.tail.to_string();
     let mut cmd = ProcCommand::new("tail");
     cmd.args(["-n", &n]);
     if args.follow {
@@ -558,8 +558,8 @@ pub fn run_logs(args: LogsArgs) -> Result<(), String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn run_logs(_args: LogsArgs) -> Result<(), String> {
-    Err("`sc logs` (service mode) is Linux/macOS-only.".into())
+pub fn run_log(_args: LogArgs) -> Result<(), String> {
+    Err("`sc log` (service mode) is Linux/macOS-only.".into())
 }
 
 #[cfg(target_os = "linux")]

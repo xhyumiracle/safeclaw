@@ -44,6 +44,10 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
     // Record the global `--vault` once; `resolve_active` reads it as the top of
     // the vault chain (flag > env pin > config default).
     cli::active::set_vault_flag(cli.vault.clone());
+    // The global `--json` (available on any subcommand): threaded into the
+    // handlers that have a machine-readable form. Commands with no JSON output
+    // simply ignore it.
+    let json = cli.json;
     // `serve` installs its own subscriber below (long-running, different
     // defaults); every other (short-lived) verb gets a stderr subscriber only
     // when `-v` was asked, so a command's normal output stays clean.
@@ -51,11 +55,11 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
         cli::logging::init_cli(verbose);
     }
     match cli.command {
-        Command::Status(args) => {
+        Command::Status(_args) => {
             // CLI commands log to stderr; don't initialise the tracing
             // subscriber here (it'd pollute the user-facing output of a
             // short-lived command). The daemon path enables it below.
-            cli::status::run(args)
+            cli::status::run(json)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error> {
                     eprintln!("safeclaw status: {}", e);
@@ -84,9 +88,9 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
                     e.into()
                 })
         }
-        Command::Logs(args) => cli::service::run_logs(args).map_err(daemon_err),
+        Command::Log(args) => cli::service::run_log(args).map_err(daemon_err),
         Command::Pubkey(args) => cli::custodian::pubkey(args).await.map_err(daemon_err),
-        Command::Registry(args) => cli::custodian::registry(args).map_err(daemon_err),
+        Command::Registry(_args) => cli::custodian::registry(json).map_err(daemon_err),
         Command::Up => {
             // `sc up` = make SafeClaw ready: ensure the daemon is running, then
             // ensure the vault is unlocked (the single auto-unlock chokepoint;
@@ -115,8 +119,8 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
                     e.into()
                 })
         }
-        Command::Doctor(args) => {
-            cli::doctor::run(args)
+        Command::Doctor(_args) => {
+            cli::doctor::run(json)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error> {
                     eprintln!("safeclaw doctor: {}", e);
@@ -124,7 +128,7 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
                 })
         }
         Command::Vault(args) => {
-            cli::vault::run(args.sub)
+            cli::vault::run(args.sub, json)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error> {
                     eprintln!("safeclaw vault: {}", e);
@@ -146,7 +150,7 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
                 })
         }
         Command::Store(args) => {
-            cli::store::run(args.sub)
+            cli::store::run(args.sub, json)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error> {
                     eprintln!("safeclaw store: {}", e);
@@ -154,7 +158,7 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
                 })
         }
         Command::Passkey(args) => {
-            cli::passkey::run(args.sub)
+            cli::passkey::run(args.sub, json)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error> {
                     eprintln!("safeclaw passkey: {}", e);
@@ -162,7 +166,7 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
                 })
         }
         Command::Agent(args) => {
-            cli::agent::run(args.sub)
+            cli::agent::run(args.sub, json)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error> {
                     eprintln!("safeclaw agent: {}", e);
@@ -204,7 +208,7 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
             use crate::config::ConnectionSubcommand;
             let r = match args.sub {
                 ConnectionSubcommand::Add(a) => cli::connect::run(a).await,
-                ConnectionSubcommand::Ls(a) => cli::connect::run_ls(a).await,
+                ConnectionSubcommand::Ls(_a) => cli::connect::run_ls(json).await,
                 ConnectionSubcommand::Rm(a) => cli::connect::run_rm(a).await,
             };
             r.map_err(|e| -> Box<dyn std::error::Error> {
@@ -281,7 +285,7 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
             let r = match args.sub {
                 ServiceSubcommand::Validate(a) => cli::service_def::run_validate(a).await,
                 ServiceSubcommand::Add(a) => cli::service_def::run_add(a).await,
-                ServiceSubcommand::Ls(a) => cli::service_def::run_ls(a).await,
+                ServiceSubcommand::Ls(a) => cli::service_def::run_ls(a, json).await,
                 ServiceSubcommand::Rm(a) => cli::service_def::run_rm(a).await,
             };
             r.map_err(|e| -> Box<dyn std::error::Error> {

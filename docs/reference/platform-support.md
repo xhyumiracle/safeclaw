@@ -52,7 +52,7 @@ daemon at login and restarts it on crash; `sc down` removes it. Logs at
 
 A single static binary, no runtime dependencies. `sc up` installs a per-user
 systemd unit (`~/.config/systemd/user/safeclaw.service`, `systemctl --user`)
-that starts the daemon and restarts it on failure; `sc logs` reads its journal.
+that starts the daemon and restarts it on failure; `sc log` reads its journal.
 Running it as a system-wide service is possible by hand-writing your own unit.
 
 ## Windows

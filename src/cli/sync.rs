@@ -57,7 +57,7 @@ pub async fn run(_args: SyncArgs) -> Result<(), String> {
 
 /// Surface what happened to pending OAuth connects this sync, so a daemon-side
 /// exchange failure is VISIBLE at the command that triggered it instead of only
-/// in `sc logs`. Stays silent when there was nothing pending.
+/// in `sc log`. Stays silent when there was nothing pending.
 fn report_connects(connects: Option<&serde_json::Value>) {
     let Some(c) = connects else { return };
     let conns = |arr: Option<&serde_json::Value>| -> Vec<String> {

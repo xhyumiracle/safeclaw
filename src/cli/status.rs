@@ -1,7 +1,6 @@
 //! `safeclaw status` / `safeclaw vault status` — current vault status.
 
 use crate::cli::active::{frontend_origin, join_vault_url, load as load_config};
-use crate::config::StatusArgs;
 
 #[derive(Debug)]
 pub struct VaultStatus {
@@ -183,7 +182,7 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
     }
 }
 
-pub async fn run(args: StatusArgs) -> Result<(), String> {
+pub async fn run(json: bool) -> Result<(), String> {
     let cfg = load_config()?;
     // ONE control root for the probe and every fetch below — derived env-first
     // (an agent's shelled `sc status` reports the agent's own daemon).
@@ -217,7 +216,7 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
     // URL next to it is exactly what makes a moved port diagnosable.
     let broker = crate::cli::active::api_face_root(&cfg);
 
-    if args.json {
+    if json {
         print_json(
             &d,
             &control,

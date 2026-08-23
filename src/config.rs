@@ -28,7 +28,7 @@ pub const DEFAULT_BODY_CAP: u64 = 32 * 1024 * 1024;
 ///
 ///   - **Daemon + vault lifecycle** (Linux user-systemd): `sc up` (install +
 ///     start + unlock), `sc down`, `sc restart`, `sc unlock` / `sc lock` (the
-///     active vault), `sc logs`, and `sc serve` to run it in the foreground
+///     active vault), `sc log`, and `sc serve` to run it in the foreground
 ///     (Docker / dev / non-Linux).
 ///   - **Vault ops** are short-lived CLI commands talking to the daemon
 ///     over HTTP: `sc status`, `sc vault ...` (alias `sc v`, manage the set of
@@ -52,6 +52,11 @@ pub struct Cli {
     /// resolution chain, design/vault-addressing.md).
     #[arg(long, global = true, value_name = "VAULT")]
     pub vault: Option<String>,
+    /// Emit machine-readable JSON instead of the human-readable output, on any
+    /// subcommand that supports it (e.g. status, doctor, registry, and the `ls`
+    /// listings). Commands with no JSON form ignore it.
+    #[arg(long, global = true)]
+    pub json: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -86,7 +91,7 @@ pub enum Command {
     /// DOS-lock the vault). Pass `--vault` to target a non-active vault.
     Lock(UnlockArgs),
     /// Tail the local daemon's logs (journalctl).
-    Logs(LogsArgs),
+    Log(LogArgs),
     /// ADVANCED / self-host: run the daemon in the FOREGROUND (this process),
     /// for Docker / a hand-written systemd unit / non-systemd hosts. On a normal
     /// Linux box you never call this — `sc up` installs a background service
@@ -100,27 +105,26 @@ pub enum Command {
     /// running daemon), the exact shape `GET /registry` serves. `--json` for CI.
     Registry(RegistryArgs),
     /// Alias for `sc secret ls`.
-    #[command(alias = "list")]
     Ls(CommonArgs),
     /// Alias for `sc secret get`.
     Get(GetArgs),
-    /// Per-vault lifecycle ops. Today: `vault delete` to nuke a vault's
+    /// Per-vault lifecycle ops. Today: `vault rm` to nuke a vault's
     /// daemon-side state (irreversible, passkey-gated). Short: `sc v`.
     #[command(alias = "v")]
     Vault(VaultArgs),
     /// Read/write persistent CLI preferences in `~/.safeclaw/config.toml`.
     /// Settings here are the lowest-priority fallback in the resolution
     /// chain (flag > env > config > default). Subs: set / get / unset /
-    /// list.
+    /// ls.
     Config(ConfigArgs),
     /// Manage this device's upstream egress proxy (the HTTP proxy the daemon uses
-    /// to reach the internet). Subs: set / show / clear. Behind a corporate or
+    /// to reach the internet). Subs: set / get / unset. Behind a corporate or
     /// on-demand proxy this is how the daemon completes OAuth connects and routes
     /// its forward hop, since the background daemon doesn't inherit your shell's
     /// `HTTPS_PROXY`.
     Proxy(ProxyArgs),
     /// Manage the active vault's enrolled passkeys. `ls` is read-only;
-    /// `add` / `remove` / `rename` need crypto ceremonies and are deferred
+    /// `add` / `rm` / `rename` need crypto ceremonies and are deferred
     /// to a later session. Short: `sc p`.
     #[command(alias = "p")]
     Passkey(PasskeyArgs),
@@ -282,7 +286,6 @@ pub enum ConnectionSubcommand {
     Add(ConnectArgs),
     /// List the connections the agent can use (id, hosts, phantoms). Requires an
     /// unlocked vault. `--json` for scripts.
-    #[command(alias = "list")]
     Ls(ConnectionLsArgs),
     /// Remove a connection and its secret(s) from the vault (two passkey
     /// gestures: unlock + write). Mirrors the console's "Disconnect".
@@ -290,11 +293,7 @@ pub enum ConnectionSubcommand {
 }
 
 #[derive(Debug, Args)]
-pub struct ConnectionLsArgs {
-    /// Emit machine-readable JSON instead of the human table.
-    #[arg(long)]
-    pub json: bool,
-}
+pub struct ConnectionLsArgs {}
 
 #[derive(Debug, Args)]
 pub struct ConnectionRmArgs {
@@ -304,7 +303,7 @@ pub struct ConnectionRmArgs {
     pub id: String,
     /// Skip the interactive confirmation (required off a terminal, since the
     /// delete of the connection + its secrets is irreversible without a re-add).
-    #[arg(long)]
+    #[arg(long, short = 'y')]
     pub yes: bool,
     /// Remove only the connection record and keep every secret value in the
     /// vault (unreference). Default deletes the keys ONLY this connection
@@ -351,12 +350,7 @@ pub struct GitCredentialArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct RegistryArgs {
-    /// Emit the catalog as JSON (the same shape `GET /registry` serves) instead
-    /// of a human-readable table. Used by CI to publish the catalog artifact.
-    #[arg(long)]
-    pub json: bool,
-}
+pub struct RegistryArgs {}
 
 #[derive(Debug, Args)]
 pub struct VaultArgs {
@@ -379,7 +373,6 @@ pub enum SecretSubcommand {
     /// Delete a native secret. Two passkey gestures.
     Rm(RmArgs),
     /// List secret names this vault can resolve.
-    #[command(alias = "list")]
     Ls(CommonArgs),
 }
 
@@ -405,7 +398,6 @@ pub enum ServiceSubcommand {
     /// the daemon (its connections stay stuck), and the console only surfaces
     /// definitions that have a connection, so this is where orphaned or broken
     /// defs become visible. One passkey gesture (unlock, read-only).
-    #[command(alias = "list")]
     Ls(ServiceLsArgs),
     /// Delete a custom service definition from the vault (`aux.services`).
     /// Warns when connections still reference it (they keep working off stored
@@ -484,7 +476,6 @@ pub enum AgentSubcommand {
     /// your paired devices.
     Add(AgentAddArgs),
     /// List this account's agents (name, key prefix, last-used).
-    #[command(alias = "list")]
     Ls,
     /// Revoke an agent by name (or key prefix / id). Propagates to every
     /// device in under a second over the sync stream (one poll cycle when a
@@ -526,14 +517,13 @@ pub enum PasskeySubcommand {
     /// List passkeys enrolled on the active vault (public metadata only:
     /// credential id, device name, transports, timestamps). No vault
     /// unlock or passkey gesture required.
-    #[command(alias = "list")]
     Ls(CommonArgs),
     /// Add a new passkey (cross-device or same-device). NOT YET
-    /// IMPLEMENTED — needs the daemon-side `/cli/auth?op=enroll-passkey`
+    /// IMPLEMENTED, needs the daemon-side `/cli/auth?op=enroll-passkey`
     /// page and the same crypto vendoring as `sc setup`.
     Add(CommonArgs),
     /// Remove an enrolled passkey by credential id. NOT YET IMPLEMENTED.
-    Remove(PasskeyRemoveArgs),
+    Rm(PasskeyRemoveArgs),
     /// Rename an enrolled passkey's `device_name`. NOT YET IMPLEMENTED —
     /// daemon currently has no metadata-update endpoint.
     Rename(PasskeyRenameArgs),
@@ -552,12 +542,7 @@ pub struct PasskeyRenameArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct VaultLsArgs {
-    /// Emit a JSON array (`[{url, daemon, vault, default}]`) instead of the
-    /// human list.
-    #[arg(long)]
-    pub json: bool,
-}
+pub struct VaultLsArgs {}
 
 #[derive(Debug, Subcommand)]
 pub enum VaultSubcommand {
@@ -566,14 +551,13 @@ pub enum VaultSubcommand {
     Status(StatusArgs),
     /// List vaults this CLI has used (from local config) + mark the
     /// device default with `*`. `--json` for scripts/agents.
-    #[command(alias = "list")]
     Ls(VaultLsArgs),
     /// Switch the active vault. Pass an id, a unique id prefix, or the exact name
     /// (quote if it has spaces); also an `sc vault ls` index, a vault URL, --local
     /// for the localhost default, or nothing for an interactive prompt.
     Use(VaultUseArgs),
     /// Remove a vault from the local known list (does NOT touch the
-    /// daemon — for that use `sc vault delete`). Pass URL or index.
+    /// daemon, for that use `sc vault rm`). Pass URL or index.
     Forget(VaultForgetArgs),
     /// Create a new vault. Default = local (http://localhost:23293,
     /// vault id "default"). Pass --remote <URL> to create on a remote
@@ -582,7 +566,7 @@ pub enum VaultSubcommand {
     Create(VaultCreateArgs),
     /// Irreversibly delete a vault's daemon-side state. Passkey-gated
     /// via the standard `/op/{op_id}` browser-callback ceremony.
-    Delete(VaultDeleteArgs),
+    Rm(VaultDeleteArgs),
     /// Back-compat alias for top-level `sc unlock`. Lock/unlock are vault-level
     /// lifecycle ops (they sit next to `sc up`), so the canonical spelling is
     /// top-level; this is kept hidden so existing `sc vault unlock` calls work.
@@ -639,8 +623,8 @@ pub struct VaultDeleteArgs {
 
     /// Bypass the interactive confirmation. Without this flag the command
     /// refuses to proceed (since deletion is irreversible).
-    #[arg(long)]
-    pub yes_i_mean_it: bool,
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 
     #[arg(long)]
     pub no_browser: bool,
@@ -663,7 +647,6 @@ pub struct StoreArgs {
 pub enum StoreSubcommand {
     /// List external stores connected to the active vault. Needs the
     /// vault unlocked (we read from daemon's cache snapshot).
-    #[command(alias = "list")]
     Ls(CommonArgs),
 }
 
@@ -682,9 +665,9 @@ pub enum ProxySubcommand {
     Set { url: String },
     /// Print the configured egress proxy (and any shell `HTTPS_PROXY` that would
     /// override it). Exit nonzero when nothing is configured.
-    Show,
+    Get,
     /// Remove the configured egress proxy and bounce the daemon back to direct.
-    Clear,
+    Unset,
 }
 
 #[derive(Debug, Args)]
@@ -703,17 +686,17 @@ pub enum ConfigSubcommand {
     /// Clear a preference.
     Unset { key: String },
     /// Print all preferences (key = value, one per line).
-    List,
+    Ls,
 }
 
 #[derive(Debug, Args)]
-pub struct LogsArgs {
+pub struct LogArgs {
     /// Follow new log lines (like `tail -f`).
     #[arg(long, short = 'f')]
     pub follow: bool,
     /// Show only the last N lines (passed to journalctl as -n).
     #[arg(long, short = 'n', default_value = "200")]
-    pub lines: u32,
+    pub tail: u32,
     /// Keep journald's full format (local wall-clock, host, pid). Default output
     /// is `-o cat` — just the daemon's own already-timestamped line.
     #[arg(long)]
@@ -793,13 +776,7 @@ pub struct ServeArgs {
 /// `~/.safeclaw/config.toml`; the active vault is `--vault` else
 /// `$SAFECLAW_VAULT_ID` (env pin) else the config default (§5).
 #[derive(Debug, Args)]
-pub struct StatusArgs {
-    /// Emit machine-readable JSON (daemon + vault state, the vault selection —
-    /// env pin vs device default — and the agent-facing connections/phantoms)
-    /// instead of the human table.
-    #[arg(long)]
-    pub json: bool,
-}
+pub struct StatusArgs {}
 
 #[derive(Debug, Args)]
 pub struct SyncArgs {}
@@ -829,15 +806,15 @@ pub struct UpgradeArgs {
     /// Force the PRE-RELEASE channel: install the newest release even if it's a
     /// `vX.Y.Z-rc.N` pre-release. Normally the channel is DERIVED from the cloud
     /// this host is paired to (a `dev.*` login tracks pre-releases, prod tracks
-    /// stable), so a dogfood box needs no flag — plain `sc upgrade` already
+    /// stable), so a dogfood box needs no flag; plain `sc upgrade` already
     /// tracks rc. This override is for the rare case of pulling an rc while
     /// paired to prod. Mutually exclusive with `--stable`.
     #[arg(long, conflicts_with = "stable")]
-    pub pre: bool,
+    pub prerelease: bool,
     /// Force the STABLE channel: track only stable releases (GitHub's `latest`,
     /// which skips pre-releases) regardless of derivation. The escape hatch for a
     /// `dev.*`-paired box that wants to drop back to stable. Mutually exclusive
-    /// with `--pre`.
+    /// with `--prerelease`.
     #[arg(long)]
     pub stable: bool,
 }
@@ -856,20 +833,20 @@ pub struct LoginArgs {
     #[arg(long)]
     pub device_name: Option<String>,
     /// First-party environment selector: `prod` (default) or `dev`. Resolves
-    /// only against a compiled-in allowlist — it is NOT a raw custodian URL, so
+    /// only against a compiled-in allowlist, it is NOT a raw custodian URL, so
     /// a hostile install prompt can at worst flip between your own prod/dev,
     /// never to a third-party host. The prod console omits it; the dev console's
-    /// install prompt appends `--env dev`.
+    /// install prompt appends `--profile dev`.
     #[arg(long)]
-    pub env: Option<String>,
+    pub profile: Option<String>,
     /// Test-only: allow a plaintext `http://` custodian URL. Without this,
     /// `sc login` refuses non-HTTPS URLs to keep the pair-token off the wire
     /// in cleartext (a malicious skill prompt could otherwise smuggle in an
     /// attacker's device-key by suggesting an `http://` custodian).
-    /// `http://localhost:*` and `http://127.0.0.1:*` are exempt — that's the
+    /// `http://localhost:*` and `http://127.0.0.1:*` are exempt, that's the
     /// common dev-loopback case and is on-host plaintext.
     #[arg(long)]
-    pub insecure_http: bool,
+    pub insecure: bool,
 }
 
 /// Args for `sc logout`.
@@ -943,10 +920,10 @@ pub struct RmArgs {
     /// Native-secrets key name to remove from the vault.
     pub key: String,
     /// Remove the key even when connections still reference it. They are
-    /// never deleted with it — they just turn unconfigured until the key is
+    /// never deleted with it, they just turn unconfigured until the key is
     /// re-added. Required off a terminal; interactive runs prompt instead.
-    #[arg(long)]
-    pub force: bool,
+    #[arg(long, short = 'y')]
+    pub yes: bool,
     #[arg(long)]
     pub no_browser: bool,
     /// Fixed port for the localhost callback server. When set, the CLI

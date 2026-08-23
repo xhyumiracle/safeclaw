@@ -206,7 +206,7 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     // op). The referenced-by detail is reported AFTER — the daemon computes it
     // while it holds the open vault. The KEY name rides the op (public); the
     // value never leaves the vault.
-    if !args.force && std::io::stdin().is_terminal() {
+    if !args.yes && std::io::stdin().is_terminal() {
         let ans = crate::cli::connect::prompt_line(&format!("Remove key '{}'? [y/N]: ", key))?;
         if !matches!(ans.trim(), "y" | "Y" | "yes" | "YES") {
             eprintln!("aborted");
