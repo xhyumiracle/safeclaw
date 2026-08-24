@@ -541,18 +541,12 @@ fn scheme_host(url: &str) -> Option<String> {
 }
 
 /// The agent's broker-face URL from the env: `$SAFECLAW_BROKER_URL` (the
-/// self-describing name — this is SafeClaw's broker/API face, NOT the control
-/// port), falling back to the legacy `$SAFECLAW_DAEMON_URL` so an env minted
-/// before the rename keeps working. Empty values are ignored.
+/// self-describing name, SafeClaw's broker/API face, not the control port).
+/// Empty values are ignored.
 pub fn env_broker_url() -> Option<String> {
     std::env::var("SAFECLAW_BROKER_URL")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::env::var("SAFECLAW_DAEMON_URL")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
 }
 
 fn env_daemon_host() -> Option<String> {
