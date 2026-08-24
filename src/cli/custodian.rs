@@ -5,7 +5,7 @@
 //! status in `status`.
 
 use crate::cli::active::resolve_active;
-use crate::config::{CommonArgs, RegistryArgs};
+use crate::config::CommonArgs;
 
 pub async fn pubkey(args: CommonArgs) -> Result<(), String> {
     fetch_print(args, "/pubkey").await
@@ -15,7 +15,7 @@ pub async fn pubkey(args: CommonArgs) -> Result<(), String> {
 /// services, no running daemon. This is the exact shape `GET /registry` serves;
 /// CI runs `sc registry --json` to publish the catalog artifact the console
 /// reads. Offline by construction (`ServiceRegistry::compiled_only()`).
-pub fn registry(args: RegistryArgs) -> Result<(), String> {
+pub fn registry(json: bool) -> Result<(), String> {
     let reg = crate::service::ServiceRegistry::compiled_only();
     // include_policy_rules = true: this catalog is the SSoT the CONSOLE reads
     // (CI publishes it as registry.json) and the policy panel needs each
@@ -23,7 +23,7 @@ pub fn registry(args: RegistryArgs) -> Result<(), String> {
     // them by default (lean); only this published artifact opts in.
     let catalog = crate::server::handlers::registry::render_catalog(&reg, true, None, false)
         .map_err(|e| e.to_string())?;
-    if args.json {
+    if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?

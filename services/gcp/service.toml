@@ -14,7 +14,7 @@ Scope is cloud-platform (full GCP). Multi-account: switch the phantom value
 id = "gcp"
 name = "Google Cloud"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 # GCP is a multi-host platform: one cloud-platform token reaches every API, each
 # on its own `*.googleapis.com` host. The Google TRIO hosts (www./gmail.

@@ -1,4 +1,4 @@
-//! `sc up` / `down` / `restart` / `logs` — user-level daemon lifecycle.
+//! `sc up` / `down` / `restart` / `log` — user-level daemon lifecycle.
 //!
 //! Two backends, one mental model ("bring the daemon up in the background,
 //! auto-restart on crash, state under `$HOME`, no sudo"):
@@ -20,7 +20,7 @@
 //! shape) should write their own `/etc/systemd/system/safeclaw.service`
 //! and not touch these commands.
 
-use crate::config::LogsArgs;
+use crate::config::LogArgs;
 use std::process::Command as ProcCommand;
 
 const UNIT_BASENAME: &str = "safeclaw.service";
@@ -81,6 +81,90 @@ fn run_launchctl(args: &[&str], action: &str) -> Result<(), String> {
         return Err(format!("launchctl {} failed: {}", action, stderr.trim()));
     }
     Ok(())
+}
+
+/// The REAL liveness signal on macOS: something answers on the daemon's control
+/// port. A launchd job can be *loaded* yet its process *dead* — a clean exit
+/// under `KeepAlive{SuccessfulExit=false}` (which an `sc upgrade` bounce can
+/// leave behind) is not restarted, so `launchctl list` still lists the job while
+/// nothing listens. Reading "loaded" as "running" made `sc up` report success
+/// over a dead daemon; a cheap TCP connect is the honest check.
+#[cfg(target_os = "macos")]
+fn control_port_alive() -> bool {
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, crate::config::CONTROL_PORT));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok()
+}
+
+/// Poll the control port until it answers or we give up (~20s). The daemon binds
+/// only AFTER `pull_on_start`, which now auto-discovers the account's vaults and
+/// pulls each one's sealed blob before serving — on a multi-vault account that
+/// cold start runs well past the old 6s window, so a bounce would false-alarm
+/// "nothing answering" even though the daemon comes up a beat later. Poll long
+/// enough to cover it; a genuinely dead daemon still errors, just later.
+#[cfg(target_os = "macos")]
+fn wait_for_control_port() -> bool {
+    for _ in 0..80 {
+        if control_port_alive() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
+}
+
+/// This login session's uid — needed to name the launchd GUI domain explicitly
+/// (`gui/<uid>`). Declaring `getuid` directly avoids taking on the `libc` crate
+/// for one call; `uid_t` is `u32` on Darwin.
+#[cfg(target_os = "macos")]
+fn current_uid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
+/// The GUI domain (`gui/<uid>`) our LaunchAgent lives in, and the fully-qualified
+/// service target within it. Pinning the domain explicitly is what stops the
+/// legacy verbs' "wrong session / not found in domain" wedge.
+#[cfg(target_os = "macos")]
+fn gui_domain() -> String {
+    format!("gui/{}", current_uid())
+}
+#[cfg(target_os = "macos")]
+fn gui_service() -> String {
+    format!("gui/{}/{}", current_uid(), LAUNCHD_LABEL)
+}
+
+/// Bring the LaunchAgent to "one fresh process, running" from ANY prior state,
+/// using ONLY the modern domain-pinned verbs. This is the launchd analog of
+/// systemd's "daemon-reload + restart", built to converge whether the job is
+/// absent, loaded-but-dead, disabled (a legacy `unload -w` override), or
+/// domain-wedged.
+///
+/// Every launchctl step is BEST-EFFORT — "already bootstrapped" / "not found"
+/// are expected along the way and must not abort the sequence. The SOLE success
+/// criterion is the control port answering (the honest `is-active`), never a
+/// launchctl exit code. `bootout` clears the old registration, `enable` clears a
+/// lingering disable override, `bootstrap` re-registers (RunAtLoad starts it),
+/// and `kickstart -k` forces a fresh process (covering a RunAtLoad that didn't
+/// fire or a job we couldn't boot out).
+#[cfg(target_os = "macos")]
+fn launchd_converge(plist_arg: &str) -> Result<(), String> {
+    let domain = gui_domain();
+    let service = gui_service();
+    let _ = run_launchctl(&["bootout", &service], "bootout");
+    let _ = run_launchctl(&["enable", &service], "enable");
+    let _ = run_launchctl(&["bootstrap", &domain, plist_arg], "bootstrap");
+    let _ = run_launchctl(&["kickstart", "-k", &service], "kickstart");
+    if wait_for_control_port() {
+        Ok(())
+    } else {
+        Err(
+            "the LaunchAgent was (re)started but nothing is answering on the control port, \
+             check `sc log`"
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -180,7 +264,7 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     eprintln!("  broker:   requires an agent key (synced from your account); mint one with `sc agent add` or the dashboard's \"Connect a new agent\"");
     eprintln!();
     eprintln!("  next: `sc login --pair-token <token>` to connect this daemon to your vault (token from the dashboard)");
-    eprintln!("        `sc logs -f` to tail, `sc down` to stop, `sc restart` to reload");
+    eprintln!("        `sc log -f` to tail, `sc down` to stop, `sc restart` to reload");
     Ok(())
 }
 
@@ -280,10 +364,9 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     }
 
     let plist_arg = plist_path.to_string_lossy().to_string();
-    // Reload cleanly: drop any prior registration (ignore "not loaded"), then
-    // load -w (enables + RunAtLoad starts it).
-    let _ = run_launchctl(&["unload", &plist_arg], "unload");
-    run_launchctl(&["load", "-w", &plist_arg], "load")?;
+    // Register + start via the modern domain-pinned verbs, converging from any
+    // prior state; success is verified by the control port, not launchctl.
+    launchd_converge(&plist_arg)?;
 
     eprintln!("✓ daemon installed and running ({})", plist_path.display());
     eprintln!("  binary:   {}", bin_str);
@@ -296,7 +379,7 @@ pub async fn run_start_systemd(force: bool) -> Result<(), String> {
     eprintln!("  logs:     {}", log_str);
     eprintln!();
     eprintln!("  next: `sc login --pair-token <token>` to connect this daemon to your vault (token from the dashboard)");
-    eprintln!("        `sc logs -f` to tail, `sc down` to stop, `sc restart` to reload");
+    eprintln!("        `sc log -f` to tail, `sc down` to stop, `sc restart` to reload");
     Ok(())
 }
 
@@ -319,6 +402,7 @@ pub fn run_ensure_running() -> Result<(), String> {
         .map(|s| s.success())
         .unwrap_or(false);
     if active {
+        eprintln!("✓ daemon already running");
         return Ok(());
     }
     // Not active. If the unit exists, just start it (no rewrite). Otherwise
@@ -335,24 +419,22 @@ pub fn run_ensure_running() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 pub fn run_ensure_running() -> Result<(), String> {
     let plist_path = launchd_plist_path()?;
-    let plist_arg = plist_path.to_string_lossy().to_string();
-    // Already loaded? `launchctl list <label>` exits 0 when registered, and
-    // KeepAlive keeps the process itself alive — treat loaded as running.
-    let loaded = ProcCommand::new("launchctl")
-        .args(["list", LAUNCHD_LABEL])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if loaded {
-        return Ok(());
-    }
     if !plist_path.exists() {
         return Err(
             "daemon is not running and no LaunchAgent is installed — run `sc up` once to install it"
                 .to_string(),
         );
     }
-    run_launchctl(&["load", "-w", &plist_arg], "load")?;
+    // Liveness = the control port answers, NOT `launchctl list` (a job can be
+    // loaded-but-dead; see control_port_alive). Already up → cheap no-op: never
+    // tear down a healthy daemon on a routine `sc up` (that would drop the
+    // in-memory vault keys and re-lock). Only converge when nothing answers.
+    if control_port_alive() {
+        eprintln!("✓ daemon already running");
+        return Ok(());
+    }
+    let plist_arg = plist_path.to_string_lossy().to_string();
+    launchd_converge(&plist_arg)?;
     eprintln!("✓ daemon started");
     Ok(())
 }
@@ -376,10 +458,13 @@ pub fn run_stop() -> Result<(), String> {
     if !plist_path.exists() {
         return Err("no LaunchAgent installed — run `sc up` first".to_string());
     }
-    let plist_arg = plist_path.to_string_lossy().to_string();
-    // unload -w stops the process AND marks it disabled so it won't restart at
-    // login until the next `sc up`.
-    run_launchctl(&["unload", "-w", &plist_arg], "unload")?;
+    // Modern equivalent of `unload -w`: bootout removes it from the domain (stops
+    // the process); disable persists "stay down" across logins until the next
+    // `sc up` re-enables it. Both best-effort — an already-stopped daemon is a
+    // success, not an error.
+    let service = gui_service();
+    let _ = run_launchctl(&["bootout", &service], "bootout");
+    let _ = run_launchctl(&["disable", &service], "disable");
     eprintln!("✓ daemon stopped");
     Ok(())
 }
@@ -404,11 +489,11 @@ pub fn run_restart() -> Result<(), String> {
         return Err("no LaunchAgent installed — run `sc up` first".to_string());
     }
     let plist_arg = plist_path.to_string_lossy().to_string();
-    // Bounce via unload+load (legacy, compatible across macOS versions). The
-    // caller (`sc restart` / `sc upgrade`) re-unlocks afterward, so a bounce
-    // that drops the in-memory keys converges back to ready.
-    let _ = run_launchctl(&["unload", &plist_arg], "unload");
-    run_launchctl(&["load", "-w", &plist_arg], "load")?;
+    // Always converge to a FRESH process (the point of restart / the `sc upgrade`
+    // bounce). The modern verbs + control-port verify can't silently no-op the
+    // way the old `unload`/`load -w` pair did when a just-exited job wasn't
+    // relaunched. The caller re-unlocks afterward.
+    launchd_converge(&plist_arg)?;
     eprintln!("✓ daemon restarted");
     Ok(())
 }
@@ -419,9 +504,9 @@ pub fn run_restart() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn run_logs(args: LogsArgs) -> Result<(), String> {
+pub fn run_log(args: LogArgs) -> Result<(), String> {
     ensure_unit_installed()?;
-    let n = args.lines.to_string();
+    let n = args.tail.to_string();
     let mut cmd = ProcCommand::new("journalctl");
     cmd.args(["--user", "-u", UNIT_BASENAME, "-n", &n]);
     // `-o cat` prints only the daemon's own log line — which already carries an
@@ -446,7 +531,7 @@ pub fn run_logs(args: LogsArgs) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn run_logs(args: LogsArgs) -> Result<(), String> {
+pub fn run_log(args: LogArgs) -> Result<(), String> {
     // launchd has no journal; the daemon's stdout/stderr land in the plist's
     // StandardOutPath. Tail that file (the daemon already prefixes each line
     // with an ISO timestamp + level + module, so there's no journald-style
@@ -458,7 +543,7 @@ pub fn run_logs(args: LogsArgs) -> Result<(), String> {
             log_path.display()
         ));
     }
-    let n = args.lines.to_string();
+    let n = args.tail.to_string();
     let mut cmd = ProcCommand::new("tail");
     cmd.args(["-n", &n]);
     if args.follow {
@@ -473,8 +558,8 @@ pub fn run_logs(args: LogsArgs) -> Result<(), String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn run_logs(_args: LogsArgs) -> Result<(), String> {
-    Err("`sc logs` (service mode) is Linux/macOS-only.".into())
+pub fn run_log(_args: LogArgs) -> Result<(), String> {
+    Err("`sc log` (service mode) is Linux/macOS-only.".into())
 }
 
 #[cfg(target_os = "linux")]

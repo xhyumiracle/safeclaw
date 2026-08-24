@@ -1,8 +1,5 @@
 setup = """
-Routed (under `sc run` / the env bundle)? Nothing to configure — cargo honours the
-proxy + CA env directly on every path, so the crates.io token never enters cargo's
-config, env, or the agent process.
-Not routed? Prefix the publish: `sc run -- cargo publish`.
+Run the publish under `sc run -- cargo publish`.
 Publishing is irreversible (crates.io only yanks) — expect a passkey prompt; the
 approve link surfaces in cargo's error output. Tap it, then re-run the command.
 """
@@ -11,7 +8,7 @@ approve link surfaces in cargo's error output. Tap it, then re-run the command.
 id = "cratesio"
 name = "crates.io"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 hosts = ["crates.io"]
 secrets = ["CARGO_REGISTRY_TOKEN"]

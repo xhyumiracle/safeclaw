@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use crate::cli::active::{load, save, CliConfig};
 use crate::config::LogoutArgs;
+use crate::device_auth::DikRequestExt;
 
 pub async fn run(args: LogoutArgs) -> Result<(), String> {
     let cfg = load().unwrap_or_default();
@@ -37,11 +38,25 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
         }
     }
 
-    // 2. Stop the daemon so it stops serving/syncing this account's vaults (and
-    //    stops any orphan-vault 403 sync spam). Best-effort / Linux-only.
-    #[cfg(target_os = "linux")]
+    // 2. Stop the daemon so it stops serving/syncing this account's vaults and
+    //    drops in-memory K. Cross-platform: macOS previously skipped this, so a
+    //    self-logout left the daemon running (K in memory, vault.dat on disk) and
+    //    kept substituting secrets — the "unpair -> this machine can't use
+    //    secrets" expectation has to hold for self-logout too. Best-effort.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let _ = crate::cli::service::run_stop();
+    }
+
+    // 2b. Wipe local sealed vault state (`<state_dir>/vaults/`). Unpair means this
+    //    machine is out; the sealed blobs are ciphertext (no leak), but leaving
+    //    them is untidy and a re-pair re-pulls them from the cloud. Best-effort —
+    //    a wipe failure must not block the unpair.
+    {
+        let vaults_dir = crate::config::default_state_dir().join("vaults");
+        if vaults_dir.exists() {
+            let _ = std::fs::remove_dir_all(&vaults_dir);
+        }
     }
 
     // 3. Remove the device-key file (this host's identity to the cloud).
@@ -60,6 +75,8 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
     cleared.vault = None;
     cleared.cloud_backend = None;
     cleared.frontend_origin = None;
+    cleared.account_id = None;
+    cleared.account_uik = None;
     cleared.vault_deleted_upstream = None;
     cleared.known_vaults.clear();
     save(&cleared)?;
@@ -71,10 +88,10 @@ pub async fn run(args: LogoutArgs) -> Result<(), String> {
         eprintln!("Nothing was paired; cleared any stale local config.");
     }
     eprintln!();
-    eprintln!("  Your agent's SAFECLAW_* env (BROKER_URL / VAULT_ID / API_KEY) may");
-    eprintln!("  still be persisted in its .env — it's stale now; remove it. Agent keys stay");
+    eprintln!("  Your agent's SAFECLAW_* env (BROKER_URL / AGENT_IDENTITY) may");
+    eprintln!("  still be persisted in its .env — it's stale now; remove it. Agents stay");
     eprintln!("  valid account-wide (logout revokes only this DEVICE) — revoke unused ones");
-    eprintln!("  with `sc agent rm`. Re-pair with `sc login --pair-token <token>`.");
+    eprintln!("  with `sc agent rm`. Re-pair with `sc login`.");
     Ok(())
 }
 
@@ -109,9 +126,11 @@ async fn revoke_device_cloud(cfg: &CliConfig) -> Result<Option<String>, String> 
         .build()
         .map_err(|e| format!("http client init: {}", e))?;
 
+    let list_url = format!("{}/api/vault/devices", cloud);
     let resp = client
-        .get(format!("{}/api/vault/devices", cloud))
+        .get(&list_url)
         .bearer_auth(&key)
+        .dik_pop("GET", &list_url, &[])
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;
@@ -129,9 +148,11 @@ async fn revoke_device_cloud(cfg: &CliConfig) -> Result<Option<String>, String> 
     };
     let label = me.label.clone().unwrap_or_else(|| me.prefix.clone());
 
+    let del_url = format!("{}/api/vault/devices/{}", cloud, me.id);
     let del = client
-        .delete(format!("{}/api/vault/devices/{}", cloud, me.id))
+        .delete(&del_url)
         .bearer_auth(&key)
+        .dik_pop("DELETE", &del_url, &[])
         .send()
         .await
         .map_err(|e| crate::cli::neterr::reach_failed(cloud, &e))?;

@@ -11,7 +11,7 @@ Same shape for remote add / push / fetch. Multi-account: switch the phantom valu
 id = "github"
 name = "GitHub"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 # One GitHub connection (one PAT) backs both the REST API (api.github.com) and
 # git-over-HTTPS (github.com). Basic self-describes on the wire — no auth section.

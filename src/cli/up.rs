@@ -42,7 +42,46 @@ pub async fn run() -> Result<(), String> {
 pub async fn restart() -> Result<(), String> {
     let _ = service::reconcile_unit_execstart();
     service::run_restart()?;
-    ensure_unlocked().await
+    ensure_unlocked().await?;
+    warn_if_stale_after_restart().await;
+    Ok(())
+}
+
+/// After a bounce, confirm the daemon that came back up is actually THIS
+/// binary's version — the guarantee behind `sc upgrade` (you end up running the
+/// new version, not silently the old one). The common install (unit ExecStart
+/// path == the binary `sc upgrade` just overwrote) relaunches the new binary by
+/// construction. This catches the rare exceptions: the service unit points at a
+/// *different* `sc` (path drift), or the bounce didn't take. We can't force the
+/// service from here, so we make it LOUD and actionable instead of leaving a
+/// silent stale daemon. Best-effort: an unreachable or version-less daemon is
+/// left alone (nothing to assert).
+async fn warn_if_stale_after_restart() {
+    let Ok((custodian, _vault)) = resolve_active(None) else {
+        return; // nothing paired — no daemon state to verify
+    };
+    let want = crate::build_version();
+    let want = want.trim().trim_start_matches("safeclaw ").trim();
+    // ensure_unlocked already waited for the daemon; a couple of cheap retries
+    // cover a still-settling health endpoint.
+    for _ in 0..5 {
+        let d = crate::cli::status::probe_local_daemon(&custodian).await;
+        if d.up {
+            match d.version.as_deref().map(|v| v.trim().trim_start_matches("safeclaw ").trim()) {
+                Some(v) if v == want => return, // ✓ the new binary is serving
+                Some(v) => {
+                    eprintln!(
+                        "⚠ The running daemon is still {v}, but this build is {want}. The upgrade\n  \
+                         did not take: the service is launching a different `sc`. Fix it with:\n    \
+                         sc down && sc up"
+                    );
+                    return;
+                }
+                None => return, // pre-version daemon — can't compare, don't cry wolf
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// The single unlock chokepoint. If the active vault is Locked, run the passkey
@@ -78,7 +117,6 @@ pub async fn ensure_unlocked() -> Result<(), String> {
 
     if should_attempt_unlock(&status.state) {
         let args = UnlockArgs {
-            vault: None,
             no_browser: false,
             cb_port: settings_cb_port(),
             timeout: 120,

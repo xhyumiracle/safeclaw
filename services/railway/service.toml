@@ -12,7 +12,7 @@ Multi-account: switch the phantom value (__sc__railway_work__).
 id = "railway"
 name = "Railway"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 # One account/team token backs the whole GraphQL API. Both hosts resolve
 # (railway.app is the legacy domain, railway.com the current one).

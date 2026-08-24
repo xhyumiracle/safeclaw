@@ -18,12 +18,12 @@ pub async fn run_lock(args: UnlockArgs) -> Result<(), String> {
 }
 
 async fn drive(custom_op: &str, label: &str, args: UnlockArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
 
     let op = json!({
         "act": { "type": { "custom": custom_op }, "target": "", "scope": null },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
 
     let opts = ApproveOpts {

@@ -78,6 +78,11 @@ pub struct CacheEntry {
     /// ask-always path never reads `entries` at all — see `op_grants`.) A real
     /// grant (from `approve_op`) overwrites it with `from_bootstrap = false`.
     pub from_bootstrap: bool,
+    /// Op-agent binding (team §C1): for a GRANT entry, the prefix of the agent
+    /// key the approval was minted for — `cache_lookup_grant` misses for any
+    /// other agent. `None` on bootstrap/residency entries (allow-level values
+    /// are not approvals; any policy-allowed agent may use them).
+    pub agent_prefix: Option<String>,
 }
 
 /// How long an approved `ask-always` one-shot grant stays redeemable
@@ -124,7 +129,11 @@ pub struct SecretsCache {
     /// requests *of the same scope* within the TTL fast-path without
     /// re-prompting. `ask-always` never lands here; `allow` doesn't need it.
     ///
-    /// Key shape: `(connection_id, rule_id, method, host)`. The grant is bound to:
+    /// Key shape: `(agent_prefix, connection_id, rule_id, method, host)`. The
+    /// grant is bound to:
+    ///   - the **agent** that triggered the approved op (op-agent binding,
+    ///     team §C1) — agent A's approved ask never fast-paths agent B's
+    ///     identical request inside the window;
     ///   - the **connection** — approving account A's send never fast-paths B;
     ///   - the matched **policy rule** — which carries the path scope, so a
     ///     grant can never reach beyond the rule the user's approval matched;
@@ -140,9 +149,11 @@ pub struct SecretsCache {
     /// Lives in the same memory window as the rest of the cache: dropped on
     /// lock (which zero-outs the entire cache via Default drop). Daemon
     /// restart also blows it away (vaults boot Locked, cache starts empty).
-    pub rule_approvals: HashMap<(String, String, String, String), u64>,
+    pub rule_approvals: HashMap<(String, String, String, String, String), u64>,
     /// `ask-always` one-shot grants, keyed by the REQUEST the user approved:
-    /// `(connection_id, method, host, path, scope_digest)`. Written by
+    /// `(agent_prefix, connection_id, method, host, path, scope_digest)` —
+    /// agent-bound like `rule_approvals` (a grant minted for agent A's request
+    /// cannot be spent by agent B). Written by
     /// `approve_op` when the op's policy level was AskAlways; consumed (removed)
     /// by the proxy's replay exactly once. This is what makes an `ask-always`
     /// approval mean "this action, once": a grant minted for `POST /v2/purchase`
@@ -162,7 +173,7 @@ pub struct SecretsCache {
     /// (e.g. a chat agent) may take minutes to re-run. Single-use + exact
     /// binding is what makes the long window safe — time is not the guard.
     /// Same memory window as the rest of the cache: dropped on lock/refresh.
-    pub op_grants: HashMap<(String, String, String, String, String), CacheEntry>,
+    pub op_grants: HashMap<(String, String, String, String, String, String), CacheEntry>,
     /// Item names present in the decrypted `native-secrets` kv (names only,
     /// never values). Surface for `GET /v/{vid}/secret-keys` so the frontend
     /// can decide which services are "reachable" without paying for an
@@ -231,6 +242,15 @@ pub struct SecretsCache {
     /// per-connection (`policy.connections.<id>`), while the built-in rules it
     /// merges come from the shared service definition.
     pub connections: HashMap<String, crate::storage::plaintext::Connection>,
+    /// The vault's **authorized-agents table** (design §11.1), keyed by `ag_id`
+    /// (`derive_id(Agent, pubkey)`). Snapshot of `view.aux.agents` at
+    /// unlock/refresh. **Presence = authorized**; an `ag_id` with no entry is not
+    /// in the table. Consulted ONLY on the AIK (PoP) path where the daemon knows
+    /// the presented `ag_id`; the legacy Basic api-key path (dual-auth window)
+    /// carries an api-key prefix, which is never in this `ag_`-keyed table → the
+    /// mask lookup misses → the caller falls to the legacy allow (nothing bricks
+    /// until bearers retire).
+    pub agents: std::collections::BTreeMap<String, crate::storage::plaintext::AgentEntry>,
     /// Custom (per-vault `aux.services`) service definitions, validated at
     /// unlock. Wiped on lock (Default drop). A custom service folds into
     /// discovery like a compiled one and never shadows a built-in id.
@@ -272,6 +292,42 @@ pub struct PendingLoopback {
 pub struct AppState {
     pub config: Config,
     pub vaults: VaultDir,
+    /// Last successful cloud contact per vault (unlock initialises, sync
+    /// successes refresh). Drives the shared-vault offline lease (team §7.5):
+    /// a daemon cut off from the cloud — network loss OR revoked/offboarded
+    /// credentials parking its sync — keeps serving a SHARED vault only for
+    /// the lease window.
+    pub cloud_contact: Mutex<HashMap<String, std::time::Instant>>,
+    /// Server-authoritative vault sharedness (team §4: explicit `kind`, default
+    /// private), delivered on the `/blob` sync envelope OUTSIDE the sealed body —
+    /// `kind` is a server operational fact, never E2E. `true` = shared, `false` =
+    /// private; an ABSENT entry (never synced, or an old server that omits the
+    /// field) reads as private via `vault_is_shared` — the fail-safe default so a
+    /// personal vault (and any pre-sync state) is never leased. Supersedes the old
+    /// "derive shared from the E2E members map" heuristic (review H1). In-memory
+    /// only, repopulated on each pull — same restart-softness as `cloud_contact`,
+    /// which the offline lease already accepts (it is a soft backstop).
+    pub vault_shared: Mutex<HashMap<String, bool>>,
+    /// Vaults whose cloud sync returned `SC_UPGRADE_REQUIRED` — this daemon is too
+    /// old for their (newer) item format (design 甲). While set, the broker refuses
+    /// with [`crate::error::ScCode::UpgradeRequired`] so the AGENT gets an actionable
+    /// "run `sc upgrade`" instead of a silent parked-sync failure. In-memory only,
+    /// (re)set by the sync path; cleared when a sync succeeds again.
+    pub vault_upgrade_required: Mutex<std::collections::HashSet<String>>,
+    /// Team-edition extension hooks (team-edition §9 open/closed split). The
+    /// open build leaves the [`crate::team_hooks::NoopHooks`] default (no team
+    /// policy); the closed `safeclaw-ee` overlay injects real ones via
+    /// [`AppState::with_team_hooks`]. Serve-time team policy (the offline lease,
+    /// etc.) lives behind these, never inline in open core.
+    pub team: std::sync::Arc<dyn crate::team_hooks::TeamHooks>,
+    /// Vaults whose addressing migration completed locally but whose cloud
+    /// `format=2` mark hasn't landed yet — the sync loop drains this after a
+    /// successful item push (团队 §8.3: mark only after the rows are up).
+    pub pending_format_mark: Mutex<std::collections::HashSet<String>>,
+    /// Owner lock-list registrations awaiting delivery: vault → blinded ids of
+    /// the config singletons (computed at unlock while K was in hand; the sync
+    /// loop POSTs them once for SHARED vaults). §5.15 two-tier write model.
+    pub pending_config_ids: Mutex<HashMap<String, Vec<String>>>,
     pub challenges: Mutex<ChallengeStore>,
     pub approvals: Mutex<ApprovalStore>,
     pub services: ServiceRegistry,
@@ -392,6 +448,18 @@ pub struct OpPayloadEntry {
 }
 
 impl AppState {
+    /// Inject the closed `safeclaw-ee` team hooks (team-edition §9). The open
+    /// build leaves the [`crate::team_hooks::NoopHooks`] default; the overlay's
+    /// `main` calls this on the fresh `AppState` before it is wrapped in `Arc`.
+    /// Chainable.
+    pub fn with_team_hooks(
+        mut self,
+        hooks: std::sync::Arc<dyn crate::team_hooks::TeamHooks>,
+    ) -> Self {
+        self.team = hooks;
+        self
+    }
+
     pub fn new(config: Config) -> Self {
         let vaults = VaultDir::new(&config.state_dir);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -401,6 +469,12 @@ impl AppState {
         Self {
             config,
             vaults,
+            cloud_contact: Mutex::new(HashMap::new()),
+            vault_shared: Mutex::new(HashMap::new()),
+            vault_upgrade_required: Mutex::new(std::collections::HashSet::new()),
+            team: std::sync::Arc::new(crate::team_hooks::NoopHooks),
+            pending_format_mark: Mutex::new(std::collections::HashSet::new()),
+            pending_config_ids: Mutex::new(HashMap::new()),
             challenges: Mutex::new(ChallengeStore::new()),
             approvals: Mutex::new(ApprovalStore::new()),
             services: ServiceRegistry::load(),
@@ -629,6 +703,8 @@ impl AppState {
         cache: SecretsCache,
         state_key: zeroize::Zeroizing<Vec<u8>>,
     ) {
+        // Team lease clock starts at unlock (a human was just present).
+        self.record_cloud_contact(&vault_id);
         let unlocked_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -796,16 +872,19 @@ impl AppState {
         conn_id: &str,
         value: Vec<u8>,
         expires_at: Option<u64>,
+        agent_prefix: Option<String>,
     ) {
         let mut states = self.vault_states.lock().unwrap();
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.entries.insert(
                 conn_id.to_string(),
-                // A real approval grant — consumable by the ask retry path.
+                // A real approval grant — consumable by the ask retry path,
+                // bound to the agent the approval was minted for.
                 CacheEntry {
                     value,
                     expires_at,
                     from_bootstrap: false,
+                    agent_prefix,
                 },
             );
         }
@@ -819,6 +898,7 @@ impl AppState {
     pub fn op_grant_insert(
         &self,
         vault_id: &str,
+        agent_prefix: &str,
         conn_id: &str,
         method: &str,
         host: &str,
@@ -831,6 +911,7 @@ impl AppState {
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.op_grants.insert(
                 (
+                    agent_prefix.to_string(),
                     conn_id.to_string(),
                     method.to_string(),
                     host.to_ascii_lowercase(),
@@ -841,6 +922,7 @@ impl AppState {
                     value,
                     expires_at: Some(expires_at),
                     from_bootstrap: false,
+                    agent_prefix: Some(agent_prefix.to_string()),
                 },
             );
         }
@@ -863,6 +945,7 @@ impl AppState {
     pub fn op_grant_take(
         &self,
         vault_id: &str,
+        agent_prefix: &str,
         conn_id: &str,
         method: &str,
         host: &str,
@@ -880,6 +963,7 @@ impl AppState {
             _ => return None,
         };
         let key = (
+            agent_prefix.to_string(),
             conn_id.to_string(),
             method.to_string(),
             host.to_ascii_lowercase(),
@@ -905,7 +989,12 @@ impl AppState {
     /// first matching request forces a passkey approval instead of riding the
     /// connection's allow-level residency; after approval the downgraded (Allow)
     /// retry reads the real grant via `cache_lookup`. Non-destructive; honors TTL.
-    pub fn cache_lookup_grant(&self, vault_id: &str, conn_id: &str) -> Option<Vec<u8>> {
+    pub fn cache_lookup_grant(
+        &self,
+        vault_id: &str,
+        conn_id: &str,
+        agent_prefix: &str,
+    ) -> Option<Vec<u8>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -917,6 +1006,11 @@ impl AppState {
         };
         let entry = cache.entries.get(conn_id)?;
         if entry.from_bootstrap {
+            return None;
+        }
+        // Op-agent binding: a grant minted for one agent is not a grant for
+        // another — miss (and re-prompt) instead of riding it.
+        if entry.agent_prefix.as_deref() != Some(agent_prefix) {
             return None;
         }
         if let Some(exp) = entry.expires_at {
@@ -984,6 +1078,7 @@ impl AppState {
                     expires_at: Some(expires_at),
                     // oauth_access has its own lookup path; the flag is unread here.
                     from_bootstrap: false,
+                    agent_prefix: None,
                 },
             );
         }
@@ -1042,6 +1137,7 @@ impl AppState {
     pub fn evaluate_request_policy(
         &self,
         vault_id: &str,
+        agent_prefix: &str,
         connection_id: &str,
         service_id: &str,
         method: &str,
@@ -1128,10 +1224,13 @@ impl AppState {
         // request could ride. Only a genuinely scope-less rule uses this window.
         if level == crate::core::policy::AccessLevel::Ask && !has_scope_shape {
             if let Some(rule_id) = matched_rule.clone() {
-                // The grant is scoped to the **connection** (not the service),
-                // the matched rule, the method, AND the resolved host: an
-                // approval for host A must not fast-path host B in the window.
+                // The grant is scoped to the **agent** (op-agent binding),
+                // the **connection** (not the service), the matched rule, the
+                // method, AND the resolved host: an approval for host A must
+                // not fast-path host B in the window, and agent A's approval
+                // never fast-paths agent B.
                 let key = (
+                    agent_prefix.to_string(),
                     connection_id.to_string(),
                     rule_id,
                     method.to_string(),
@@ -1168,6 +1267,7 @@ impl AppState {
     pub fn record_ask_approval(
         &self,
         vault_id: &str,
+        agent_prefix: &str,
         connection_id: &str,
         rule_id: Option<String>,
         method: &str,
@@ -1184,6 +1284,7 @@ impl AppState {
         if let Some(VaultState::Unlocked { cache, .. }) = states.get_mut(vault_id) {
             cache.rule_approvals.insert(
                 (
+                    agent_prefix.to_string(),
                     connection_id.to_string(),
                     rule_id,
                     method.to_string(),
@@ -1191,6 +1292,187 @@ impl AppState {
                 ),
                 now + ttl_seconds,
             );
+        }
+    }
+
+    /// Record a successful cloud contact for this vault (sync pull/push, or
+    /// unlock — a human is present). Feeds the shared-vault offline lease.
+    pub fn record_cloud_contact(&self, vault_id: &str) {
+        self.cloud_contact
+            .lock()
+            .unwrap()
+            .insert(vault_id.to_string(), std::time::Instant::now());
+    }
+
+    /// Seconds since the last cloud contact, `None` if never recorded (treated
+    /// as fresh by callers — the entry appears at unlock).
+    pub fn cloud_contact_age_secs(&self, vault_id: &str) -> Option<u64> {
+        self.cloud_contact
+            .lock()
+            .unwrap()
+            .get(vault_id)
+            .map(|t| t.elapsed().as_secs())
+    }
+
+    /// Is this vault SHARED? Server-authoritative (team §4): the `kind` the
+    /// server stamps on the `/blob` sync envelope, cached in `vault_shared`.
+    /// An absent entry (never synced, or an old server without the field) is
+    /// PRIVATE — the fail-safe default so a personal vault, and any pre-sync
+    /// state, is never leased (review H1 is structurally impossible here: a
+    /// private vault's `kind` never reads shared). Independent of unlock state,
+    /// unlike the old E2E members-map derivation this replaces.
+    pub fn vault_is_shared(&self, vault_id: &str) -> bool {
+        *self
+            .vault_shared
+            .lock()
+            .unwrap()
+            .get(vault_id)
+            .unwrap_or(&false)
+    }
+
+    /// Record the server-authoritative sharedness (`kind`) for a vault, from the
+    /// `/blob` sync envelope. `true` = shared, `false` = private. Called by the
+    /// sync path whenever a fresh envelope carries the field; absent-field pulls
+    /// leave the last known value untouched (see `sync::apply_vault_kind`).
+    pub fn set_vault_shared(&self, vault_id: &str, shared: bool) {
+        self.vault_shared
+            .lock()
+            .unwrap()
+            .insert(vault_id.to_string(), shared);
+    }
+
+    /// Eagerly seed `vault_shared` from the known-vaults catalog `kind` (server-
+    /// authoritative, mirrored on every discovery, available WITHOUT unlocking a
+    /// blob). Called at startup and after discovery so `vault_is_shared` is
+    /// reliable before the first serve. DENYLIST normalization (shared iff `kind`
+    /// is `team`/`shared`; `personal`/`private`/anything else = not shared) so a
+    /// vocabulary drift never strips a personal vault. Only vaults with a known
+    /// `kind` are seeded; the signed-envelope path still refreshes the live value.
+    pub fn hydrate_shared_from_catalog(&self) {
+        for kv in crate::cli::active::known_vaults() {
+            if kv.kind.is_some() {
+                self.set_vault_shared(&kv.vault, Self::kind_str_is_shared(kv.kind.as_deref()));
+            }
+        }
+    }
+
+    /// DENYLIST normalization of a server `kind` string to sharedness: shared iff
+    /// `kind` is `team` or `shared` (case-insensitive); `personal` / `private` /
+    /// `None` / anything else = NOT shared, so a vocabulary drift or a renamed kind
+    /// never strips a personal vault from serving. Bridges the two `kind`
+    /// vocabularies (discovery `personal/team/shared`, blob envelope `shared/private`).
+    pub fn kind_str_is_shared(kind: Option<&str>) -> bool {
+        matches!(
+            kind.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+            Some("team") | Some("shared")
+        )
+    }
+
+    /// Mark (or clear) a vault as needing a daemon upgrade — the cloud returned
+    /// `SC_UPGRADE_REQUIRED` for its sync (design 甲). Set by the sync path on that
+    /// signal, cleared on a successful sync. The broker reads it to fail loudly with
+    /// an actionable "run `sc upgrade`" to the agent.
+    pub fn set_vault_upgrade_required(&self, vault_id: &str, required: bool) {
+        let mut set = self.vault_upgrade_required.lock().unwrap();
+        if required {
+            set.insert(vault_id.to_string());
+        } else {
+            set.remove(vault_id);
+        }
+    }
+
+    /// Is this vault flagged `SC_UPGRADE_REQUIRED` (daemon too old for its format)?
+    pub fn is_vault_upgrade_required(&self, vault_id: &str) -> bool {
+        self.vault_upgrade_required
+            .lock()
+            .unwrap()
+            .contains(vault_id)
+    }
+
+    /// Does this vault's reach mask let `agent_id` use `connection_id`?
+    /// (team §8.1 — ONE pipeline: the proxy deny, the registry annotation and
+    /// GET /vaults all read THIS.) The verdict:
+    ///   - `Some(false)` — the agent IS in the authorized-agents table and its
+    ///     mask denies this connection (the only denial the proxy acts on).
+    ///   - `Some(true)` — in the table, mask allows.
+    ///   - `None` — vault locked, OR `agent_id` is not in the `ag_`-keyed table.
+    ///     The caller treats `None` as "no mask restriction" (allow): this is the
+    ///     legacy Basic-auth path (api-key prefix, never in an `ag_`-keyed table)
+    ///     during the dual-auth window. True fail-closed ("not in table = deny")
+    ///     is enforced by the AIK proxy path once bearers retire (§11.6).
+    pub fn agent_mask_allows(
+        &self,
+        vault_id: &str,
+        agent_id: &str,
+        connection_id: &str,
+    ) -> Option<bool> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache
+                .agents
+                .get(agent_id)
+                .map(|e| e.connections.allows(connection_id)),
+            _ => None,
+        }
+    }
+
+    /// Is `agent_id` present in this vault's authorized-agents table (§11)?
+    /// Presence = authorized: the UIK-signed `ag_`-keyed table is the daemon's
+    /// only authz source, and dropping a row is the revoke. Used by the hop-A AIK
+    /// PoP proxy path to decide whether a crypto-verified `ag_…` may use this
+    /// vault at all — distinct from [`agent_mask_allows`], which only restricts
+    /// WHICH connections an already-authorized agent may reach. `false` when the
+    /// vault is locked or the agent isn't in the table (fail-closed — the AIK path
+    /// is opt-in and dual-authed with the legacy api-key, so this never bricks a
+    /// legacy agent, whose api-key prefix simply isn't an `ag_` and takes the
+    /// hash-set path instead).
+    pub fn agent_is_authorized(&self, vault_id: &str, agent_id: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.agents.contains_key(agent_id),
+            _ => false,
+        }
+    }
+
+    /// Is `agent_id` present in the authorized-agents table of ANY currently
+    /// UNLOCKED vault this daemon holds (§11)? The ACCOUNT-scoped check for the
+    /// api-face reads (registry / op-poll / `/vaults`) — those aren't tied to a
+    /// single vault, so a hop-A AIK PoP that proves possession of `ag_…` is a
+    /// valid agent of this account for those cross-vault reads iff it's
+    /// authorized on at least one vault. `false` if no unlocked vault authorizes
+    /// it (fail-closed; dual-auth with the legacy api-key covers the transition).
+    pub fn agent_is_authorized_any(&self, agent_id: &str) -> bool {
+        let states = self.vault_states.lock().unwrap();
+        states.values().any(|s| match s {
+            VaultState::Unlocked { cache, .. } => cache.agents.contains_key(agent_id),
+            _ => false,
+        })
+    }
+
+    /// Which of `candidates` this agent is ALLOWED to reach in this vault —
+    /// evaluated through `AgentMask::allows` so the blacklist and `All` resolve
+    /// identically (team §8.1 ONE pipeline: same verdict as the proxy deny).
+    /// `Some(set)` = the subset of `candidates` reachable under this agent's mask;
+    /// `None` = vault locked OR `agent_id` is not in the authorized-agents table
+    /// (the caller masks nothing — the legacy allow of the dual-auth window, since
+    /// a legacy api-key prefix is never in the `ag_`-keyed table). Used by the
+    /// registry/vaults surfaces to annotate rows without N lock round-trips.
+    pub fn agent_allowed_connections(
+        &self,
+        vault_id: &str,
+        agent_id: &str,
+        candidates: &[String],
+    ) -> Option<Vec<String>> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache.agents.get(agent_id).map(|entry| {
+                candidates
+                    .iter()
+                    .filter(|id| entry.connections.allows(id))
+                    .cloned()
+                    .collect()
+            }),
+            _ => None,
         }
     }
 
@@ -1218,6 +1500,23 @@ impl AppState {
 
     /// Clone a connection record out of the unlocked routing snapshot. `None`
     /// when the vault is Locked or the connection id is unknown.
+    /// All connections of one vault (id → record), empty when locked. Used by
+    /// the agent-face `/vaults` index.
+    pub fn connections_snapshot(
+        &self,
+        vault_id: &str,
+    ) -> Vec<(String, crate::storage::plaintext::Connection)> {
+        let states = self.vault_states.lock().unwrap();
+        match states.get(vault_id) {
+            Some(VaultState::Unlocked { cache, .. }) => cache
+                .connections
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn connection_snapshot(
         &self,
         vault_id: &str,
@@ -1365,6 +1664,29 @@ mod tests {
         AppState::new(cfg)
     }
 
+    #[test]
+    fn kind_str_is_shared_is_a_denylist() {
+        // Shared iff team/shared (case- and space-tolerant).
+        assert!(AppState::kind_str_is_shared(Some("team")));
+        assert!(AppState::kind_str_is_shared(Some("shared")));
+        assert!(AppState::kind_str_is_shared(Some("  TEAM ")));
+        // Everything else (incl. unknown / None) is NOT shared, so a personal
+        // vault is never stripped from serving by a vocabulary drift.
+        assert!(!AppState::kind_str_is_shared(Some("personal")));
+        assert!(!AppState::kind_str_is_shared(Some("private")));
+        assert!(!AppState::kind_str_is_shared(Some("solo")));
+        assert!(!AppState::kind_str_is_shared(None));
+    }
+
+    #[test]
+    fn default_build_is_personal_edition() {
+        // The default build wires NoopHooks: the open-source PERSONAL edition,
+        // which does not serve team vaults. The sync path leaves SHARED vaults to
+        // the official build (see `build_serves_shared` / `leave_shared_to_official`
+        // in sync.rs); the official build's EeHooks override this to `true`.
+        assert!(!test_state().team.serves_shared_vaults());
+    }
+
     /// The op-payload stash is single-use and digest-verified: a deposit is
     /// retrievable exactly once by its returned digest, and an unknown digest
     /// (wrong, replayed, or post-restart) fails closed.
@@ -1406,6 +1728,7 @@ mod tests {
                     value: value.to_vec(),
                     expires_at: None,
                     from_bootstrap: true,
+                    agent_prefix: None,
                 },
             );
         }
@@ -1419,13 +1742,20 @@ mod tests {
         // allow fast-path uses the residency…
         assert_eq!(state.cache_lookup("v1", "github"), Some(b"tok".to_vec()));
         // …but ask must NOT: a bootstrap value is not a grant.
-        assert_eq!(state.cache_lookup_grant("v1", "github"), None);
+        assert_eq!(state.cache_lookup_grant("v1", "github", "agA"), None);
         // ask-always never reads `entries` at all — the residency (and even a
         // real conn-keyed ask grant) is invisible to op_grant_take.
-        state.cache_insert("v1", "github", b"granted".to_vec(), None);
+        state.cache_insert(
+            "v1",
+            "github",
+            b"granted".to_vec(),
+            None,
+            Some("agA".into()),
+        );
         assert_eq!(
             state.op_grant_take(
                 "v1",
+                "agA",
                 "github",
                 "DELETE",
                 "api.github.com",
@@ -1437,7 +1767,7 @@ mod tests {
         );
         // The ask path sees its grant as usual.
         assert_eq!(
-            state.cache_lookup_grant("v1", "github"),
+            state.cache_lookup_grant("v1", "github", "agA"),
             Some(b"granted".to_vec())
         );
     }
@@ -1446,7 +1776,7 @@ mod tests {
     fn cache_insert_no_expiry_persists_lookups() {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
-        state.cache_insert("v1", "svc", b"secret".to_vec(), None);
+        state.cache_insert("v1", "svc", b"secret".to_vec(), None, Some("agA".into()));
         assert_eq!(state.cache_lookup("v1", "svc"), Some(b"secret".to_vec()));
         // Multiple lookups still hit (no eviction without expiry).
         assert_eq!(state.cache_lookup("v1", "svc"), Some(b"secret".to_vec()));
@@ -1464,6 +1794,7 @@ mod tests {
             + 600;
         state.op_grant_insert(
             "v1",
+            "agA",
             "svc",
             "POST",
             "api.x.com",
@@ -1474,13 +1805,31 @@ mod tests {
         );
         // First take returns the value …
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             Some(b"tok".to_vec())
         );
         // … and removes it: a second take misses, and nothing leaked into the
         // conn-keyed entries for the allow/ask paths to find.
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             None
         );
         assert_eq!(state.cache_lookup("v1", "svc"), None);
@@ -1501,6 +1850,7 @@ mod tests {
             + 600;
         state.op_grant_insert(
             "v1",
+            "agA",
             "svc",
             "POST",
             "api.x.com",
@@ -1511,26 +1861,156 @@ mod tests {
         );
         // Different path / method / host / connection → all miss.
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/refund", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/refund",
+                "",
+                true
+            ),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "svc", "DELETE", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "DELETE",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.y.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.y.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "other", "POST", "api.x.com", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "other",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
             None
         );
         // Host comparison is case-insensitive (hosts are lowercased at insert).
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "API.X.COM", "/v2/purchase", "", true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "API.X.COM",
+                "/v2/purchase",
+                "",
+                true
+            ),
             Some(b"tok".to_vec())
         );
+    }
+
+    /// Op-agent binding (team §C1): every grant surface is keyed by the agent
+    /// the approval was minted for. Agent B holding a perfectly valid key must
+    /// never redeem/ride agent A's approval — and B's miss must not consume
+    /// A's grant.
+    #[test]
+    fn grants_are_agent_bound_across_all_three_surfaces() {
+        let state = test_state();
+        unlock_with_empty_cache(&state, "v1");
+        let far = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+
+        // (1) ask-always / scoped op_grants.
+        state.op_grant_insert(
+            "v1",
+            "agA",
+            "svc",
+            "POST",
+            "api.x.com",
+            "/v2/purchase",
+            "",
+            b"tok".to_vec(),
+            far,
+        );
+        assert_eq!(
+            state.op_grant_take(
+                "v1",
+                "agB",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
+            None,
+            "agent B cannot redeem A's grant"
+        );
+        assert_eq!(
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                "",
+                true
+            ),
+            Some(b"tok".to_vec()),
+            "B's miss must not have consumed A's grant"
+        );
+
+        // (2) unscoped-ask conn-keyed grant.
+        state.cache_insert("v1", "svc", b"granted".to_vec(), None, Some("agA".into()));
+        assert_eq!(state.cache_lookup_grant("v1", "svc", "agB"), None);
+        assert_eq!(
+            state.cache_lookup_grant("v1", "svc", "agA"),
+            Some(b"granted".to_vec())
+        );
+
+        // (3) rule-approvals window: recorded for A, B still re-prompts.
+        state.record_ask_approval("v1", "agA", "gh", Some("read".into()), "GET", "h.com", 60);
+        {
+            let states = state.vault_states.lock().unwrap();
+            if let Some(VaultState::Unlocked { cache, .. }) = states.get("v1") {
+                let key_a = (
+                    "agA".to_string(),
+                    "gh".to_string(),
+                    "read".to_string(),
+                    "GET".to_string(),
+                    "h.com".to_string(),
+                );
+                let mut key_b = key_a.clone();
+                key_b.0 = "agB".to_string();
+                assert!(cache.rule_approvals.contains_key(&key_a));
+                assert!(!cache.rule_approvals.contains_key(&key_b));
+            } else {
+                panic!("vault not unlocked");
+            }
+        }
     }
 
     #[test]
@@ -1539,6 +2019,7 @@ mod tests {
         unlock_with_empty_cache(&state, "v1");
         state.op_grant_insert(
             "v1",
+            "agA",
             "svc",
             "POST",
             "api.x.com",
@@ -1549,7 +2030,7 @@ mod tests {
         );
         // Expired grant is not returned (and is consumed/dropped).
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/p", "", true),
+            state.op_grant_take("v1", "agA", "svc", "POST", "api.x.com", "/p", "", true),
             None
         );
     }
@@ -1571,6 +2052,7 @@ mod tests {
         let d180 = crate::service::scope_digest(&[("amount".into(), "180".into())]);
         state.op_grant_insert(
             "v1",
+            "agA",
             "svc",
             "POST",
             "api.x.com",
@@ -1583,6 +2065,7 @@ mod tests {
         assert_eq!(
             state.op_grant_take(
                 "v1",
+                "agA",
                 "svc",
                 "POST",
                 "api.x.com",
@@ -1594,11 +2077,29 @@ mod tests {
         );
         // …so the honest ($80) replay still succeeds, exactly once.
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                &d80,
+                true
+            ),
             Some(b"tok".to_vec())
         );
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/v2/purchase", &d80, true),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/v2/purchase",
+                &d80,
+                true
+            ),
             None
         );
     }
@@ -1620,6 +2121,7 @@ mod tests {
         let d_other = crate::service::scope_digest(&[("q".into(), "beta".into())]);
         state.op_grant_insert(
             "v1",
+            "agA",
             "svc",
             "POST",
             "api.x.com",
@@ -1630,20 +2132,56 @@ mod tests {
         );
         // Peek (consume=false) reuses the SAME action any number of times…
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/search",
+                &d_read,
+                false
+            ),
             Some(b"tok".to_vec())
         );
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/search",
+                &d_read,
+                false
+            ),
             Some(b"tok".to_vec())
         );
         // …but a DIFFERENT bound value misses (re-prompt), without disturbing the grant.
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_other, false),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/search",
+                &d_other,
+                false
+            ),
             None
         );
         assert_eq!(
-            state.op_grant_take("v1", "svc", "POST", "api.x.com", "/search", &d_read, false),
+            state.op_grant_take(
+                "v1",
+                "agA",
+                "svc",
+                "POST",
+                "api.x.com",
+                "/search",
+                &d_read,
+                false
+            ),
             Some(b"tok".to_vec())
         );
     }
@@ -1653,7 +2191,7 @@ mod tests {
         let state = test_state();
         unlock_with_empty_cache(&state, "v1");
         // Already-expired entry.
-        state.cache_insert("v1", "svc", b"secret".to_vec(), Some(0));
+        state.cache_insert("v1", "svc", b"secret".to_vec(), Some(0), Some("agA".into()));
         assert_eq!(state.cache_lookup("v1", "svc"), None);
         // Subsequent insert with valid TTL should succeed (lazy eviction
         // dropped the stale entry; nothing leaks across).
@@ -1662,7 +2200,13 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3600;
-        state.cache_insert("v1", "svc", b"new".to_vec(), Some(future));
+        state.cache_insert(
+            "v1",
+            "svc",
+            b"new".to_vec(),
+            Some(future),
+            Some("agA".into()),
+        );
         assert_eq!(state.cache_lookup("v1", "svc"), Some(b"new".to_vec()));
     }
 
@@ -1672,7 +2216,7 @@ mod tests {
         // Never unlocked.
         assert_eq!(state.cache_lookup("v1", "svc"), None);
         // Insert into a locked vault should be a no-op too.
-        state.cache_insert("v1", "svc", b"x".to_vec(), None);
+        state.cache_insert("v1", "svc", b"x".to_vec(), None, Some("agA".into()));
         assert_eq!(state.cache_lookup("v1", "svc"), None);
     }
 
@@ -1715,6 +2259,7 @@ mod tests {
         let (lvl, rule, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "gh",
                 "gh",
                 "GET",
@@ -1729,12 +2274,21 @@ mod tests {
         assert_eq!(rule.as_deref(), Some("read"));
 
         // User approves that GET toward host A.
-        state.record_ask_approval(vid, "gh", Some("read".to_string()), "GET", "api.gh.com", 60);
+        state.record_ask_approval(
+            vid,
+            "agA",
+            "gh",
+            Some("read".to_string()),
+            "GET",
+            "api.gh.com",
+            60,
+        );
 
         // The same GET toward the same host now fast-paths (the feature works).
         let (lvl, _, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "gh",
                 "gh",
                 "GET",
@@ -1752,6 +2306,7 @@ mod tests {
         let (lvl, _, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "gh",
                 "gh",
                 "GET",
@@ -1772,6 +2327,7 @@ mod tests {
         let (lvl, rule, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "gh",
                 "gh",
                 "POST",
@@ -1791,7 +2347,7 @@ mod tests {
 
         // A tag-default Ask (no rule) is never recorded, so it can never
         // produce a fast-path — record is a no-op for rule_id == None.
-        state.record_ask_approval(vid, "gh", None, "GET", "api.gh.com", 60);
+        state.record_ask_approval(vid, "agA", "gh", None, "GET", "api.gh.com", 60);
     }
 
     // A path that declares a `[requests]` scope shape must bind its approval
@@ -1830,6 +2386,7 @@ mod tests {
         // the coarse connection-window key (exactly the empty-body path).
         state.record_ask_approval(
             vid,
+            "agA",
             "shop",
             Some("purchase".to_string()),
             "POST",
@@ -1841,6 +2398,7 @@ mod tests {
         let (lvl, _, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "shop",
                 "shop",
                 "POST",
@@ -1851,13 +2409,18 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(lvl, AccessLevel::Allow, "an unscoped rule still uses the window");
+        assert_eq!(
+            lvl,
+            AccessLevel::Allow,
+            "an unscoped rule still uses the window"
+        );
 
         // A SCOPED path must NOT ride that value-blind window — it re-asks so its
         // per-value op_grant binds the amount/merchant.
         let (lvl, _, _) = state
             .evaluate_request_policy(
                 vid,
+                "agA",
                 "shop",
                 "shop",
                 "POST",

@@ -1,4 +1,4 @@
-//! `sc config set/get/unset/list` — persistent CLI preferences in
+//! `sc config set/get/unset/ls` — persistent CLI preferences in
 //! `~/.safeclaw/config.toml` `[settings]`.
 //!
 //! Resolution chain for any setting:
@@ -18,7 +18,7 @@ pub fn run(sub: ConfigSubcommand) -> Result<(), String> {
         ConfigSubcommand::Set { key, value } => run_set(&key, &value),
         ConfigSubcommand::Get { key } => run_get(&key),
         ConfigSubcommand::Unset { key } => run_unset(&key),
-        ConfigSubcommand::List => run_list(),
+        ConfigSubcommand::Ls => run_ls(),
     }
 }
 
@@ -63,7 +63,7 @@ fn run_unset(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_list() -> Result<(), String> {
+fn run_ls() -> Result<(), String> {
     let cfg = load().unwrap_or_default();
     let mut any = false;
     if let Some(n) = cfg.settings.cb_port {

@@ -24,6 +24,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +86,37 @@ pub struct CliConfig {
     /// `sc vault forget` never sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_deleted_upstream: Option<String>,
+    /// The account's Supabase UUID, captured at `sc login`. ROLE = logging / debug /
+    /// support identification ONLY: it matches the id shown in the web console, so a
+    /// human can tie this machine to an account. It is NOT an identity or verification
+    /// anchor — a database UUID cannot be checked against a signature. Everything that
+    /// verifies OWNER intent (the principal ledger, membership, tombstones) uses
+    /// `account_uik` (the self-certifying `us_…`) below. Keeping the two apart is the
+    /// fix for the Fix-0 confusion: an earlier build wrongly pinned THIS UUID as the
+    /// ledger anchor, so `derive_id(uik_pub) == account_id` never matched and nothing
+    /// verified. Cleared by logout / self-revoke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// §15: the account's owner-UIK id (`us_…`) — the REAL principal-ledger anchor
+    /// (the `account_id` above is the Supabase UUID, NOT the anchor). Self-certifying:
+    /// `derive_id(User, uik_pub) == account_uik`. Delivered + pinned at pairing; the
+    /// daemon verifies the ledger anchor + its own per-vault membership against it.
+    /// Absent on an older backend / pre-UIK account (the ledger loop then doesn't run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_uik: Option<String>,
+    /// §15 principal-ledger enforcement switch: DEFAULT OFF — a verified revoke of
+    /// THIS device only locks+wipes when this is "on". `SAFECLAW_PRINCIPAL_ENFORCE`
+    /// overrides (and survives an old binary's config save). Flipped on at the P6
+    /// cutover. See [`crate::principal_ledger::principal_enforce_enabled`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_enforce: Option<String>,
+    /// §15 leg-A require-signed-tombstone switch: DEFAULT OFF — an unsigned
+    /// `status:"deleted"` still drops local state (legacy). When "on", the daemon drops
+    /// only on an owner-signed tombstone that verifies against the vault fold-owner set.
+    /// `SAFECLAW_REQUIRE_SIGNED_TOMBSTONE` overrides. Flipped on at the P6 cutover. See
+    /// [`crate::principal_ledger::require_signed_tombstone`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_signed_tombstone: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -117,6 +149,17 @@ pub struct KnownVault {
     #[serde(alias = "custodian")]
     pub daemon: String,
     pub vault: String,
+    /// Cloud-authoritative display label, mirrored on every discovery. Human /
+    /// agent facing ONLY — the `vault` id stays the canonical, unique, STABLE
+    /// handle (labels can be renamed and are not unique). `None` for a legacy
+    /// catalog entry until the next discovery refresh fills it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Vault kind (`personal` / `team` / `shared`), mirrored on discovery.
+    /// DISPLAY-only (shown by `sc vault ls`); never an addressing token, so a
+    /// vault literally labeled "team" can't collide with the kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 pub fn config_path() -> Result<PathBuf, String> {
@@ -238,20 +281,53 @@ pub fn clear_known_vaults() -> Result<(), String> {
     update_known_vaults(|l| l.clear())
 }
 
-/// Dedupe-append one vault to the catalog.
-fn remember_vault(daemon: &str, vault: &str) -> Result<(), String> {
-    let new = KnownVault {
-        daemon: daemon.to_string(),
-        vault: vault.to_string(),
-    };
-    if known_vaults().contains(&new) {
-        return Ok(());
-    }
+/// Upsert one vault into the catalog, keyed by `(daemon, vault)`. Refreshes the
+/// cloud-mirrored `label`/`kind` when the caller supplies them (a rename lands on
+/// the next discovery); a meta-less caller (`sc vault use`) never wipes an
+/// existing label. Keying on the id — not full-struct equality — is what lets a
+/// label change in place instead of leaving a stale duplicate row.
+fn upsert_vault(
+    daemon: &str,
+    vault: &str,
+    label: Option<String>,
+    kind: Option<String>,
+) -> Result<(), String> {
+    let daemon = daemon.to_string();
+    let vault = vault.to_string();
     update_known_vaults(move |l| {
-        if !l.contains(&new) {
-            l.push(new);
+        if let Some(e) = l.iter_mut().find(|kv| kv.daemon == daemon && kv.vault == vault) {
+            if label.is_some() {
+                e.label = label;
+            }
+            if kind.is_some() {
+                e.kind = kind;
+            }
+        } else {
+            l.push(KnownVault {
+                daemon,
+                vault,
+                label,
+                kind,
+            });
         }
     })
+}
+
+/// Dedupe-append one vault to the catalog (no cloud meta — `sc vault use`/create).
+fn remember_vault(daemon: &str, vault: &str) -> Result<(), String> {
+    upsert_vault(daemon, vault, None, None)
+}
+
+/// Upsert a DISCOVERED account vault together with its cloud `label`/`kind`. The
+/// daemon calls this on every discovery so `sc vault ls` and `--vault <name>`
+/// resolution ([`resolve_vault_token`]) stay fresh across renames.
+pub fn remember_discovered_vault(
+    daemon: &str,
+    vault: &str,
+    label: Option<String>,
+    kind: Option<String>,
+) -> Result<(), String> {
+    upsert_vault(daemon, vault, label, kind)
 }
 
 /// Remove a vault from the catalog. If it was active, clears active — even
@@ -296,6 +372,16 @@ pub fn forget_vault(vault: &str) -> Result<bool, String> {
     Ok(removed_known || cleared_active)
 }
 
+/// Dedupe-add a vault to the known-vaults catalog WITHOUT changing the active
+/// selection. The daemon's auto-discovery path calls this for every vault the
+/// account owns (design/vault-addressing.md), so `sc vault ls` and the sync
+/// watcher pick them up with no manual `sc vault use`. Choosing a DEFAULT stays
+/// a separate, explicit act (`put_active`) — discovery never writes `config.vault`,
+/// so an explicit default stays put when new vaults appear.
+pub fn remember(daemon: &str, vault: &str) -> Result<(), String> {
+    remember_vault(daemon, vault)
+}
+
 /// Set the active vault and dedupe-add it to the catalog.
 pub fn put_active(daemon: &str, vault: &str) -> Result<PathBuf, String> {
     remember_vault(daemon, vault)?;
@@ -306,26 +392,70 @@ pub fn put_active(daemon: &str, vault: &str) -> Result<PathBuf, String> {
     save(&cfg)
 }
 
-/// Set the active vault to a LOCAL daemon URL AND record the cloud pro-backend
-/// for sealed-blob sync. Used by `sc login`: the agent talks to the local
-/// `daemon`, while the daemon syncs against the cloud (`cloud_backend`).
-/// Dedupe-adds to the catalog like `put_active`.
-pub fn put_active_with_cloud(
+/// Record the cloud pairing coordinates (`sc login`) WITHOUT choosing a vault.
+/// Device pairing is account-level and vault-agnostic (design/vault-addressing.md):
+/// the daemon auto-discovers the account's vaults on start, a single one
+/// auto-selects, and a multi-vault account is resolved by the user (`sc vault
+/// use`) or per command (`--vault`). The agent talks to the local `daemon`; the
+/// daemon syncs against the cloud (`cloud_backend`). Leaves `config.vault` as it
+/// was: a fresh machine has none (auto-select decides), and a re-pair keeps an
+/// explicit default the user already set.
+pub fn put_cloud_coords(
     daemon: &str,
-    vault: &str,
     cloud_backend: &str,
     frontend_origin: Option<&str>,
+    account_id: Option<&str>,
+    account_uik: Option<&str>,
 ) -> Result<PathBuf, String> {
-    remember_vault(daemon, vault)?;
     let mut cfg = load().unwrap_or_default();
     cfg.daemon = Some(daemon.to_string());
-    cfg.vault = Some(vault.to_string());
     cfg.vault_deleted_upstream = None;
     cfg.cloud_backend = Some(cloud_backend.to_string());
     cfg.frontend_origin = frontend_origin
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_string());
+    // §15: persist the paired account UUID (reference) + the owner-UIK us_ (the
+    // real, self-certifying principal-ledger anchor). Keep prior values if this
+    // pairing response omits them (older backend / pre-UIK account).
+    if let Some(a) = account_id.filter(|s| !s.is_empty()) {
+        cfg.account_id = Some(a.to_string());
+    }
+    if let Some(u) = account_uik.filter(|s| !s.is_empty()) {
+        cfg.account_uik = Some(u.to_string());
+    }
     save(&cfg)
+}
+
+/// The account's Supabase UUID, for logging / debug / support display ONLY (matching a
+/// daemon to a console account). NEVER an identity or verification anchor — use
+/// [`account_uik`] for anything that checks owner intent. `None` for a local-only daemon.
+pub fn account_id() -> Option<String> {
+    load().ok()?.account_id.filter(|s| !s.is_empty())
+}
+
+/// The account's owner-UIK id (`us_…`) captured at pairing — the §15 principal-ledger
+/// ANCHOR + the daemon's own per-vault member identity. `None` on an older backend /
+/// pre-UIK account (the ledger loop then doesn't start; membership-loss wipe is skipped).
+pub fn account_uik() -> Option<String> {
+    load().ok()?.account_uik.filter(|s| !s.is_empty())
+}
+
+/// Clear the cloud pairing from config + the known-vaults catalog (the inverse of
+/// [`put_cloud_coords`]): drop daemon/vault/cloud_backend/frontend_origin/account_id
+/// + known_vaults, preserve user `settings`. Used by the §15 self-revoke wipe so it
+/// leaves the same state `sc logout` does.
+pub fn clear_pairing() -> Result<(), String> {
+    let mut cfg = load().unwrap_or_default();
+    cfg.daemon = None;
+    cfg.vault = None;
+    cfg.cloud_backend = None;
+    cfg.frontend_origin = None;
+    cfg.account_id = None;
+    cfg.account_uik = None;
+    cfg.vault_deleted_upstream = None;
+    cfg.known_vaults.clear();
+    save(&cfg)?;
+    clear_known_vaults()
 }
 
 /// Resolve the cloud FRONTEND origin (for the human web-approval link
@@ -411,18 +541,12 @@ fn scheme_host(url: &str) -> Option<String> {
 }
 
 /// The agent's broker-face URL from the env: `$SAFECLAW_BROKER_URL` (the
-/// self-describing name — this is SafeClaw's broker/API face, NOT the control
-/// port), falling back to the legacy `$SAFECLAW_DAEMON_URL` so an env minted
-/// before the rename keeps working. Empty values are ignored.
+/// self-describing name, SafeClaw's broker/API face, not the control port).
+/// Empty values are ignored.
 pub fn env_broker_url() -> Option<String> {
     std::env::var("SAFECLAW_BROKER_URL")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::env::var("SAFECLAW_DAEMON_URL")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
 }
 
 fn env_daemon_host() -> Option<String> {
@@ -518,29 +642,50 @@ pub fn device_default_vault(cfg: &CliConfig) -> Option<String> {
     cfg.vault.clone().or_else(single_known_vault)
 }
 
+/// The global `--vault` flag, recorded once by main right after clap parse so
+/// every handler resolves it through the ONE chain below instead of each
+/// subcommand carrying its own copy of the flag (design/vault-addressing.md).
+static VAULT_FLAG: OnceLock<Option<String>> = OnceLock::new();
+
+pub fn set_vault_flag(v: Option<String>) {
+    let _ = VAULT_FLAG.set(v);
+}
+
+pub fn vault_flag() -> Option<String> {
+    VAULT_FLAG
+        .get()
+        .cloned()
+        .flatten()
+        .filter(|s| !s.is_empty())
+}
+
 /// Resolve the active `(control_root, vault)` pair every short-lived `sc`
 /// command routes through — the single choke point (CREDENTIAL_BROKER.md §14).
 ///
 /// - **control root:** see [`control_root`] — the env `BROKER_URL` HOST wins
 ///   (the single-host invariant), else config, else the loopback default.
 /// - **vault precedence:** `--vault flag > $SAFECLAW_VAULT_ID (env pin) >
-///   config default > single-vault auto-select`. The env pin is what makes an
-///   agent's shelled-out `sc` target the SAME vault its own HTTP does — env
-///   overrides file for the VARYING axis, exactly like `AWS_PROFILE`. A fresh
-///   shell (no pin) still follows config + `sc vault use`.
+///   config default > single-vault auto-select`. The env pin is launch-scoped
+///   context (`sc run` injects it into the child) — it's what makes an agent's
+///   shelled-out `sc` target the SAME vault its own HTTP does. Nothing durable
+///   mints it, so a fresh shell follows config + `sc vault use`.
 pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), String> {
     let cfg = load()?;
     let explicit = vault_override
         .map(str::to_string)
+        .or_else(vault_flag)
         .or_else(|| {
             std::env::var("SAFECLAW_VAULT_ID")
                 .ok()
                 .filter(|s| !s.is_empty())
         })
         .or_else(|| cfg.vault.clone());
-    if let Some(vault) = explicit {
-        validate_vault_id_arg(&vault)?;
-        return Ok((control_root(&cfg), vault));
+    if let Some(token) = explicit {
+        let (daemon, vault) = resolve_vault_token(&token, &cfg)?;
+        return Ok((
+            control_root_from(env_daemon_host(), Some(&daemon), control_port()),
+            vault,
+        ));
     }
     // Single-vault auto-select: the catalog entry records WHICH daemon that
     // vault lives behind — pair them, so a cleared active selection can't
@@ -569,7 +714,7 @@ pub fn resolve_active(vault_override: Option<&str>) -> Result<(String, String), 
 /// typo at the argument boundary with a pointer to `sc vault ls`, instead of
 /// letting it travel to the daemon and surface as a deep, opaque
 /// "passkeys HTTP 400 Bad Request" (after the user already typed a
-/// confirmation, in `sc vault delete`'s case).
+/// confirmation, in `sc vault rm`'s case).
 fn validate_vault_id_arg(v: &str) -> Result<(), String> {
     let ok = !v.is_empty()
         && v.len() <= 128
@@ -583,6 +728,88 @@ fn validate_vault_id_arg(v: &str) -> Result<(), String> {
             v
         ))
     }
+}
+
+/// Resolve a user/agent `--vault` token to `(daemon, vault_id)` the
+/// git/docker/kubectl way: an exact id, an exact label (case-insensitive), or a
+/// unique id-prefix — whichever is UNAMBIGUOUS. Ambiguity is an error listing
+/// the candidates, never a guess (the failure mode this exists to kill: an agent
+/// told "the team vault" picking one at random). A syntactically-valid id not
+/// yet in the catalog (a just-created vault) is accepted verbatim. Spaces belong
+/// to a label: quote it, or pass a short id-prefix (no spaces, no quoting).
+pub fn resolve_vault_token(token: &str, cfg: &CliConfig) -> Result<(String, String), String> {
+    let token = token.trim();
+    let known = known_vaults();
+    // 1. exact id — the canonical handle always wins.
+    if let Some(kv) = known.iter().find(|kv| kv.vault == token) {
+        return Ok((kv.daemon.clone(), kv.vault.clone()));
+    }
+    // 2. exact label, case-insensitive — unique or fail loud.
+    let by_label: Vec<&KnownVault> = known
+        .iter()
+        .filter(|kv| {
+            kv.label
+                .as_deref()
+                .map(|l| l.trim().eq_ignore_ascii_case(token))
+                .unwrap_or(false)
+        })
+        .collect();
+    match by_label.as_slice() {
+        [kv] => return Ok((kv.daemon.clone(), kv.vault.clone())),
+        [] => {}
+        many => return Err(ambiguous_vault_err(token, "name", many)),
+    }
+    // 3. unique id-prefix (docker/git style); >=4 chars so a stray word can't sweep.
+    if token.len() >= 4
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        let by_prefix: Vec<&KnownVault> =
+            known.iter().filter(|kv| kv.vault.starts_with(token)).collect();
+        match by_prefix.as_slice() {
+            [kv] => return Ok((kv.daemon.clone(), kv.vault.clone())),
+            [] => {}
+            many => return Err(ambiguous_vault_err(token, "id prefix", many)),
+        }
+    }
+    // 4. a full-length valid id the catalog hasn't recorded yet (just created /
+    //    catalog lag) — accept verbatim against the default daemon.
+    if validate_vault_id_arg(token).is_ok() && token.len() >= 20 {
+        let daemon = cfg
+            .daemon
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT));
+        return Ok((daemon, token.to_string()));
+    }
+    Err(format!(
+        "no vault matches '{}' — run `sc vault ls` and pass its id, a unique id prefix, or its exact name (quote a name with spaces)",
+        token
+    ))
+}
+
+/// Render the "be specific" error when a token matches multiple vaults — lists
+/// each candidate's name + short id so the caller can disambiguate.
+fn ambiguous_vault_err(token: &str, by: &str, cands: &[&KnownVault]) -> String {
+    let list = cands
+        .iter()
+        .map(|kv| {
+            let short = kv.vault.get(..8).unwrap_or(&kv.vault);
+            match kv.label.as_deref() {
+                Some(l) => format!("  {} ({})", l, short),
+                None => format!("  {}", kv.vault),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "'{}' matches {} vaults by {} — be specific (use the id or a unique prefix):\n{}",
+        token,
+        cands.len(),
+        by,
+        list
+    )
 }
 
 /// Single-vault auto-select (§5): exactly one known vault defaults to it, so a
@@ -605,8 +832,8 @@ mod tests {
     use super::*;
 
     /// A display name / typo passed as `--vault` must fail at the argument
-    /// boundary with the `sc vault ls` pointer — not travel to the daemon and
-    /// come back as an opaque "passkeys HTTP 400" (the `sc vault delete
+    /// boundary with the `sc vault ls` pointer, not travel to the daemon and
+    /// come back as an opaque "passkeys HTTP 400" (the `sc vault rm
     /// "test vault2"` report).
     #[test]
     fn vault_id_arg_rejects_names_and_accepts_ids() {

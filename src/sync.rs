@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cli::active;
+use crate::device_auth::DikRequestExt;
 use crate::state::AppState;
 use crate::storage::sealed_vault::{self, SealedVault};
 use crate::sync_stream::{Mode, StreamHealth, VaultStatus, WakeCell, Work};
@@ -99,9 +100,21 @@ pub async fn pull_on_start(state_dir: &Path) {
         tracing::debug!("cloud sync: no device-key (unpaired); skipping pull");
         return;
     };
-    // All vaults this device knows (active ∪ known_vaults) are kept online —
-    // the agent addresses any of them by vid, no "switch vault" needed (1P
-    // model). See [[project_vault_agent_architecture_2026_06_25]].
+    // Auto-discover every vault this ACCOUNT owns, not just the ones a manual
+    // `sc vault use` recorded (design/vault-addressing.md). Persist newly found
+    // ids into the known-vaults catalog BEFORE computing the pull set below, so
+    // the daemon serves a console-created vault with no `sc vault use`. Blobs are
+    // passkey-sealed, so syncing every account vault leaks nothing; unlock stays
+    // passkey-gated. Best-effort: an old backend or a network blip just leaves
+    // the locally-known set as it was.
+    let discovered = discover_account_vault_ids(cloud, &dk).await;
+    let fresh = remember_discovered(&cfg, &discovered);
+    if !fresh.is_empty() {
+        tracing::info!(count = fresh.len(), "cloud sync: adopted account vaults via discovery");
+    }
+    // All vaults this device knows (active ∪ known_vaults ∪ discovered) are kept
+    // online — the agent addresses any of them by vid, no "switch vault" needed
+    // (1P model). See [[project_vault_agent_architecture_2026_06_25]].
     let ids = synced_vault_ids(&cfg);
     if ids.is_empty() {
         tracing::debug!("cloud sync: no vaults to pull");
@@ -216,17 +229,19 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
         if let Some(dk2) = device_key() {
             match pull_keys(&state.config.state_dir, cloud2, vault_id, &dk2).await {
                 Ok(n) if n > 0 => {
+                    state.record_cloud_contact(vault_id);
                     tracing::info!(vault = %vault_id, adopted = n, "keyset pull: adopted rows")
                 }
-                Ok(_) => {}
+                Ok(_) => state.record_cloud_contact(vault_id),
                 Err(e) => tracing::debug!(vault = %vault_id, "keyset pull failed: {}", e),
             }
             match pull_items(&state.config.state_dir, cloud2, vault_id, &dk2).await {
                 Ok(n) if n > 0 => {
+                    state.record_cloud_contact(vault_id);
                     tracing::info!(vault = %vault_id, adopted = n, "per-item pull: adopted rows");
                     refresh_after_item_pull(state, vault_id);
                 }
-                Ok(_) => {}
+                Ok(_) => state.record_cloud_contact(vault_id),
                 Err(e) => tracing::debug!(vault = %vault_id, "per-item pull failed: {}", e),
             }
         }
@@ -244,7 +259,104 @@ pub async fn sync_vault_now(state: &Arc<AppState>, vault_id: &str) -> Result<Syn
     // already-synced rows 409-skip without blocking the rest.
     push_keys_best_effort(state, vault_id).await;
     push_items_best_effort(state, vault_id).await;
+    deliver_team_marks(state, vault_id).await;
     Ok(SyncOutcome { pulled, connects })
+}
+
+/// Force a FULL `/membership` re-pull for ONE vault, out of band — the approve
+/// path's SELF-HEAL. A backend x/y backfill (a credential's WebAuthn pubkey added
+/// to an already-synced membership) does NOT bump the membership seq, so a normal
+/// delta pull replies "nothing new" and the daemon's `credential_lookup` keeps
+/// missing the credential ("unknown credential") even though the cloud offers it.
+/// On a lookup miss we re-pull the WHOLE triple (since=0) here and retry once.
+/// Returns rows adopted. Best-effort caller: a local-only/unpaired daemon errs.
+pub async fn resync_membership_now(state: &Arc<AppState>, vault_id: &str) -> Result<usize, String> {
+    let cfg = active::load().map_err(|_| "not paired".to_string())?;
+    let cloud = cfg
+        .cloud_backend
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "local-only daemon (no cloud) — cannot resync membership".to_string())?;
+    let dk =
+        device_key().ok_or_else(|| "daemon not paired — cannot resync membership".to_string())?;
+    let n = pull_membership(&state.config.state_dir, cloud, vault_id, &dk, true).await?;
+    if n > 0 {
+        state.record_cloud_contact(vault_id);
+        tracing::info!(vault = %vault_id, adopted = n, "membership resync (self-heal): backfilled keyset");
+    }
+    Ok(n)
+}
+
+/// Drain the post-migration cloud marks for one vault (team §8.3/§5.15):
+/// the owner lock-list registration (config-ids) and the one-way `format=2`
+/// ratchet. Both idempotent server-side; delivered only after the push above
+/// so the format gate never fronts rows that aren't up yet. Best-effort —
+/// stays queued for the next round on any failure.
+async fn deliver_team_marks(state: &Arc<AppState>, vault_id: &str) {
+    let cfg = match crate::cli::active::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some(dk) = device_key() else { return };
+    let has_ids = state
+        .pending_config_ids
+        .lock()
+        .unwrap()
+        .get(vault_id)
+        .cloned();
+    let has_format = state.pending_format_mark.lock().unwrap().contains(vault_id);
+    if has_ids.is_none() && !has_format {
+        return;
+    }
+    let Ok(client) = crate::cli::egress_proxy::client(Duration::from_secs(10)) else {
+        return;
+    };
+    let cloud = cloud.trim_end_matches('/');
+    if let Some(ids) = has_ids {
+        let url = format!("{}/v/{}/config-ids", cloud, vault_id);
+        let body = serde_json::json!({ "ids": ids });
+        match client
+            .post(&url)
+            .bearer_auth(&dk)
+            .dik_pop("POST", &url, &serde_json::to_vec(&body).unwrap_or_default())
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                state.pending_config_ids.lock().unwrap().remove(vault_id);
+                tracing::info!(vault = %vault_id, "owner lock-list registered");
+            }
+            Ok(r) => {
+                tracing::debug!(vault = %vault_id, status = %r.status(), "config-ids register deferred")
+            }
+            Err(e) => tracing::debug!(vault = %vault_id, "config-ids register failed: {}", e),
+        }
+    }
+    if has_format {
+        let url = format!("{}/v/{}/format", cloud, vault_id);
+        let body = serde_json::json!({ "format": 2 });
+        match client
+            .patch(&url)
+            .bearer_auth(&dk)
+            .dik_pop("PATCH", &url, &serde_json::to_vec(&body).unwrap_or_default())
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                state.pending_format_mark.lock().unwrap().remove(vault_id);
+                tracing::info!(vault = %vault_id, "vault marked format=2 (unified addressing)");
+            }
+            Ok(r) => {
+                tracing::debug!(vault = %vault_id, status = %r.status(), "format mark deferred")
+            }
+            Err(e) => tracing::debug!(vault = %vault_id, "format mark failed: {}", e),
+        }
+    }
 }
 
 /// After a per-item pull adopted new rows, refresh the in-memory cache for an
@@ -277,16 +389,226 @@ fn refresh_after_item_pull(state: &Arc<AppState>, vault: &str) {
 /// `known_vaults` (added by `sc vault use` / `sc vault create`), deduped. The
 /// agent reaches any of them by vid; `sc vault use` is only the CLI default.
 fn synced_vault_ids(cfg: &crate::cli::active::CliConfig) -> Vec<String> {
+    // A personal build (open source) syncs only PERSONAL vaults: a SHARED (team)
+    // vault is handled by the official SafeClaw build, so it is left out of this
+    // device's synced set here (never pulled, watched, or audit-shipped). The
+    // official build serves team, so `build_serves_shared()` is true there and
+    // nothing is filtered. Classification is the server-authoritative catalog
+    // `kind` (mirrored on discovery, no unlock needed); an UNKNOWN kind is kept
+    // (fail-safe: a personal vault is never dropped from sync).
+    let serves_shared = crate::team_hooks::build_serves_shared();
+    let known = crate::cli::active::known_vaults();
+    let leave_to_official = |vid: &str| -> bool {
+        !serves_shared
+            && known
+                .iter()
+                .find(|kv| kv.vault == vid)
+                .map(|kv| crate::state::AppState::kind_str_is_shared(kv.kind.as_deref()))
+                .unwrap_or(false)
+    };
     let mut ids: Vec<String> = Vec::new();
     if let Some(v) = cfg.vault.as_deref().filter(|s| !s.is_empty()) {
-        ids.push(v.to_string());
+        if !leave_to_official(v) {
+            ids.push(v.to_string());
+        }
     }
-    for kv in crate::cli::active::known_vaults() {
-        if !kv.vault.is_empty() && !ids.iter().any(|x| x == &kv.vault) {
-            ids.push(kv.vault);
+    for kv in &known {
+        if !kv.vault.is_empty() && !leave_to_official(&kv.vault) && !ids.iter().any(|x| x == &kv.vault)
+        {
+            ids.push(kv.vault.clone());
         }
     }
     ids
+}
+
+/// A personal build (open source) leaves SHARED (team) vaults to the official
+/// SafeClaw build: it never syncs their material. `true` iff this build does NOT
+/// serve team AND `vid` is shared per the server-authoritative catalog `kind`
+/// (unknown kind is NOT shared, so a personal vault is never dropped). This is the
+/// single guard the pull primitives share, so every adopt path (main loop,
+/// watchers, `sync_vault_now`, `resync_membership_now`, conflict recovery) is
+/// covered at one point. The official build serves team, so it is always `false`
+/// there. team-edition §9.
+fn leave_shared_to_official(vid: &str) -> bool {
+    if crate::team_hooks::build_serves_shared() {
+        return false;
+    }
+    crate::cli::active::known_vaults()
+        .iter()
+        .find(|kv| kv.vault == vid)
+        .map(|kv| crate::state::AppState::kind_str_is_shared(kv.kind.as_deref()))
+        .unwrap_or(false)
+}
+
+/// GET the account's vault ids from the cloud — the same `/api/vault/vaults` the
+/// console lists, now device-key authable. The daemon keeps EVERY account vault
+/// synced (1P per-item model), so a vault created in the browser reaches this
+/// device with no `sc vault use`. Best-effort: any failure returns an empty list
+/// and the caller leaves the locally-known set untouched. This never REMOVES a
+/// vault; deletion is the tombstone path (`PullOutcome::Deleted`).
+/// One account vault as `/api/vault/vaults` returns it: the id plus the
+/// cloud-authoritative label/kind the daemon mirrors into the local catalog.
+struct DiscoveredVault {
+    id: String,
+    label: Option<String>,
+    kind: Option<String>,
+}
+
+async fn discover_account_vault_ids(cloud: &str, dk: &str) -> Vec<DiscoveredVault> {
+    let cloud = cloud.trim_end_matches('/');
+    let url = format!("{}/api/vault/vaults", cloud);
+    let Ok(client) = crate::cli::egress_proxy::client(Duration::from_secs(15)) else {
+        return Vec::new();
+    };
+    let resp = match client
+        .get(&url)
+        .bearer_auth(dk)
+        .dik_pop("GET", &url, &[])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("vault discovery: reach {} failed: {}", cloud, e);
+            return Vec::new();
+        }
+    };
+    if !resp.status().is_success() {
+        // 404 = a backend that predates device-key vault listing; anything else
+        // is transient. Either way, keep what we already know.
+        tracing::debug!(status = %resp.status(), "vault discovery: non-success (old backend?)");
+        return Vec::new();
+    }
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!("vault discovery: parse failed: {}", e);
+            return Vec::new();
+        }
+    };
+    body.get("vaults")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let id = v.get("id").and_then(|i| i.as_str())?.to_string();
+                    let label = v
+                        .get("label")
+                        .and_then(|i| i.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    let kind = v
+                        .get("kind")
+                        .and_then(|i| i.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    Some(DiscoveredVault { id, label, kind })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persist discovered vault ids into the known-vaults catalog under this device's
+/// local daemon URL, so `synced_vault_ids` / `sc vault ls` include them. Returns
+/// the ids that were NOT already known (the ones freshly adopted this call), so
+/// the caller can spawn a watcher for each new one. Setting a DEFAULT is a
+/// separate act (`sc vault use`); discovery only makes vaults AVAILABLE.
+fn remember_discovered(
+    cfg: &crate::cli::active::CliConfig,
+    discovered: &[DiscoveredVault],
+) -> Vec<String> {
+    let daemon = cfg
+        .daemon
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", crate::config::CONTROL_PORT));
+    let known: std::collections::HashSet<String> = crate::cli::active::known_vaults()
+        .into_iter()
+        .map(|kv| kv.vault)
+        .collect();
+    let mut fresh = Vec::new();
+    for dv in discovered {
+        let is_new = !known.contains(&dv.id);
+        // Upsert EVERY discovered vault (not just new ones) so a cloud rename
+        // refreshes the mirrored label/kind; only NEW ids are returned as fresh
+        // (the caller spawns a per-vault watcher for each).
+        match crate::cli::active::remember_discovered_vault(
+            &daemon,
+            &dv.id,
+            dv.label.clone(),
+            dv.kind.clone(),
+        ) {
+            Ok(()) => {
+                if is_new {
+                    fresh.push(dv.id.clone());
+                }
+            }
+            Err(e) => tracing::debug!(vault = %dv.id, "vault discovery: remember failed: {}", e),
+        }
+    }
+    fresh
+}
+
+/// Live auto-discovery: adopt an account vault created AFTER the daemon started
+/// (e.g. in the console) without a restart. Re-lists the account's vaults on an
+/// interval; a genuinely new one is persisted, pulled once so it serves right
+/// away, then handed to a steady `watch_loop`. That watcher rides long-poll
+/// (its cell is not in the SSE dispatcher's fixed set); the next daemon restart
+/// folds it into the SSE stream. Spawned unconditionally for a paired daemon, so
+/// even a device with zero vaults today adopts its first console-created one.
+async fn discovery_reconcile_loop(
+    state: Arc<AppState>,
+    cloud: String,
+    dk: String,
+    mut watched: std::collections::HashSet<String>,
+) {
+    /// Cadence for spotting a newly created vault. Fast path for existing vaults
+    /// is still the per-vault watcher; this only governs first adoption latency.
+    const INTERVAL: Duration = Duration::from_secs(120);
+    // A private health channel pinned Down: dynamically-added vaults run on
+    // long-poll (Fallback), and holding the sender here keeps every spawned
+    // watcher's `health_rx.changed()` parked instead of erroring on a dropped
+    // sender.
+    let (_health_tx, health_rx) = tokio::sync::watch::channel(StreamHealth::Down);
+    loop {
+        tokio::time::sleep(INTERVAL).await;
+        let cfg = match active::load() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let discovered = discover_account_vault_ids(&cloud, &dk).await;
+        let fresh = remember_discovered(&cfg, &discovered);
+        let serves_shared = crate::team_hooks::build_serves_shared();
+        for vid in fresh {
+            // Personal build: leave a SHARED (team) vault to the official build
+            // (do not live-adopt it). Kind is the server-authoritative discovery
+            // value; unknown is kept (fail-safe for personal vaults).
+            if !serves_shared
+                && discovered
+                    .iter()
+                    .find(|d| d.id == vid)
+                    .map(|d| crate::state::AppState::kind_str_is_shared(d.kind.as_deref()))
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            if !watched.insert(vid.clone()) {
+                continue;
+            }
+            let st = state.clone();
+            let cl = cloud.clone();
+            let dkk = dk.clone();
+            let hr = health_rx.clone();
+            tracing::info!(vault = %vid, "cloud sync: live-adopted a new account vault (long-poll until restart)");
+            tokio::spawn(async move {
+                let cell = Arc::new(WakeCell::new());
+                // Pull once so the vault serves immediately, then keep it current.
+                let _ = pull(&st.config.state_dir, &cl, &vid, &dkk).await;
+                watch_loop(st, vid, cl, dkk, cell, hr).await;
+            });
+        }
+    }
 }
 
 /// Spawn one `watch_loop` per synced vault (active ∪ known_vaults), so every
@@ -338,8 +660,33 @@ pub fn spawn_watchers(state: Arc<AppState>) {
         ));
     }
     if !cells.is_empty() {
-        tokio::spawn(crate::sync_stream::dispatcher(cloud, dk, cells, health_tx));
+        tokio::spawn(crate::sync_stream::dispatcher(
+            cloud.clone(),
+            dk.clone(),
+            cells,
+            health_tx,
+        ));
     }
+    // Live auto-discovery (design/vault-addressing.md): adopt account vaults
+    // created after startup with no restart. Runs even with zero vaults today, so
+    // a freshly-paired device picks up its first console-created vault. Seeded
+    // with the vaults already watched above so it only spawns for NEW ones.
+    let watched: std::collections::HashSet<String> =
+        synced_vault_ids(&cfg).into_iter().collect();
+    // §15 account principal ledger: pull + verify + (flag-gated) enforce a VERIFIED
+    // self-revoke (lock + wipe all + logout). The anchor is the account's owner-UIK
+    // us_ pinned at login (NOT the account UUID) — self-certifying. Dormant until
+    // SAFECLAW_PRINCIPAL_ENFORCE is on (the P6 cutover flips the default). Uses clones
+    // so the discovery loop below still takes ownership.
+    if let Some(anchor_uik) = active::account_uik() {
+        tokio::spawn(crate::principal_ledger::principal_ledger_loop(
+            state.clone(),
+            cloud.clone(),
+            dk.clone(),
+            anchor_uik,
+        ));
+    }
+    tokio::spawn(discovery_reconcile_loop(state, cloud, dk, watched));
 }
 
 /// Pull the vault's sealed blob (version-gated by the `.blob_version` sidecar).
@@ -354,6 +701,16 @@ async fn pull(
     vault: &str,
     device_key: &str,
 ) -> Result<PullOutcome, String> {
+    // Personal build: a SHARED (team) vault is left to the official build, so its
+    // whole-blob is never pulled here either. The main sync loop and the discovery
+    // reconcile already pre-filter shared vaults, but the arbitrary-vid callers
+    // (`sync_vault_now` via `POST /v/{vid}/sync`, `recover_after_conflict`) do not,
+    // so gate at the primitive to keep team material off disk regardless of
+    // caller, the same single-chokepoint rule the per-item primitives use.
+    // Reporting `Unchanged` (not an error) keeps those callers benign. §9.
+    if leave_shared_to_official(vault) {
+        return Ok(PullOutcome::Unchanged);
+    }
     let local_ver = read_local_version(state_dir, vault);
     let url = format!(
         "{}/v/{}/blob?since={}",
@@ -366,6 +723,7 @@ async fn pull(
     let resp = client
         .get(&url)
         .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
@@ -388,6 +746,114 @@ async fn pull(
     Ok(classify_pull_body(state_dir, vault, &body)?)
 }
 
+/// Extract the server-authoritative vault `kind` from a `/blob` (or `/blob/wait`)
+/// response envelope (team §4). `kind` rides OUTSIDE the sealed blob — a server
+/// operational fact, never E2E — so the daemon reads it straight off the
+/// envelope. `Some(true)` = `"shared"`, `Some(false)` = `"private"`, `None` if
+/// the field is absent/unrecognized (an old server, or a probe the server didn't
+/// stamp) — the caller then leaves the last known sharedness untouched (never
+/// downgrades a known-shared vault to private on a field-less poll). Additive by
+/// construction: a server that never sends `kind` changes nothing (every vault
+/// stays at the fail-safe private default in `vault_is_shared`).
+fn parse_shared_from_body(body: &serde_json::Value) -> Option<bool> {
+    match body.get("kind").and_then(|v| v.as_str()) {
+        Some("shared") => Some(true),
+        Some("private") => Some(false),
+        _ => None,
+    }
+}
+
+/// Decode standard base64 (the backend emits `Buffer.toString("base64")`).
+fn decode_b64(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
+/// Decode a base64 64-byte Ed25519 signature.
+fn decode_sig64(s: &str) -> Option<[u8; 64]> {
+    let v = decode_b64(s)?;
+    if v.len() != 64 {
+        return None;
+    }
+    let mut a = [0u8; 64];
+    a.copy_from_slice(&v);
+    Some(a)
+}
+
+/// Apply the server-signed operational envelope (team §9 — "谁是权威谁签名"):
+/// trust `kind` and advance the offline-lease contact clock ONLY from a signature
+/// we can verify against the pinned server key. A present-but-invalid signature
+/// (a fake / MITM `/blob` server, or a tampered local cache) is IGNORED with a
+/// warning — so a local attacker can neither flip a shared vault to private (to
+/// kill its lease) nor forge a recent contact (to hold the lease open offline).
+/// An ABSENT `env` (a legacy server that does not sign yet) falls back to trusting
+/// the plain top-level `kind`, so the rollout is additive and never silent-bricks
+/// (§7). This defends the daemon's cache against LOCAL tampering, not against a
+/// compromised server (§9); the hard revocation is always upstream-key rotation.
+fn apply_verified_envelope(state: &Arc<AppState>, vault: &str, body: &serde_json::Value) {
+    if let Some(env) = body.get("env") {
+        // Signed path: the top-level `kind` is covered by the `env` signature.
+        let kind = body
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("private");
+        let format = env.get("format").and_then(|v| v.as_u64()).unwrap_or(0);
+        let epoch = env
+            .get("membership_epoch")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let issued_at = env.get("issued_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        let nonce = env
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .and_then(decode_b64)
+            .unwrap_or_default();
+        let verified = env
+            .get("sig")
+            .and_then(|v| v.as_str())
+            .and_then(decode_sig64)
+            .map(|sig| {
+                crate::crypto::server_key::verify_envelope(
+                    vault, kind, format, epoch, issued_at, &nonce, &sig,
+                )
+            })
+            .unwrap_or(false);
+        if !verified {
+            tracing::warn!(vault = %vault, "cloud sync: server envelope signature INVALID — ignoring operational facts (kind/lease)");
+            return;
+        }
+        state.set_vault_shared(vault, kind == "shared");
+    } else if let Some(shared) = parse_shared_from_body(body) {
+        // Legacy server (no `env` signature): trust the plain `kind` field.
+        state.set_vault_shared(vault, shared);
+    }
+    // Contact token: advance the lease freshness clock only from a verified token.
+    if let Some(tok) = body.get("contact_token") {
+        let account_id = tok.get("account_id").and_then(|v| v.as_str()).unwrap_or("");
+        let issued_at = tok.get("issued_at").and_then(|v| v.as_u64()).unwrap_or(0);
+        let nonce = tok
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .and_then(decode_b64)
+            .unwrap_or_default();
+        let verified = tok
+            .get("sig")
+            .and_then(|v| v.as_str())
+            .and_then(decode_sig64)
+            .map(|sig| {
+                crate::crypto::server_key::verify_contact_token(
+                    vault, account_id, issued_at, &nonce, &sig,
+                )
+            })
+            .unwrap_or(false);
+        if verified {
+            state.record_cloud_contact(vault);
+        } else {
+            tracing::warn!(vault = %vault, "cloud sync: contact token signature INVALID — not advancing lease clock");
+        }
+    }
+}
+
 /// Parse a 200 blob-GET body into a `PullOutcome` and, for a live update,
 /// persist the blob to `vault.dat`. Factored out of `pull` so the watch loop
 /// (which reads its own long-poll body) and the unit tests share one classifier.
@@ -404,7 +870,13 @@ fn classify_pull_body(
     // Tombstone: an explicit deleted status is the ONLY drop trigger. Checked
     // before `unchanged`/`blob` so a tombstone is never mistaken for content.
     if body.get("status").and_then(|v| v.as_str()) == Some("deleted") {
-        return Ok(PullOutcome::Deleted);
+        // §15 leg A: gate the drop on the (dual-path) tombstone check. Flag OFF (default)
+        // → always Deleted (unchanged). Flag ON → Deleted only for a verified owner
+        // tombstone; an unsigned/forged delete parks as Unchanged (a later valid pull drops).
+        if tombstone_should_drop(state_dir, vault, body) {
+            return Ok(PullOutcome::Deleted);
+        }
+        return Ok(PullOutcome::Unchanged);
     }
 
     // `{ unchanged: true }` — the cheap freshness probe said local is current.
@@ -549,7 +1021,7 @@ fn drop_local_vault(state: &Arc<AppState>, vault: &str) {
 /// land AFTER `remove_file` and re-create a live file for a tombstoned id. The
 /// ONLY lock-free drop is `pull_on_start`'s (pre-serve: no AppState, no
 /// concurrent writers yet), which uses `drop_local_vault_disk` directly.
-async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) {
+pub(crate) async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) {
     let lock = {
         let mut locks = state.vault_write_locks.lock().unwrap();
         Arc::clone(
@@ -560,6 +1032,71 @@ async fn drop_local_vault_locked(state: &Arc<AppState>, vault: &str) {
     };
     let _guard = lock.lock().await;
     drop_local_vault(state, vault);
+}
+
+/// §15 leg-B: if THIS account's UIK is VERIFIED-not-a-member of a shared vault (an
+/// owner offboarded us), actively LOCK + WIPE it locally. Returns `true` if it wiped
+/// (the caller stops this vault's watcher — a later pull would re-adopt the triple).
+/// SAFE: acts ONLY on a `Verified`, non-empty fold that EXCLUDES our `us_`
+/// ([`PerItemVault::verified_membership`] = `Some(false)`); an untrusted / rolled-back
+/// / bootstrap / personal-`NoUik` vault yields `None` → parks. Flag-gated (default OFF,
+/// P6 flips it). Recoverable if ever wrong: the discovery loop won't re-add a
+/// non-member vault, and a re-invite + passkey re-unlock restores it.
+async fn enforce_membership_presence(state: &Arc<AppState>, vault: &str) -> bool {
+    if !crate::principal_ledger::principal_enforce_enabled() {
+        return false;
+    }
+    let Some(us) = active::account_uik() else {
+        return false;
+    };
+    let Some(pv) = read_per_item_store(&state.config.state_dir, vault) else {
+        return false; // no local keyset yet → nothing to lose
+    };
+    if pv.verified_membership(vault, &us) == Some(false) {
+        tracing::warn!(
+            vault = %vault, us = %us,
+            "membership: this account is VERIFIED not a member of this vault (owner offboarded) — locking + wiping local state"
+        );
+        drop_local_vault_locked(state, vault).await;
+        return true;
+    }
+    false
+}
+
+/// §15 leg A: decide whether a `status:"deleted"` tombstone should DROP local state.
+/// Dual-path: with the require-signed flag OFF (default) ANY tombstone drops — the
+/// legacy behavior, byte-for-byte unchanged. With it ON, drop ONLY on an owner-signed
+/// tombstone (`tombstone_sig`/`tombstone_signer` in the body) that verifies against the
+/// vault's fold-owner set; a server flipping `status` without a valid owner signature is
+/// then REJECTED (parked), not obeyed. NEVER acts on a bare 401 (that path parks
+/// upstream) — this only gates an explicit deleted-status body.
+fn tombstone_should_drop(state_dir: &Path, vault: &str, body: &serde_json::Value) -> bool {
+    if !crate::principal_ledger::require_signed_tombstone() {
+        return true; // legacy dual-path: unsigned deletes still drop until the P6 flip
+    }
+    // No per-item keyset at all (a pure legacy fmt1 vault, or one never synced here) → no
+    // fold-owner to verify against and no fmt2 K/blob to protect → keep the legacy drop
+    // (F3: require-signed must never STRAND a legacy delete, only harden fmt2).
+    let Some(pv) = read_per_item_store(state_dir, vault) else {
+        return true;
+    };
+    if pv.is_legacy_nouik(vault) {
+        return true; // legacy NoUik vault: no signed owner set → legacy drop
+    }
+    // fmt2 vault: require a verified owner tombstone; an unsigned/forged delete parks.
+    let (Some(sig), Some(signer)) = (
+        body.get("tombstone_sig").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+        body.get("tombstone_signer").and_then(|v| v.as_str()).filter(|s| !s.is_empty()),
+    ) else {
+        tracing::warn!(vault = %vault, "tombstone: require-signed ON but the delete carries no owner signature; NOT dropping");
+        return false;
+    };
+    if pv.tombstone_verified(vault, signer, sig) {
+        true
+    } else {
+        tracing::warn!(vault = %vault, signer = %signer, "tombstone: owner signature did NOT verify; NOT dropping (possible server-forged delete)");
+        false
+    }
 }
 
 /// After a runtime pull wrote a new `vault.dat`, refresh the in-memory cache
@@ -658,7 +1195,14 @@ pub async fn push_blob_best_effort(state: &Arc<AppState>, vault_id: &str) {
             let base_version = read_local_version(&state.config.state_dir, vault_id);
             serde_json::json!({ "blob": blob, "base_version": base_version })
         };
-        let resp = match client.put(&url).bearer_auth(&dk).json(&body).send().await {
+        let resp = match client
+            .put(&url)
+            .bearer_auth(&dk)
+            .dik_pop("PUT", &url, &serde_json::to_vec(&body).unwrap_or_default())
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(vault = %vault_id, "push-back: PUT failed: {}", e);
@@ -763,7 +1307,13 @@ async fn fetch_agent_key_hashes(
     device_key: &str,
 ) -> Option<std::collections::HashSet<String>> {
     let url = format!("{}/api/vault/agents/hashes", cloud.trim_end_matches('/'));
-    let resp = client.get(&url).bearer_auth(device_key).send().await.ok()?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -1046,10 +1596,12 @@ async fn ship_vault_audit(
         }
         let events: Vec<AuditEventWire> = rows.iter().map(event_from_row).collect();
         let url = format!("{}/v/{}/audit", cloud, vault);
+        let body = serde_json::json!({ "events": events });
         let resp = client
             .post(&url)
             .bearer_auth(device_key)
-            .json(&serde_json::json!({ "events": events }))
+            .dik_pop("POST", &url, &serde_json::to_vec(&body).unwrap_or_default())
+            .json(&body)
             .send()
             .await;
         match resp {
@@ -1253,12 +1805,19 @@ pub async fn watch_loop(
             // explicit "deleted" stays the ONLY local-state destroyer.
             if let Some((version, status)) = work.vault {
                 if status == VaultStatus::Deleted {
-                    drop_local_vault_locked(&state, &vault).await;
-                    tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
-                    // Task exit drops the sole strong ref to the cell; the
-                    // dispatcher prunes this vid from `?vids` at its next
-                    // reconnect.
-                    return;
+                    // §15 leg A: the SSE vault EVENT carries no tombstone signature, so
+                    // it can direct-drop only under the legacy (flag-OFF) path. With
+                    // require-signed ON, do NOT drop/stop here — fall through so the
+                    // reconcile blob probe re-fetches the SIGNED tombstone body, which
+                    // `handle_blob_wake_body` gates against the fold-owner set.
+                    if !crate::principal_ledger::require_signed_tombstone() {
+                        drop_local_vault_locked(&state, &vault).await;
+                        tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
+                        // Task exit drops the sole strong ref to the cell; the
+                        // dispatcher prunes this vid from `?vids` at its next
+                        // reconnect.
+                        return;
+                    }
                 }
                 // ★ Cursor re-read from disk at use time, never cached across
                 // parks — the loop-top discipline the long-poll shape gets
@@ -1312,6 +1871,10 @@ pub async fn watch_loop(
                 if !pull_and_process(&state, &state_dir, &cloud, &vault, &dk, "sse-wake").await {
                     clean = false;
                 }
+                // §15 leg-B: a just-adopted membership triple may have offboarded us.
+                if enforce_membership_presence(&state, &vault).await {
+                    return; // wiped → stop this watcher (a re-pull would re-adopt)
+                }
             }
 
             // ★ The reconcile floor fires on schedule even under steady
@@ -1348,6 +1911,11 @@ pub async fn watch_loop(
                                 "sse-reconcile",
                             )
                             .await;
+                        // §15 leg-B: periodic fallback catch for an offboard the
+                        // SSE wake missed.
+                        if enforce_membership_presence(&state, &vault).await {
+                            return;
+                        }
                     }
                     Ok(BlobWake::Handled {
                         persist_failed,
@@ -1413,7 +1981,11 @@ pub async fn watch_loop(
         // ── Fallback shapes: the pre-SSE long-poll rounds, unchanged ──────
         let local_ver = read_local_version(&state_dir, &vault);
         let blob_url = format!("{}/v/{}/blob/wait?since={}", cloud, vault, local_ver);
-        let blob_fut = client.get(&blob_url).bearer_auth(&dk).send();
+        let blob_fut = client
+            .get(&blob_url)
+            .bearer_auth(&dk)
+            .dik_pop("GET", &blob_url, &[])
+            .send();
         // The content channel only exists once the vault has a per-item store
         // (its cursor lives there). Reading the store each round is a small
         // local file parse — negligible against a 25s park.
@@ -1425,7 +1997,11 @@ pub async fn watch_loop(
         let wake = match items_since {
             Some(seq) => {
                 let items_url = format!("{}/v/{}/items/wait?since={}", cloud, vault, seq);
-                let items_fut = client.get(&items_url).bearer_auth(&dk).send();
+                let items_fut = client
+                    .get(&items_url)
+                    .bearer_auth(&dk)
+                    .dik_pop("GET", &items_url, &[])
+                    .send();
                 // Whichever channel answers first wins; the loser is dropped
                 // mid-hold (the server notices the close) and re-armed next
                 // round. Worst case that's one extra request per ~25s window.
@@ -1470,6 +2046,9 @@ pub async fn watch_loop(
                 200 => {
                     backoff = Duration::from_secs(2);
                     consec_errs = 0;
+                    // A successful sync means our version is accepted — clear any
+                    // stale SC_UPGRADE_REQUIRED flag (design 甲).
+                    state.set_vault_upgrade_required(&vault, false);
                     let body: serde_json::Value = match resp.json().await {
                         Ok(b) => b,
                         Err(_) => {
@@ -1513,15 +2092,34 @@ pub async fn watch_loop(
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 401 | 403 => {
-                    // Park, don't die: a transient 403 (backend deploy, auth
-                    // migration) must not end this device's sync until daemon
-                    // restart. See AUTH_RETRY.
-                    tracing::warn!(
-                        vault = %vault,
-                        "cloud sync watch: auth rejected (HTTP {}); retrying in {}s",
-                        resp.status(),
-                        AUTH_RETRY.as_secs()
-                    );
+                    // Distinguish a FORCED UPGRADE (`SC_UPGRADE_REQUIRED`: this daemon
+                    // is too old for the vault's item format, design 甲) from a
+                    // transient 403. On the former, flag the vault so the broker fails
+                    // loudly with `sc upgrade` to the agent (not a silent park); else
+                    // it's transient — park, don't die (backend deploy / auth
+                    // migration). See AUTH_RETRY.
+                    let status = resp.status();
+                    let upgrade = resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|b| {
+                            b.get("code")
+                                .and_then(|v| v.as_str())
+                                .map(|c| c == "SC_UPGRADE_REQUIRED")
+                        })
+                        .unwrap_or(false);
+                    state.set_vault_upgrade_required(&vault, upgrade);
+                    if upgrade {
+                        tracing::warn!(vault = %vault, "cloud sync: SC_UPGRADE_REQUIRED — this daemon is too old for the vault format; run `sc upgrade`");
+                    } else {
+                        tracing::warn!(
+                            vault = %vault,
+                            "cloud sync watch: auth rejected (HTTP {}); retrying in {}s",
+                            status,
+                            AUTH_RETRY.as_secs()
+                        );
+                    }
                     tokio::time::sleep(AUTH_RETRY).await;
                 }
                 _ => {
@@ -1676,12 +2274,23 @@ async fn handle_blob_wake_body(
     channel: &str,
 ) -> BlobWake {
     if body.get("status").and_then(|v| v.as_str()) == Some("deleted") {
-        // Drop under the per-vault write lock so the destroy can't race a
-        // concurrent approve.rs / connect write to vault.dat.
-        drop_local_vault_locked(state, vault).await;
-        tracing::info!(vault = %vault, "cloud sync: vault deleted upstream; dropped local state");
-        return BlobWake::Stopped;
+        // §15 leg A: gate the drop (dual-path). Flag OFF (default) → drop as today.
+        // Flag ON → drop only on a verified owner tombstone; else park (keep watching).
+        if tombstone_should_drop(state_dir, vault, body) {
+            // Drop under the per-vault write lock so the destroy can't race a
+            // concurrent approve.rs / connect write to vault.dat.
+            drop_local_vault_locked(state, vault).await;
+            tracing::info!(vault = %vault, "cloud sync: vault deleted upstream (owner-verified); dropped local state");
+            return BlobWake::Stopped;
+        }
+        return BlobWake::Unchanged;
     }
+    // Server-authoritative operational facts (team §4/§9): trust `kind` + advance
+    // the offline-lease clock only from a server signature we can verify against
+    // the pinned key (a fake/MITM server or a tampered cache is ignored); an
+    // unsigned legacy envelope falls back to the plain `kind`. THE continuous
+    // refresh path — long-poll and SSE both land here.
+    apply_verified_envelope(state, vault, body);
     if body
         .get("unchanged")
         .and_then(|v| v.as_bool())
@@ -1755,6 +2364,7 @@ async fn probe_blob_and_handle(
     let resp = client
         .get(&url)
         .bearer_auth(dk)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| ProbeError::Other(format!("reach {}: {}", cloud, e)))?;
@@ -1860,6 +2470,12 @@ struct ItemRow {
     seq: u64,
     /// base64url-nopad of `suite‖nonce‖ct‖tag`.
     ct: String,
+    /// A1.2 per-record signature (base64url, over the ciphertext) + the signer's
+    /// self-id. Absent on legacy/unsigned rows (fmt1 personal / pre-migration).
+    #[serde(default)]
+    sig: Option<String>,
+    #[serde(default)]
+    signer: Option<String>,
 }
 
 /// Load the per-item store for a vault, or `None` if it doesn't exist yet.
@@ -1901,7 +2517,7 @@ fn adopt_item_rows(pv: &mut PerItemVault, rows: &[ItemRow], max_seq: u64) -> Res
         let ct = URL_SAFE_NO_PAD
             .decode(row.ct.as_bytes())
             .map_err(|e| format!("item ct not base64url: {}", e))?;
-        pv.put_raw(row.item_id.clone(), row.version, ct);
+        pv.put_raw_signed(row.item_id.clone(), row.version, ct, row.sig.clone(), row.signer.clone());
         adopted += 1;
     }
     if max_seq > pv.items_seq {
@@ -1919,6 +2535,11 @@ pub async fn pull_items(
     vault: &str,
     device_key: &str,
 ) -> Result<usize, String> {
+    // Personal build: a SHARED (team) vault's content is left to the official
+    // build; never lands on disk here (team-edition §9). Covers every caller.
+    if leave_shared_to_official(vault) {
+        return Ok(0);
+    }
     let Some(mut pv) = read_per_item_store(state_dir, vault) else {
         return Ok(0); // no per-item store yet (vault not enrolled per-item)
     };
@@ -1933,6 +2554,7 @@ pub async fn pull_items(
     let resp = client
         .get(&url)
         .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
@@ -2003,6 +2625,7 @@ pub async fn push_item(
     let resp = client
         .put(&url)
         .bearer_auth(device_key)
+        .dik_pop("PUT", &url, &serde_json::to_vec(&body).unwrap_or_default())
         .json(&body)
         .send()
         .await
@@ -2053,6 +2676,7 @@ pub async fn gc_item(
     let resp = client
         .delete(&url)
         .bearer_auth(device_key)
+        .dik_pop("DELETE", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
@@ -2232,6 +2856,70 @@ struct KeyRowData {
     /// against a build that computes it; absent on older rows.
     #[serde(default)]
     wc_check: Option<String>,
+    /// v2 (UIK) fields — present iff this vault is a `custody → UIK → K` keyset
+    /// (team-shared-vault-security-model.md §5). In v2, `wrapped_key` wraps the
+    /// UIK root (not `K`), and `K` is recovered from the per-credential seal
+    /// below. All four travel together; `uik` is `Some` on the keyset once any
+    /// row carries them. Base64 (lenient-decoded like the other data fields).
+    /// `uik_user_id` = the member's `us_…` account key.
+    #[serde(default)]
+    uik_user_id: Option<String>,
+    /// The member's UIK Ed25519 signing public key (config/role sig verify).
+    #[serde(default)]
+    uik_sig_pub: Option<String>,
+    /// The member's UIK X25519 encryption public key.
+    #[serde(default)]
+    uik_enc_pub: Option<String>,
+    /// HPKE encapsulated key for the K-seal.
+    #[serde(default)]
+    uik_k_encapped: Option<String>,
+    /// HPKE ciphertext = `Seal(K)` to `uik_enc_pub`.
+    #[serde(default)]
+    uik_k_ct: Option<String>,
+    /// This member's role (`"owner"` / `"member"`), an owner-signed attribute on
+    /// the cred (design/identity-uik-aik.md §4.3). Absent on a legacy row ⇒
+    /// defaults to `Member` (least privilege) on adopt.
+    #[serde(default)]
+    uik_role: Option<crate::storage::plaintext::MemberRole>,
+    /// The CREATOR's Ed25519 signature over
+    /// `role_grant_input(vault, user, role, generation)` (base64, raw 64 bytes),
+    /// signed at the keyset `generation` — verified against the pinned
+    /// `uik_creator_sig_pub` at the CURRENT generation to derive the owner-set
+    /// (F3-b generation-binding). Absent on a legacy row ⇒ the cred is not an owner.
+    #[serde(default)]
+    uik_role_sig: Option<String>,
+    /// The vault's ROOT owner (creator) UIK signing pubkey (base64, raw 32 bytes).
+    /// Keyset-LEVEL but carried REDUNDANTLY on every row (like `uik_generation`).
+    /// TOFU-pinned SET-ONCE by the daemon on adopt — first-seen wins, a non-empty
+    /// local pin is NEVER overwritten (a backend can't swap the role anchor).
+    #[serde(default)]
+    uik_creator_sig_pub: Option<String>,
+    /// DP-S1 re-key epoch (team-shared-vault-security-model.md §3.2). Keyset-LEVEL
+    /// but carried REDUNDANTLY on every row of a re-keyed vault (all rows share
+    /// it), mirroring how the uik cred fields ride here. Absent / `0` = gen-0
+    /// (never re-keyed) — the daemon then treats the vault as gen 0 (additive).
+    #[serde(default)]
+    uik_generation: Option<u64>,
+    /// The owner-signed proof authorizing the current `uik_generation` (present iff
+    /// generation > 0). JSON `{generation, k_commitment(b64), sig(b64), signer_id}`
+    /// — the daemon decodes it into a `RekeyProof` and refuses to fold a re-keyed
+    /// keyset whose proof is missing/invalid (`verify_rekey_proof`).
+    #[serde(default)]
+    uik_rekey_proof: Option<serde_json::Value>,
+    /// The append-only owner-signed DELEGATION LOG (any-owner add/promote/demote/remove
+    /// since the last checkpoint) — keyset-LEVEL, carried REDUNDANTLY on every row like
+    /// the anchor + generation. JSON array of `DelegationEvent` (sig as STANDARD b64).
+    /// Adopted as an append-only UNION (`adopt_delegation_meta`); the authoritative
+    /// owner-set is re-derived from signatures in `fold_owner_set`. Absent on a
+    /// gen-0 / no-delegation vault.
+    #[serde(default)]
+    uik_delegation_log: Option<serde_json::Value>,
+    /// The root-succession + compaction chain (`RootSuccession` array, JSON; pubkey/sig
+    /// as STANDARD b64) — the root-signed source of BOTH the current root and the
+    /// derived `role_epoch`. Carried REDUNDANTLY on every row; adopted as an append-only
+    /// union. Absent = the creator is still the genesis root at epoch 0.
+    #[serde(default)]
+    uik_root_succession: Option<serde_json::Value>,
 }
 
 /// Pull keyset rows changed since the local `.keyset_seq` cursor and adopt them
@@ -2253,6 +2941,11 @@ pub async fn pull_keys(
     vault: &str,
     device_key: &str,
 ) -> Result<usize, String> {
+    // Personal build: a SHARED (team) vault's keyset is left to the official
+    // build; never lands on disk here (team-edition §9). Covers every caller.
+    if leave_shared_to_official(vault) {
+        return Ok(0);
+    }
     // Create an empty per-item store on demand so a device that pulls keys
     // before it has ever seeded items still ends up with a keyset on disk.
     let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
@@ -2268,12 +2961,17 @@ pub async fn pull_keys(
     let resp = client
         .get(&url)
         .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
     match resp.status().as_u16() {
         200 => {}
         404 => return Ok(0), // /keys not live yet — no-op
+        // fmt>=2 vault: the backend serves the end-to-end verify(anchor, members, proof)
+        // TRIPLE at /membership, not row-shaped /keys. Route there. Legacy fmt=1 personal
+        // vaults keep the row path below (single request, unchanged).
+        409 => return pull_membership(state_dir, cloud, vault, device_key, false).await,
         401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
         other => return Err(format!("keys GET HTTP {}", other)),
     }
@@ -2292,12 +2990,200 @@ pub async fn pull_keys(
         .get("seq")
         .and_then(|v| v.as_u64())
         .unwrap_or(pv.keyset_seq);
-    let adopted = adopt_key_rows(&mut pv, &rows)?;
+    let adopted = adopt_key_rows(&mut pv, vault, &rows)?;
     if max_seq > pv.keyset_seq {
         pv.keyset_seq = max_seq;
     }
     // Persist even a zero-adopt pull so the advanced cursor sticks.
     write_per_item_store(state_dir, vault, &pv)?;
+    Ok(adopted)
+}
+
+/// Pull a fmt=2 vault's `verify(anchor, members, proof)` TRIPLE from `GET /v/{vid}/membership`
+/// and adopt it into the keyset (unified-identity-schema.md §3). The end-to-end counterpart
+/// of `pull_keys`: the WIRE is the triple (no row format), but the in-memory keyset it builds
+/// is byte-identical to what `adopt_key_rows` builds (same fold, same unlock). `since` =
+/// `keyset_seq` cursor, shared with `pull_keys` (a fmt=2 vault only ever reaches here after
+/// the initial `/keys` 409). A `keyset_seq`-only reply (nothing new) or a null-anchor reply
+/// (vault not bootstrapped yet) adopts nothing but still advances the cursor.
+async fn pull_membership(
+    state_dir: &Path,
+    cloud: &str,
+    vault: &str,
+    device_key: &str,
+    force_full: bool,
+) -> Result<usize, String> {
+    // Personal build: a SHARED (team) vault's membership triple is left to the
+    // official build; never lands on disk here (team-edition §9).
+    if leave_shared_to_official(vault) {
+        return Ok(0);
+    }
+    let mut pv = read_per_item_store(state_dir, vault).unwrap_or_else(empty_keyset_store);
+    // The `keyset_seq` cursor is per-FORMAT: the v1 `/keys` sequence and the v2
+    // `/membership` `keyset_seq` are DIFFERENT counters. On a fmt1→fmt2 MIGRATION the
+    // local cursor is still the v1 value (often far ahead of the fresh membership's
+    // seq), so a since-delta would reply "nothing new" and the triple would never land
+    // — the daemon would stay stuck on its stale v1 keyset. Detect the first v2 pull
+    // (local keyset has no `uik` yet) and pull the FULL triple from `since=0`, then
+    // adopt the membership's OWN seq (even if numerically lower than the old v1 cursor).
+    let first_v2 = pv.keyset.uik.is_none();
+    // `force_full` (the approve self-heal path) pulls the WHOLE triple from
+    // since=0: an out-of-band x/y backfill on an already-synced membership does
+    // NOT bump keyset_seq, so a delta pull replies "nothing new" and never
+    // refreshes the registry. A full pull re-adopts the triple (incl. each
+    // credential's x/y) so `credential_lookup` stops missing it.
+    let since = if first_v2 || force_full { 0 } else { pv.keyset_seq };
+    let url = format!(
+        "{}/v/{}/membership?since={}",
+        cloud.trim_end_matches('/'),
+        vault,
+        since
+    );
+    let client = crate::cli::egress_proxy::client(Duration::from_secs(15))
+        .map_err(|e| format!("http client init: {}", e))?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
+        .send()
+        .await
+        .map_err(|e| format!("reach {}: {}", cloud, e))?;
+    match resp.status().as_u16() {
+        200 => {}
+        404 => return Ok(0), // /membership not live yet — no-op
+        401 | 403 => return Err(format!("cloud auth rejected (HTTP {})", resp.status())),
+        other => return Err(format!("membership GET HTTP {}", other)),
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse membership response: {}", e))?;
+    let max_seq = body
+        .get("keyset_seq")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(pv.keyset_seq);
+    // A since-delta "nothing new" reply carries only keyset_seq; a pre-bootstrap vault
+    // carries a null anchor. Either way there is no triple to adopt — just advance the cursor.
+    let adopted = match body.get("anchor").and_then(|v| v.as_str()) {
+        Some(anchor) if !anchor.is_empty() => adopt_membership_triple(&mut pv, vault, anchor, &body)?,
+        _ => 0,
+    };
+    if first_v2 {
+        // Switching from the v1 `/keys` cursor to the v2 `/membership` sequence: adopt
+        // the membership's seq outright (the usual monotonic guard would keep the stale,
+        // higher v1 value and freeze out future v2 deltas).
+        pv.keyset_seq = max_seq;
+    } else if max_seq > pv.keyset_seq {
+        pv.keyset_seq = max_seq;
+    }
+    write_per_item_store(state_dir, vault, &pv)?;
+    Ok(adopted)
+}
+
+/// Adopt a `verify(anchor, members, proof)` membership TRIPLE (fmt=2, end-to-end) into the
+/// in-memory keyset — the daemon-side equivalent of `adopt_key_rows`, fed from the triple
+/// instead of per-cred rows. It reuses the SAME keyset writers (`adopt_creator_pin` /
+/// `set_uik_cred_b64` / `adopt_delegation_meta` / `adopt_rekey_meta`) in the SAME order, so
+/// the fold + unlock + golden vectors stay byte-identical; ONLY the source of the fields
+/// changes. The daemon's OWN member is keyed under its credential cid(s) (so v2 unlock's
+/// `uik.creds[own_cid]` lookup finds the K-seal); OTHER members are keyed under their `us_…`
+/// id (the fold iterates `creds.values()` — the map key is irrelevant there).
+fn adopt_membership_triple(
+    pv: &mut PerItemVault,
+    vault_id: &str,
+    anchor_b64: &str,
+    body: &serde_json::Value,
+) -> Result<usize, String> {
+    // Creator (root) anchor — TOFU-pinned set-once (reused helper).
+    adopt_creator_pin(pv, &Some(anchor_b64.to_string()))
+        .map_err(|e| format!("adopt creator pin: {}", e))?;
+
+    // The caller's OWN credentials: identity_id → [cid]. The daemon keys its own member's
+    // seal under these cids so the grant's credential_id resolves at v2 unlock.
+    let mut cids_by_member: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    if let Some(creds) = body.get("credentials").and_then(|v| v.as_array()) {
+        for c in creds {
+            if let (Some(cid), Some(idid)) = (
+                c.get("cid").and_then(|v| v.as_str()),
+                c.get("identity_id").and_then(|v| v.as_str()),
+            ) {
+                cids_by_member
+                    .entry(idid.to_string())
+                    .or_default()
+                    .push(cid.to_string());
+            }
+            // Adopt this credential's WebAuthn pubkey (x/y) into the registry so the
+            // daemon can VERIFY its approve/unlock assertion — `uik.creds` carries the
+            // K-seal but NOT the ES256 pubkey, so without this a v2 tap fails with
+            // "unknown credential". Own creds only (the serve returns the caller's own).
+            if let (Some(cid), Some(x), Some(y)) = (
+                c.get("cid").and_then(|v| v.as_str()),
+                c.get("x").and_then(|v| v.as_str()),
+                c.get("y").and_then(|v| v.as_str()),
+            ) {
+                let dn = c.get("device_name").and_then(|v| v.as_str()).unwrap_or("");
+                pv.set_registry_pubkey(cid, x, y, dn)
+                    .map_err(|e| format!("adopt registry pubkey {}: {}", cid, e))?;
+            }
+        }
+    }
+
+    let (Some(members), Some(identities)) = (
+        body.get("members").and_then(|v| v.as_object()),
+        body.get("identities").and_then(|v| v.as_object()),
+    ) else {
+        return Ok(0); // an anchor with no members/identities seats nobody
+    };
+
+    let mut adopted = 0usize;
+    for (id, m) in members {
+        let ident = identities.get(id);
+        // The FOLD self-certifies a checkpoint on `sig_pub` + `role_sig` (authority), NOT on
+        // K-delivery — so seat a cred whenever `sig_pub` is present, defaulting the delivery
+        // fields (enc_pub / k_encapped / k_ct) to empty when absent. Those are used only to
+        // UNLOCK the daemon's OWN cred (which always carries them); for other members they are
+        // inert. This matches the backend/frontend fold (which seat from sig_pub+role_sig
+        // alone) so the owner-set is identical across all three even for a member whose
+        // nullable `enc_pub` / K fields are missing. A member with no `sig_pub` can't be
+        // self-certified → skip (fail-closed); the delegation log still folds them from sigs.
+        let Some(sig_pub) = ident.and_then(|i| i.get("sig_pub")).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let enc_pub = ident.and_then(|i| i.get("enc_pub")).and_then(|v| v.as_str()).unwrap_or("");
+        let k_encapped = m.get("k_encapped").and_then(|v| v.as_str()).unwrap_or("");
+        let k_ct = m.get("k_ct").and_then(|v| v.as_str()).unwrap_or("");
+        // A bad/absent role token degrades to Member (least privilege) — NEVER `?`-fail the
+        // whole pull (that would leave the keyset stale), matching the frontend's coercion.
+        let role: crate::storage::plaintext::MemberRole = m
+            .get("role")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let role_sig = m.get("role_sig").and_then(|v| v.as_str()).unwrap_or("");
+        // Key the OWN member under its credential cid(s); OTHER members under their us_id.
+        let keys: Vec<String> = match cids_by_member.get(id) {
+            Some(cids) if !cids.is_empty() => cids.clone(),
+            _ => vec![id.clone()],
+        };
+        for key in keys {
+            pv.set_uik_cred_b64(&key, id, sig_pub, enc_pub, k_encapped, k_ct, role, role_sig)
+                .map_err(|e| format!("adopt uik seal {}: {}", id, e))?;
+        }
+        adopted += 1;
+    }
+
+    // Keyset-level delegation state + re-key meta (reused helpers, SAME order as adopt_key_rows:
+    // creds+anchor first, then delegation, then the verify-before-ratchet re-key gate).
+    let proof = body.get("proof");
+    let delegation_log = proof.and_then(|p| p.get("delegation_log")).cloned();
+    let root_succession = proof.and_then(|p| p.get("succession")).cloned();
+    adopt_delegation_meta(pv, vault_id, &delegation_log, &root_succession)
+        .map_err(|e| format!("adopt delegation meta: {}", e))?;
+    let generation = proof.and_then(|p| p.get("generation")).and_then(|v| v.as_u64());
+    let rekey_proof = proof.and_then(|p| p.get("rekey_proof")).cloned();
+    adopt_rekey_meta(pv, vault_id, generation, &rekey_proof)
+        .map_err(|e| format!("adopt rekey meta: {}", e))?;
     Ok(adopted)
 }
 
@@ -2312,6 +3198,9 @@ fn empty_keyset_store() -> PerItemVault {
             registry: Registry::new(),
             credentials: Vec::new(),
             keyset_version: 0,
+            // Filled from cloud `/keys` rows by `pull_keys`; the UIK layer (if the
+            // vault is v2) is adopted alongside the credential rows.
+            uik: None,
         },
         items: std::collections::BTreeMap::new(),
         items_seq: 0,
@@ -2324,7 +3213,7 @@ fn empty_keyset_store() -> PerItemVault {
 /// skipped (guards a stale replay within one response); across pulls, the
 /// `keyset_seq` cursor gates re-delivery. Each adopted row upserts the registry
 /// pubkey + the `SealedCredential`. Returns the count adopted.
-fn adopt_key_rows(pv: &mut PerItemVault, rows: &[KeyRow]) -> Result<usize, String> {
+fn adopt_key_rows(pv: &mut PerItemVault, vault_id: &str, rows: &[KeyRow]) -> Result<usize, String> {
     // Track the max version seen per cid in this batch so an out-of-order pair
     // (same cid, v3 then v2) adopts only the newer.
     let mut seen: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
@@ -2334,7 +3223,15 @@ fn adopt_key_rows(pv: &mut PerItemVault, rows: &[KeyRow]) -> Result<usize, Strin
     // but defend in depth).
     let mut ordered: Vec<&KeyRow> = rows.iter().collect();
     ordered.sort_by_key(|r| r.version);
-    for row in ordered {
+    // PASS 1 — apply every row's credential material + creator anchor FIRST. The
+    // re-key gate in PASS 2 (`adopt_rekey_meta`, verify-before-ratchet) confirms
+    // the owner-signed generation bump against the owner-set AT the PROPOSED
+    // generation `G`; a legit re-key re-signs every surviving role grant at `G` and
+    // rides them on THESE same rows, so ALL grants must be in place before the gate
+    // runs — otherwise a genuine bump's signer would not yet be a confirmable
+    // owner @G. (Confirmed ordering: cred/anchor adoption strictly precedes the
+    // re-key-meta adoption.)
+    for row in &ordered {
         if let Some(&v) = seen.get(row.cid.as_str()) {
             if row.version <= v {
                 continue;
@@ -2350,10 +3247,332 @@ fn adopt_key_rows(pv: &mut PerItemVault, rows: &[KeyRow]) -> Result<usize, Strin
             row.data.wc_check.as_deref(),
         )
         .map_err(|e| format!("adopt key row {}: {}", row.cid, e))?;
+        // v2 (UIK) keyset: adopt the per-credential K-seal riding in the same row
+        // (all four fields travel together; a partial set = a malformed row we
+        // skip the UIK adoption for rather than store a half seal).
+        if let (Some(uid), Some(sig), Some(enc), Some(encapped), Some(ct)) = (
+            row.data.uik_user_id.as_deref(),
+            row.data.uik_sig_pub.as_deref(),
+            row.data.uik_enc_pub.as_deref(),
+            row.data.uik_k_encapped.as_deref(),
+            row.data.uik_k_ct.as_deref(),
+        ) {
+            // Role rides the SAME record (SSOT): a missing role token defaults to
+            // Member (least privilege), a missing signature leaves the cred a
+            // non-owner (fails `resolve_membership_trust`'s verify).
+            let role = row.data.uik_role.unwrap_or_default();
+            let role_sig = row.data.uik_role_sig.as_deref().unwrap_or("");
+            pv.set_uik_cred_b64(&row.cid, uid, sig, enc, encapped, ct, role, role_sig)
+                .map_err(|e| format!("adopt uik seal {}: {}", row.cid, e))?;
+        }
+        // The vault's ROOT owner (creator) anchor — keyset-LEVEL, carried per row.
+        // TOFU-pinned SET-ONCE (first-seen wins; never overwrite a non-empty pin).
+        adopt_creator_pin(pv, &row.data.uik_creator_sig_pub)
+            .map_err(|e| format!("adopt creator pin {}: {}", row.cid, e))?;
         seen.insert(row.cid.as_str(), row.version);
         adopted += 1;
     }
+    // PASS 2a — with ALL creds + the creator anchor now in place, adopt the
+    // keyset-LEVEL DELEGATION state (append-only union of the owner-signed event log
+    // and the root-succession/compaction chain). Done BEFORE the re-key gate so the
+    // owner-set the re-key gate folds is already current. It rides REDUNDANTLY on
+    // every row; union+dedup makes per-row application idempotent.
+    for row in &ordered {
+        adopt_delegation_meta(
+            pv,
+            vault_id,
+            &row.data.uik_delegation_log,
+            &row.data.uik_root_succession,
+        )
+        .map_err(|e| format!("adopt delegation meta {}: {}", row.cid, e))?;
+    }
+    // PASS 2b — adopt the keyset-LEVEL DP-S1 re-key metadata (`generation` +
+    // owner-signed proof). Monotonic + owner-signature-gated (the owner-set is now
+    // folded over the just-adopted delegation state); only a strictly-higher
+    // generation carrying a VALID owner-signed proof advances the local ratchet.
+    for row in &ordered {
+        adopt_rekey_meta(
+            pv,
+            vault_id,
+            row.data.uik_generation,
+            &row.data.uik_rekey_proof,
+        )
+        .map_err(|e| format!("adopt rekey meta {}: {}", row.cid, e))?;
+    }
     Ok(adopted)
+}
+
+/// TOFU-pin the vault's ROOT owner (creator) UIK signing pubkey onto the keyset
+/// (design/identity-uik-aik.md §4.3 — the owner-authority genesis anchor).
+/// FIRST-SEEN WINS: adopt `creator_sig_pub` only when the local copy is empty;
+/// NEVER overwrite a non-empty pin. A colluding backend could otherwise serve a
+/// keyset claiming a DIFFERENT creator pubkey to forge an owner-set (self-promote
+/// via a key it controls); pinning set-once makes the anchor immutable after the
+/// first successful adopt (mirrors `adopt_rekey_meta`'s monotonic generation
+/// rule). An empty / absent value is a no-op (a legacy row carries no anchor).
+fn adopt_creator_pin(
+    pv: &mut PerItemVault,
+    creator_sig_pub_b64: &Option<String>,
+) -> Result<(), String> {
+    let Some(b64) = creator_sig_pub_b64.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let pub_bytes =
+        pv_store::decode_keys_data_field(b64).map_err(|e| format!("creator_sig_pub: {}", e))?;
+    if pub_bytes.is_empty() {
+        return Ok(());
+    }
+    let uik = pv
+        .keyset
+        .uik
+        .get_or_insert_with(pv_store::KeysetUik::default);
+    // Set-once: a non-empty pin is the immutable genesis anchor; leave it.
+    if uik.creator_sig_pub.is_empty() {
+        uik.creator_sig_pub = pub_bytes;
+    }
+    Ok(())
+}
+
+/// Adopt a `/keys` row's keyset-LEVEL DELEGATION state — the append-only
+/// `delegation_log` (owner-signed add/promote/demote/remove events) and the
+/// `root_succession` chain (root transfers + compactions, the derived-`role_epoch`
+/// source). Both are keyset-wide (carried REDUNDANTLY on every row, like the anchor
+/// and generation) and APPEND-ONLY: the daemon UNIONS incoming entries into its local
+/// copy and NEVER shrinks it, so a colluding server serving a stale/shorter set can't
+/// roll back the owner-set — rollback-safety BY CONSTRUCTION. Unlike `generation`
+/// (a stored scalar gating K selection, hence verify-before-ratchet), the owner-set is
+/// RE-DERIVED from signatures every fold ([`SealedVault::fold_owner_set`] /
+/// `resolve_current_root`), so a forged event/cert adopted here is simply INERT — the
+/// fold ignores it. Adopt only screens for well-formedness (32-byte pubkeys / 64-byte
+/// sigs) + de-duplicates, to keep a re-delivered row from growing the log unboundedly.
+/// A vault with no UIK layer (v1) is a no-op.
+fn adopt_delegation_meta(
+    pv: &mut PerItemVault,
+    vault_id: &str,
+    delegation_log: &Option<serde_json::Value>,
+    root_succession: &Option<serde_json::Value>,
+) -> Result<(), String> {
+    if pv.keyset.uik.is_none() {
+        return Ok(()); // v1 / no UIK layer — nothing to adopt
+    }
+    // ── Root-succession / compaction chain (append-only union) ──
+    if let Some(v) = root_succession {
+        let incoming: Vec<sealed_vault::RootSuccession> = serde_json::from_value(v.clone())
+            .map_err(|e| format!("parse root_succession: {}", e))?;
+        let uik = pv.keyset.uik.as_mut().unwrap();
+        for s in incoming {
+            // Storage hygiene: keep only well-formed certs (32-byte pubkey, 64-byte
+            // sig). Whether the cert actually chains from the current root is decided
+            // at fold time by `resolve_current_root` — a garbage cert stored here is
+            // inert (never advances the root).
+            if <[u8; 32]>::try_from(s.new_root_sig_pub.as_slice()).is_err()
+                || <[u8; 64]>::try_from(s.sig.as_slice()).is_err()
+            {
+                continue;
+            }
+            let dup = uik.root_succession.iter().any(|e| {
+                e.old_root_id == s.old_root_id
+                    && e.new_root_id == s.new_root_id
+                    && e.role_epoch == s.role_epoch
+                    && e.sig == s.sig
+            });
+            if !dup {
+                uik.root_succession.push(s);
+            }
+        }
+    }
+    // ── Delegation log (append-only union) ──
+    if let Some(v) = delegation_log {
+        let incoming: Vec<sealed_vault::DelegationEvent> = serde_json::from_value(v.clone())
+            .map_err(|e| format!("parse delegation_log: {}", e))?;
+        let uik = pv.keyset.uik.as_mut().unwrap();
+        for e in incoming {
+            // SIG-VERIFY-AT-ADOPT: only store an event that SELF-VERIFIES — its inline
+            // `granter_sig_pub` derives to `granter_id` AND its signature checks out.
+            // (Enabled by the self-certifying inline key.) This keeps a colluding
+            // server from bloating the log with well-formed junk events that every
+            // later fold would re-verify (a sticky CPU DoS), and stops a junk event
+            // from ever entering the fold to contend for a seq slot. The AUTHORITY
+            // check — granter is an Owner in the fold — still happens at fold time
+            // (it needs the full owner-set context).
+            let Ok(granter_pub) = <[u8; 32]>::try_from(e.granter_sig_pub.as_slice()) else {
+                continue;
+            };
+            if crate::identity::derive_id(crate::identity::IdKind::User, &granter_pub)
+                != e.granter_id
+            {
+                continue;
+            }
+            let Ok(sig) = <[u8; 64]>::try_from(e.sig.as_slice()) else {
+                continue;
+            };
+            let role_tok = if e.op == "remove" {
+                ""
+            } else {
+                crate::storage::sealed_vault::role_str(e.role)
+            };
+            let input = crate::identity::delegation_event_input(
+                vault_id,
+                &e.op,
+                &e.subject_id,
+                role_tok,
+                &e.granter_id,
+                e.seq,
+                e.role_epoch,
+            );
+            if !crate::identity::verify(&granter_pub, &input, &sig) {
+                continue; // signature does not self-verify → junk, do not store
+            }
+            let dup = uik.delegation_log.iter().any(|x| {
+                x.op == e.op
+                    && x.subject_id == e.subject_id
+                    && x.granter_id == e.granter_id
+                    && x.seq == e.seq
+                    && x.role_epoch == e.role_epoch
+                    && x.sig == e.sig
+            });
+            if !dup {
+                uik.delegation_log.push(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply a `/keys` row's keyset-LEVEL DP-S1 re-key metadata onto the keyset's UIK
+/// layer: `generation` + the owner-signed `RekeyProof`. Both are keyset-wide (a
+/// re-keyed vault repeats them on every row). VERIFY-BEFORE-RATCHET: a
+/// strictly-higher proposed generation `G` advances the local monotonic
+/// generation (and stores the proof) ONLY when the accompanying proof is present,
+/// is FOR `G`, and is signed by an OWNER in the current folded owner-set
+/// ([`PerItemVault::fold_owner_set`]) with a valid signature over
+/// [`crate::identity::rekey_sig_input`]. Otherwise the higher generation is
+/// IGNORED (neither `generation` nor `rekey_proof` change) — this is what stops a
+/// current member forging `uik_generation: 999` with no valid owner proof from
+/// ratcheting the fleet into the fold-time `verify_rekey_proof` `Unauthorized`
+/// brick (a sticky DoS). `fold_view`'s `verify_rekey_proof` keeps the additional
+/// k_commitment↔real-K binding check (defense in depth). A row with no / `0`
+/// generation leaves the keyset untouched (gen-0 vaults never carry them → stay
+/// gen 0, additive).
+fn adopt_rekey_meta(
+    pv: &mut PerItemVault,
+    vault_id: &str,
+    generation: Option<u64>,
+    proof: &Option<serde_json::Value>,
+) -> Result<(), String> {
+    let Some(generation) = generation.filter(|g| *g > 0) else {
+        return Ok(());
+    };
+    // DP-S1 generation is a MONOTONIC ratchet: only CONSIDER a STRICTLY HIGHER
+    // generation. A malicious backend could otherwise serve an OLDER keyset (with
+    // its genuine, still-valid older proof) to roll a daemon's generation BACKWARD
+    // and undo a forward-secret re-key. A generation `<=` what we already hold is
+    // ignored — we overwrite NEITHER `generation` NOR `rekey_proof`. (A stale/equal
+    // adopt short-circuits here BEFORE the signature work below.)
+    let current = pv.keyset.uik.as_ref().map(|u| u.generation).unwrap_or(0);
+    if generation <= current {
+        return Ok(());
+    }
+    // VERIFY-BEFORE-RATCHET (HIGH-severity generation-ratchet DoS fix). The old
+    // code ratcheted `generation` on UNVERIFIED input — it stored ANY higher
+    // proposed generation and deferred the owner-signature check to fold-time
+    // `verify_rekey_proof`. A current MEMBER could then PUT its own keyset row with
+    // `uik_generation: 999` and no valid proof; every daemon pulled it, advanced to
+    // 999, and `verify_rekey_proof` then failed → `fold_view` returned
+    // `Unauthorized` → EVERY request for the vault was denied (a sticky fleet
+    // brick). We now REQUIRE a valid owner-signed proof AT the proposed generation
+    // `G` BEFORE advancing: a forged bump is IGNORED (local generation untouched),
+    // so the fleet never ratchets into the fold-time brick. The k_commitment↔real-K
+    // binding stays at fold-time `verify_rekey_proof` (K isn't available here) —
+    // defense in depth.
+    let Some(p) = proof.as_ref() else {
+        return Ok(()); // higher generation with NO proof = a forged bump → ignore
+    };
+    // The proof must be FOR generation `G` (not a valid proof for some other gen
+    // spliced onto a `G` claim).
+    if p.get("generation").and_then(|v| v.as_u64()) != Some(generation) {
+        return Ok(());
+    }
+    let signer_id = p
+        .get("signer_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let k_commitment = p
+        .get("k_commitment")
+        .and_then(|v| v.as_str())
+        .map(pv_store::decode_keys_data_field)
+        .transpose()
+        .map_err(|e| format!("k_commitment: {}", e))?
+        .unwrap_or_default();
+    let sig_bytes = p
+        .get("sig")
+        .and_then(|v| v.as_str())
+        .map(pv_store::decode_keys_data_field)
+        .transpose()
+        .map_err(|e| format!("sig: {}", e))?
+        .unwrap_or_default();
+    // Membership anti-rollback commitment (Part 2): the re-key proof binds the
+    // delegation-log prefix current at re-key time (owner-signed). Absent/0 = empty.
+    let membership_len = p.get("membership_len").and_then(|v| v.as_u64()).unwrap_or(0);
+    let membership_hash = p
+        .get("membership_hash")
+        .and_then(|v| v.as_str())
+        .map(pv_store::decode_keys_data_field)
+        .transpose()
+        .map_err(|e| format!("membership_hash: {}", e))?
+        .unwrap_or_default();
+    let Ok(sig) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
+        return Ok(()); // malformed signature → ignore (don't ratchet)
+    };
+    // The signer must be an OWNER in the CURRENT folded owner-set. A K-rotation
+    // (`generation` bump) is ORTHOGONAL to the role checkpoint (`role_epoch`) under
+    // the two-counter model, so the owner-set is folded at the current role_epoch
+    // (checkpoint ∘ delegation_log), NOT re-derived at the proposed `generation`. A
+    // member's self-signed proof fails here (a member is not an owner).
+    if pv.fold_owner_set(vault_id).get(&signer_id)
+        != Some(&crate::storage::plaintext::MemberRole::Owner)
+    {
+        return Ok(());
+    }
+    // The signer's published sig pubkey (C.1 anchor): a keyset cred whose derived
+    // id matches `signer_id` — a backend-minted key isn't in the keyset.
+    let signer_pub: Option<[u8; 32]> = pv.keyset.uik.as_ref().and_then(|uik| {
+        uik.creds.values().find_map(|c| {
+            let a = <[u8; 32]>::try_from(c.sig_pub.as_slice()).ok()?;
+            (crate::identity::derive_id(crate::identity::IdKind::User, &a) == signer_id)
+                .then_some(a)
+        })
+    });
+    let Some(signer_pub) = signer_pub else {
+        return Ok(());
+    };
+    let input = crate::identity::rekey_sig_input(
+        vault_id,
+        generation,
+        &k_commitment,
+        &signer_id,
+        membership_len,
+        &membership_hash,
+    );
+    if !crate::identity::verify(&signer_pub, &input, &sig) {
+        return Ok(()); // signature does not verify → forged bump → ignore
+    }
+    // Verified owner-signed proof at `G`: NOW ratchet forward + store the proof.
+    let uik = pv
+        .keyset
+        .uik
+        .get_or_insert_with(pv_store::KeysetUik::default);
+    uik.generation = generation;
+    uik.rekey_proof = Some(pv_store::RekeyProof {
+        generation,
+        k_commitment,
+        sig: sig_bytes,
+        signer_id,
+        membership_len,
+        membership_hash,
+    });
+    Ok(())
 }
 
 /// Push the daemon's keyset credentials ahead of the cloud after a daemon-side
@@ -2370,6 +3589,96 @@ fn adopt_key_rows(pv: &mut PerItemVault, rows: &[KeyRow]) -> Result<usize, Strin
 /// `pull_keys` to refresh, read the freshest local keyset, and PUT each credential
 /// at `version = pulled+1` with `base_version = pulled` — a 409 means someone
 /// else moved it, so we re-pull and stop (best-effort; local keyset is durable).
+/// Build one `/keys` row's `data` JSON for a credential, byte-compatible with the
+/// frontend `VaultKeyData`. Carries the passkey-wrap material (x/y/device_name/
+/// prf_salt/wrapped_key, STANDARD base64 for the byte fields to match `toBase64`),
+/// the optional KCV, the v2 (UIK) per-credential K-seal VERBATIM (the daemon can't
+/// reconstruct another member's seal — that needs their root — so it forwards
+/// exactly what it adopted), AND the keyset-LEVEL DP-S1 re-key metadata
+/// (`uik_generation` + `uik_rekey_proof`) emitted REDUNDANTLY on EVERY row of a
+/// re-keyed vault (all rows share them, mirroring the uik cred fields). Returns
+/// `None` when the credential has no registry pubkey (can't form a complete row).
+fn key_row_data_for(
+    pv: &PerItemVault,
+    cred: &sudp::state::SealedCredential,
+) -> Option<serde_json::Value> {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::Engine;
+    let cid_b64 = URL_SAFE_NO_PAD.encode(&cred.credential_id);
+    // Pull the registry pubkey for x/y/device_name; keep x/y verbatim (they are
+    // already the strings the frontend wrote — std-base64).
+    let pk = pv
+        .keyset
+        .registry
+        .get::<sudp::passkey::WebAuthn>(&cred.credential_id)
+        .ok()
+        .flatten()?;
+    let mut data = serde_json::json!({
+        "x": pk.x,
+        "y": pk.y,
+        "device_name": pk.device_name,
+        "prf_salt": STANDARD.encode(&cred.prf_salt),
+        "wrapped_key": STANDARD.encode(&cred.wrapped_key),
+    });
+    // Optional KCV cloud-side (STANDARD base64) so other devices / later pulls see
+    // it. Omitted entirely when absent.
+    if let Some(v) = &cred.wc_check {
+        data["wc_check"] = serde_json::Value::String(STANDARD.encode(v));
+    }
+    // v2 (UIK) keyset: carry this credential's K-seal VERBATIM (owner-authored;
+    // the daemon only transports it).
+    if let Some(entry) = pv.uik_cred(&cid_b64) {
+        data["uik_user_id"] = serde_json::Value::String(entry.user_id.clone());
+        data["uik_sig_pub"] = serde_json::Value::String(STANDARD.encode(&entry.sig_pub));
+        data["uik_enc_pub"] = serde_json::Value::String(STANDARD.encode(&entry.enc_pub));
+        data["uik_k_encapped"] = serde_json::Value::String(STANDARD.encode(&entry.k_encapped));
+        data["uik_k_ct"] = serde_json::Value::String(STANDARD.encode(&entry.k_ct));
+        // Owner-signed role attribute on the SAME record (SSOT). The role token
+        // always travels; the signature only when present (a legacy cred has none).
+        data["uik_role"] = serde_json::to_value(entry.role).unwrap_or(serde_json::Value::Null);
+        if !entry.role_sig.is_empty() {
+            data["uik_role_sig"] = serde_json::Value::String(STANDARD.encode(&entry.role_sig));
+        }
+    }
+    // Keyset-LEVEL role anchor + DP-S1 re-key metadata (both emitted REDUNDANTLY on
+    // EVERY row). The creator pubkey rides once pinned; a gen-0 vault carries no
+    // re-key fields, so the daemon reads it as gen 0.
+    if let Some(uik) = pv.keyset.uik.as_ref() {
+        if !uik.creator_sig_pub.is_empty() {
+            data["uik_creator_sig_pub"] =
+                serde_json::Value::String(STANDARD.encode(&uik.creator_sig_pub));
+        }
+        if uik.generation > 0 {
+            data["uik_generation"] = serde_json::json!(uik.generation);
+            if let Some(proof) = uik.rekey_proof.as_ref() {
+                data["uik_rekey_proof"] = serde_json::json!({
+                    "generation": proof.generation,
+                    "k_commitment": STANDARD.encode(&proof.k_commitment),
+                    "sig": STANDARD.encode(&proof.sig),
+                    "signer_id": proof.signer_id,
+                    "membership_len": proof.membership_len,
+                    "membership_hash": STANDARD.encode(&proof.membership_hash),
+                });
+            }
+        }
+        // Keyset-LEVEL delegation state (append-only): the owner-signed event log and
+        // the root-succession/compaction chain. Emitted VERBATIM (serde → the same
+        // STANDARD-b64 wire the browser writes and the daemon adopts) and only when
+        // non-empty, so a gen-0 / no-delegation vault carries neither field.
+        if !uik.delegation_log.is_empty() {
+            if let Ok(v) = serde_json::to_value(&uik.delegation_log) {
+                data["uik_delegation_log"] = v;
+            }
+        }
+        if !uik.root_succession.is_empty() {
+            if let Ok(v) = serde_json::to_value(&uik.root_succession) {
+                data["uik_root_succession"] = v;
+            }
+        }
+    }
+    Some(data)
+}
+
 pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
     let Ok(cfg) = active::load() else { return };
     let Some(cloud) = cfg.cloud_backend.as_deref().filter(|s| !s.is_empty()) else {
@@ -2397,36 +3706,14 @@ pub async fn push_keys_best_effort(state: &Arc<AppState>, vault_id: &str) {
 
     // Snapshot the credentials (cid_b64, keyData) so we don't hold the store
     // across awaits. Build each row's `data` byte-compatible with the frontend.
-    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
     for cred in &pv.keyset.credentials {
         let cid_b64 = URL_SAFE_NO_PAD.encode(&cred.credential_id);
-        // Pull the registry pubkey for x/y/device_name; keep x/y verbatim (they
-        // are already the strings the frontend wrote — std-base64).
-        let pk = match pv
-            .keyset
-            .registry
-            .get::<sudp::passkey::WebAuthn>(&cred.credential_id)
-        {
-            Ok(Some(pk)) => pk,
-            _ => continue, // no registry entry — can't form a complete row
+        let Some(data) = key_row_data_for(&pv, cred) else {
+            continue; // no registry entry — can't form a complete row
         };
-        let mut data = serde_json::json!({
-            "x": pk.x,
-            "y": pk.y,
-            "device_name": pk.device_name,
-            // Encode wrap material as STANDARD base64 to match the frontend
-            // (`toBase64`); its `fromBase64` accepts either, but match for
-            // cleanliness. NEVER url here for these two.
-            "prf_salt": STANDARD.encode(&cred.prf_salt),
-            "wrapped_key": STANDARD.encode(&cred.wrapped_key),
-        });
-        // Carry the optional KCV cloud-side (STANDARD base64) so other devices
-        // and later pulls see it. Omitted entirely when absent.
-        if let Some(v) = &cred.wc_check {
-            data["wc_check"] = serde_json::Value::String(STANDARD.encode(v));
-        }
         rows.push((cid_b64, data));
     }
 
@@ -2472,6 +3759,7 @@ async fn fetch_key_versions(
     let resp = client
         .get(&url)
         .bearer_auth(device_key)
+        .dik_pop("GET", &url, &[])
         .send()
         .await
         .map_err(|e| format!("reach {}: {}", cloud, e))?;
@@ -2518,6 +3806,7 @@ async fn push_key(
     let resp = client
         .put(&url)
         .bearer_auth(device_key)
+        .dik_pop("PUT", &url, &serde_json::to_vec(&body).unwrap_or_default())
         .json(&body)
         .send()
         .await
@@ -2549,7 +3838,7 @@ async fn push_key(
 #[cfg(test)]
 mod peritem_tests {
     use super::*;
-    use crate::storage::item::ItemNs;
+    use crate::storage::item::{ItemNs, VaultKeys};
     use crate::storage::sealed_vault::PerItemVault;
     use sudp::primitives::StdPrimitives;
 
@@ -2575,7 +3864,7 @@ mod peritem_tests {
         // Local row at version 2.
         let id = pv
             .seal_and_upsert::<StdPrimitives>(
-                &k,
+                VaultKeys::single(&k),
                 vid,
                 ItemNs::Secret,
                 "A",
@@ -2590,6 +3879,8 @@ mod peritem_tests {
             version: 1,
             seq: 5,
             ct: "AAAA".into(),
+            sig: None,
+            signer: None,
         };
         let n = adopt_item_rows(&mut pv, std::slice::from_ref(&stale), 5).unwrap();
         assert_eq!(n, 0, "stale version ignored");
@@ -2605,6 +3896,8 @@ mod peritem_tests {
             version: 3,
             seq: 9,
             ct: newer_ct,
+            sig: None,
+            signer: None,
         };
         let n = adopt_item_rows(&mut pv, std::slice::from_ref(&newer), 9).unwrap();
         assert_eq!(n, 1);
@@ -2666,7 +3959,7 @@ mod peritem_tests {
 
         // Adopt into a fresh empty keyset store (the on-demand pull_keys target).
         let mut pv = empty_keyset_store();
-        let n = adopt_key_rows(&mut pv, std::slice::from_ref(&row)).unwrap();
+        let n = adopt_key_rows(&mut pv, "v", std::slice::from_ref(&row)).unwrap();
         assert_eq!(n, 1);
 
         // 1. The SealedCredential has the correctly-DECODED prf_salt + wrapped_key.
@@ -2695,7 +3988,7 @@ mod peritem_tests {
 
         // 3. Idempotent re-adopt of the SAME row (version 1) doesn't duplicate
         //    the credential.
-        let _ = adopt_key_rows(&mut pv, std::slice::from_ref(&row)).unwrap();
+        let _ = adopt_key_rows(&mut pv, "v", std::slice::from_ref(&row)).unwrap();
         assert_eq!(
             pv.keyset
                 .credentials
@@ -2717,6 +4010,871 @@ mod peritem_tests {
             .find(|c| c.credential_id == cred_id_raw)
             .unwrap();
         assert_eq!(back_cred.wrapped_key, wrapped_key_raw);
+    }
+
+    /// DP-S1 wire plumbing (Part 1): a re-keyed vault's keyset-LEVEL `generation`
+    /// + owner-signed `rekey_proof` ride REDUNDANTLY on every `/keys` row's data.
+    /// Emitting a row via `key_row_data_for` (the push side) and re-adopting it
+    /// via `adopt_key_rows` (the pull side) must restore BOTH keyset-level fields
+    /// verbatim — the roundtrip a peer performs when it pulls a re-keyed keyset.
+    #[test]
+    fn rekey_meta_survives_push_to_adopt_roundtrip() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        // A genuine vault OWNER (also the creator anchor): the re-key proof and the
+        // owner cred's role grant are both signed with this key at generation 3, so
+        // the adopt-side verify-before-ratchet gate accepts the bump and restores
+        // the keyset-level fields (a forged/unsigned proof would be IGNORED — see
+        // `member_gen_poison_ignored`).
+        let vault = "vault-rt";
+        let owner = UikRoot::from_root([0x77u8; 32]);
+        let owner_sig_pub = owner.signing().public_bytes().to_vec();
+        let owner_id = owner.user_id();
+        let gen = 3u64;
+        let commit = vec![0xABu8; 32];
+        let membership = crate::identity::membership_commitment(&[]).to_vec(); // empty log
+        let rk_sig = owner
+            .signing()
+            .sign(&crate::identity::rekey_sig_input(
+                vault, gen, &commit, &owner_id, 0, &membership,
+            ))
+            .to_vec();
+        let grant = owner
+            .signing()
+            .sign(&crate::identity::role_grant_input(
+                vault, &owner_id, "owner", gen,
+            ))
+            .to_vec();
+
+        let mut pv = empty_pv();
+        let cid_b64 = URL_SAFE_NO_PAD.encode(b"c"); // empty_pv's credential id
+                                                    // Promote to v2 with an OWNER cred (role grant signed @gen), pin the
+                                                    // creator anchor, and set the owner-signed re-key state (gen 3 + proof).
+        pv.set_uik_cred(
+            cid_b64.clone(),
+            owner_id.clone(),
+            owner_sig_pub.clone(), // sig_pub
+            vec![8u8; 32],         // enc_pub
+            vec![1u8; 48],         // k_encapped
+            vec![2u8; 48],         // k_ct
+            MemberRole::Owner,
+            grant.clone(), // role_sig (creator-signed @gen)
+        );
+        {
+            let uik = pv.keyset.uik.as_mut().unwrap();
+            uik.creator_sig_pub = owner_sig_pub.clone();
+            uik.generation = gen;
+            uik.rekey_proof = Some(pv_store::RekeyProof {
+                generation: gen,
+                k_commitment: commit.clone(),
+                sig: rk_sig.clone(),
+                signer_id: owner_id.clone(),
+                membership_len: 0,
+                membership_hash: membership.clone(),
+            });
+        }
+
+        // Push side: emit the row `data` exactly as `push_keys_best_effort` does.
+        let cred = pv.keyset.credentials[0].clone();
+        let data = key_row_data_for(&pv, &cred).expect("row data built");
+        assert_eq!(data["uik_generation"], serde_json::json!(gen));
+        assert!(data["uik_rekey_proof"].is_object(), "proof object emitted");
+
+        // Pull side: a peer adopts the row into a fresh empty keyset store.
+        let row_json = serde_json::json!({
+            "cid": cid_b64,
+            "version": 2u64,
+            "seq": 4u64,
+            "data": data,
+        });
+        let row: KeyRow = serde_json::from_value(row_json).unwrap();
+        let mut peer = empty_keyset_store();
+        let n = adopt_key_rows(&mut peer, vault, std::slice::from_ref(&row)).unwrap();
+        assert_eq!(n, 1);
+
+        // Keyset-level fields restored byte-for-byte AND the ratchet advanced —
+        // because the owner-signed proof verified at gen 3 (verify-before-ratchet).
+        let uik = peer.keyset.uik.as_ref().expect("uik layer adopted");
+        assert_eq!(uik.generation, 3, "generation restored");
+        let proof = uik.rekey_proof.as_ref().expect("rekey_proof restored");
+        assert_eq!(proof.generation, 3);
+        assert_eq!(proof.signer_id, owner_id);
+        assert_eq!(proof.k_commitment, commit);
+        assert_eq!(proof.sig, rk_sig);
+
+        // A gen-0 (never-re-keyed) row carries NEITHER field (additive).
+        let mut pv0 = empty_pv();
+        pv0.set_uik_cred(
+            cid_b64.clone(),
+            owner_id.clone(),
+            owner_sig_pub.clone(),
+            vec![8u8; 32],
+            vec![1u8; 48],
+            vec![2u8; 48],
+            MemberRole::Member,
+            Vec::new(),
+        );
+        let cred0 = pv0.keyset.credentials[0].clone();
+        let data0 = key_row_data_for(&pv0, &cred0).expect("row data built");
+        assert!(
+            data0.get("uik_generation").is_none(),
+            "gen-0 omits generation"
+        );
+        assert!(data0.get("uik_rekey_proof").is_none(), "gen-0 omits proof");
+    }
+
+    /// DP-S1 generation is a MONOTONIC ratchet (security): a later adopt carrying
+    /// an OLDER generation must NOT roll the keyset backward. A malicious backend
+    /// could otherwise replay a stale keyset (with its genuine, still-valid older
+    /// proof) to undo a forward-secret re-key. A strictly HIGHER generation is
+    /// still adopted (the legit forward path).
+    #[test]
+    fn adopt_rekey_meta_generation_is_monotonic() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        // Genuine owner (also the creator anchor). Every adopted bump carries a
+        // real owner-signed proof at its generation, and the owner's role grant is
+        // (re-)signed at that generation — EXACTLY as a legit re-key rides them on
+        // the same synced rows. This exercises the monotonic ratchet on top of the
+        // verify-before-ratchet gate.
+        let vault = "vault-mono";
+        let owner = UikRoot::from_root([0x55u8; 32]);
+        let owner_sig_pub = owner.signing().public_bytes().to_vec();
+        let owner_id = owner.user_id();
+
+        let mut pv = empty_keyset_store();
+        // (Re-)sign the owner's role grant at `gen` and (re)install the owner cred +
+        // pinned creator anchor, so `owner_set_at(vault, gen)` confirms the owner.
+        let set_grant = |pv: &mut PerItemVault, gen: u64| {
+            let grant = owner
+                .signing()
+                .sign(&crate::identity::role_grant_input(
+                    vault, &owner_id, "owner", gen,
+                ))
+                .to_vec();
+            pv.set_uik_cred(
+                "cid-owner".into(),
+                owner_id.clone(),
+                owner_sig_pub.clone(),
+                vec![9u8; 32],
+                vec![1u8; 40],
+                vec![2u8; 40],
+                MemberRole::Owner,
+                grant,
+            );
+            pv.keyset.uik.as_mut().unwrap().creator_sig_pub = owner_sig_pub.clone();
+        };
+        // A genuine owner-signed re-key proof at `gen` (empty delegation log → empty
+        // membership commitment).
+        let proof = |gen: u64| -> Option<serde_json::Value> {
+            let commit = [gen as u8; 32];
+            let membership = crate::identity::membership_commitment(&[]);
+            let sig = owner.signing().sign(&crate::identity::rekey_sig_input(
+                vault, gen, &commit, &owner_id, 0, &membership,
+            ));
+            Some(serde_json::json!({
+                "generation": gen,
+                "signer_id": owner_id,
+                "k_commitment": URL_SAFE_NO_PAD.encode(commit),
+                "sig": URL_SAFE_NO_PAD.encode(sig),
+                "membership_len": 0,
+                "membership_hash": URL_SAFE_NO_PAD.encode(membership),
+            }))
+        };
+
+        // First re-key: gen 3 adopted from a clean (gen-0) keyset.
+        set_grant(&mut pv, 3);
+        adopt_rekey_meta(&mut pv, vault, Some(3), &proof(3)).unwrap();
+        assert_eq!(pv.keyset.uik.as_ref().unwrap().generation, 3);
+        assert_eq!(
+            pv.keyset
+                .uik
+                .as_ref()
+                .unwrap()
+                .rekey_proof
+                .as_ref()
+                .unwrap()
+                .generation,
+            3
+        );
+
+        // Rollback attempt: an OLDER gen-1 keyset is IGNORED by monotonicity (it
+        // short-circuits before the signature check) — generation AND proof both
+        // stay at 3 (neither overwritten).
+        adopt_rekey_meta(&mut pv, vault, Some(1), &proof(1)).unwrap();
+        assert_eq!(
+            pv.keyset.uik.as_ref().unwrap().generation,
+            3,
+            "older generation must not roll back"
+        );
+        assert_eq!(
+            pv.keyset
+                .uik
+                .as_ref()
+                .unwrap()
+                .rekey_proof
+                .as_ref()
+                .unwrap()
+                .generation,
+            3,
+            "older proof must not overwrite the current one"
+        );
+
+        // Equal gen is also a no-op (idempotent re-adopt of the same keyset).
+        adopt_rekey_meta(&mut pv, vault, Some(3), &proof(3)).unwrap();
+        assert_eq!(pv.keyset.uik.as_ref().unwrap().generation, 3);
+
+        // A genuinely NEWER re-key (gen 5) IS adopted — the grant is re-signed @5
+        // (as a legit re-key does) and the forward path still works.
+        set_grant(&mut pv, 5);
+        adopt_rekey_meta(&mut pv, vault, Some(5), &proof(5)).unwrap();
+        assert_eq!(
+            pv.keyset.uik.as_ref().unwrap().generation,
+            5,
+            "higher generation adopted"
+        );
+        assert_eq!(
+            pv.keyset
+                .uik
+                .as_ref()
+                .unwrap()
+                .rekey_proof
+                .as_ref()
+                .unwrap()
+                .generation,
+            5
+        );
+    }
+
+    /// HIGH-severity generation-ratchet DoS regression (verify-before-ratchet).
+    /// `adopt_rekey_meta` must NOT advance the monotonic keyset `generation` on a
+    /// strictly-higher generation whose owner-signed proof is missing / member-
+    /// signed / otherwise invalid. Otherwise a current MEMBER could PUT its own
+    /// keyset row (self-cid is allowed by the backend) with `uik_generation: 999`
+    /// and no valid proof; every daemon would ratchet to 999, then fold-time
+    /// `verify_rekey_proof` would fail → every request for the vault is denied (a
+    /// sticky fleet brick — the exact "generation storm" the owner-signed
+    /// generation was meant to prevent). The gate verifies the OWNER signature at
+    /// the proposed generation BEFORE ratcheting: a forged bump leaves the local
+    /// generation untouched; a genuine owner-signed bump still advances it.
+    #[test]
+    fn member_gen_poison_ignored() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let vault = "vault-poison";
+        let creator = UikRoot::from_root([0x11u8; 32]); // vault owner (creator anchor)
+        let member = UikRoot::from_root([0x22u8; 32]); // a current, NON-owner member
+        let creator_sig_pub = creator.signing().public_bytes().to_vec();
+        let creator_id = creator.user_id();
+        let member_sig_pub = member.signing().public_bytes().to_vec();
+        let member_id = member.user_id();
+
+        // A v2 keyset at generation 0: creator (Owner) + member (Member), each grant
+        // creator-signed at gen 0, creator anchor pinned.
+        let mut pv = empty_keyset_store();
+        let creator_grant = creator
+            .signing()
+            .sign(&crate::identity::role_grant_input(
+                vault,
+                &creator_id,
+                "owner",
+                0,
+            ))
+            .to_vec();
+        pv.set_uik_cred(
+            "cid-creator".into(),
+            creator_id.clone(),
+            creator_sig_pub.clone(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Owner,
+            creator_grant,
+        );
+        let member_grant = creator
+            .signing()
+            .sign(&crate::identity::role_grant_input(
+                vault, &member_id, "member", 0,
+            ))
+            .to_vec();
+        pv.set_uik_cred(
+            "cid-member".into(),
+            member_id.clone(),
+            member_sig_pub.clone(),
+            vec![8u8; 32],
+            vec![3u8; 40],
+            vec![4u8; 40],
+            MemberRole::Member,
+            member_grant,
+        );
+        pv.keyset.uik.as_mut().unwrap().creator_sig_pub = creator_sig_pub.clone();
+        assert_eq!(
+            pv.keyset.uik.as_ref().unwrap().generation,
+            0,
+            "keyset starts at generation 0"
+        );
+
+        // --- Attack 1: a strictly-higher generation with NO proof → IGNORED. ---
+        adopt_rekey_meta(&mut pv, vault, Some(999), &None).unwrap();
+        assert_eq!(
+            pv.keyset.uik.as_ref().unwrap().generation,
+            0,
+            "gen:999 with no proof must NOT ratchet",
+        );
+
+        // --- Attack 2: a MEMBER-signed proof at gen 999 → IGNORED. ---
+        // The backend lets a member PUT its own self-cid row, so a member can self-
+        // sign a re-key proof. It is not an OWNER @999, so the gate rejects it.
+        let commit = [0x99u8; 32];
+        let member_rk_sig = member
+            .signing()
+            .sign(&crate::identity::rekey_sig_input(
+                vault,
+                999,
+                &commit,
+                &member_id,
+                0,
+                &crate::identity::membership_commitment(&[]),
+            ))
+            .to_vec();
+        let member_proof = Some(serde_json::json!({
+            "generation": 999u64,
+            "signer_id": member_id,
+            "k_commitment": URL_SAFE_NO_PAD.encode(commit),
+            "sig": URL_SAFE_NO_PAD.encode(&member_rk_sig),
+        }));
+        adopt_rekey_meta(&mut pv, vault, Some(999), &member_proof).unwrap();
+        assert_eq!(
+            pv.keyset.uik.as_ref().unwrap().generation,
+            0,
+            "member-signed gen:999 proof must NOT ratchet (signer is not an owner @999)",
+        );
+        assert!(
+            pv.keyset.uik.as_ref().unwrap().rekey_proof.is_none(),
+            "no forged proof is stored",
+        );
+
+        // --- Legit path: a genuine OWNER-signed re-key at gen 1 → advances. ---
+        // A real re-key re-signs every surviving grant at the new generation on the
+        // same synced rows; simulate the creator's grant re-signed @1.
+        let creator_grant1 = creator
+            .signing()
+            .sign(&crate::identity::role_grant_input(
+                vault,
+                &creator_id,
+                "owner",
+                1,
+            ))
+            .to_vec();
+        pv.keyset
+            .uik
+            .as_mut()
+            .unwrap()
+            .creds
+            .get_mut("cid-creator")
+            .expect("creator cred")
+            .role_sig = creator_grant1;
+        let commit1 = [0x01u8; 32];
+        let membership1 = crate::identity::membership_commitment(&[]); // empty delegation log
+        let owner_rk_sig = creator
+            .signing()
+            .sign(&crate::identity::rekey_sig_input(
+                vault,
+                1,
+                &commit1,
+                &creator_id,
+                0,
+                &membership1,
+            ))
+            .to_vec();
+        let owner_proof = Some(serde_json::json!({
+            "generation": 1u64,
+            "signer_id": creator_id,
+            "k_commitment": URL_SAFE_NO_PAD.encode(commit1),
+            "sig": URL_SAFE_NO_PAD.encode(&owner_rk_sig),
+            "membership_len": 0,
+            "membership_hash": URL_SAFE_NO_PAD.encode(membership1),
+        }));
+        adopt_rekey_meta(&mut pv, vault, Some(1), &owner_proof).unwrap();
+        assert_eq!(
+            pv.keyset.uik.as_ref().unwrap().generation,
+            1,
+            "genuine owner-signed re-key at gen 1 advances the ratchet",
+        );
+        let stored = pv
+            .keyset
+            .uik
+            .as_ref()
+            .unwrap()
+            .rekey_proof
+            .as_ref()
+            .expect("owner-signed proof stored");
+        assert_eq!(stored.generation, 1);
+        assert_eq!(stored.signer_id, creator_id);
+    }
+
+    /// The delegation state (owner-signed event log + root-succession/compaction
+    /// chain) actually SYNCS through the `/keys` wire: a fresh device that adopts the
+    /// carried fields reconstructs the SAME owner-set as the origin — the whole point
+    /// of the sync carriage (without it the fold works in-memory but never propagates).
+    #[test]
+    fn delegation_state_syncs_via_keys_wire() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+
+        let vault = "vault-deleg-sync";
+        let creator = UikRoot::from_root([0x11u8; 32]);
+        let a = UikRoot::from_root([0x33u8; 32]);
+        let b = UikRoot::from_root([0x44u8; 32]);
+        let creator_id = creator.user_id();
+        let (a_id, b_id) = (a.user_id(), b.user_id());
+        let creator_pub = creator.signing().public_bytes().to_vec();
+
+        // Build a v2 keyset: creator anchor + creator owner-grant @0; A & B are creds
+        // with NO checkpoint grant (their ownership will come ONLY from the log).
+        let build = |with_log: bool| -> PerItemVault {
+            let mut pv = empty_keyset_store();
+            let cg = creator
+                .signing()
+                .sign(&crate::identity::role_grant_input(
+                    vault,
+                    &creator_id,
+                    "owner",
+                    0,
+                ))
+                .to_vec();
+            pv.set_uik_cred(
+                "cid-c".into(),
+                creator_id.clone(),
+                creator_pub.clone(),
+                vec![9u8; 32],
+                vec![1u8; 40],
+                vec![2u8; 40],
+                MemberRole::Owner,
+                cg,
+            );
+            for (cid, who, id) in [("cid-a", &a, &a_id), ("cid-b", &b, &b_id)] {
+                pv.set_uik_cred(
+                    cid.into(),
+                    id.clone(),
+                    who.signing().public_bytes().to_vec(),
+                    vec![9u8; 32],
+                    vec![1u8; 40],
+                    vec![2u8; 40],
+                    MemberRole::Member,
+                    Vec::new(),
+                );
+            }
+            pv.keyset.uik.as_mut().unwrap().creator_sig_pub = creator_pub.clone();
+            if with_log {
+                // creator sets A owner (seq 1); A (a non-root owner) sets B (seq 2).
+                for (signer, subj, seq) in [(&creator, &a_id, 1u64), (&a, &b_id, 2u64)] {
+                    let gid = signer.user_id();
+                    let gpub = signer.signing().public_bytes().to_vec();
+                    let sig = signer
+                        .signing()
+                        .sign(&crate::identity::delegation_event_input(
+                            vault, "set", subj, "owner", &gid, seq, 0,
+                        ))
+                        .to_vec();
+                    pv.keyset.uik.as_mut().unwrap().delegation_log.push(
+                        sealed_vault::DelegationEvent {
+                            op: "set".into(),
+                            subject_id: subj.clone(),
+                            role: MemberRole::Owner,
+                            granter_id: gid,
+                            granter_sig_pub: gpub,
+                            seq,
+                            role_epoch: 0,
+                            sig,
+                        },
+                    );
+                }
+            }
+            pv
+        };
+
+        let source = build(true);
+        let src_owners = source.fold_owner_set(vault);
+        assert_eq!(
+            src_owners.get(&a_id),
+            Some(&MemberRole::Owner),
+            "A owner @ source"
+        );
+        assert_eq!(
+            src_owners.get(&b_id),
+            Some(&MemberRole::Owner),
+            "B owner @ source"
+        );
+
+        // Serialize the log the way `key_row_data_for` does (serde → wire). The sig
+        // MUST ride as a base64 STRING (the shape the browser/backend agree on).
+        let log_json =
+            serde_json::to_value(&source.keyset.uik.as_ref().unwrap().delegation_log).unwrap();
+        assert!(
+            log_json[0]["sig"].is_string(),
+            "delegation event sig rides as a STANDARD-b64 string on the /keys wire",
+        );
+
+        // A fresh device that adopted only the CREDS (no log) sees just the creator.
+        let mut fresh = build(false);
+        assert!(
+            !fresh.fold_owner_set(vault).contains_key(&a_id),
+            "no log adopted yet → A is not an owner on the fresh device",
+        );
+
+        // Adopt the carried log → the fresh device reconstructs the FULL owner-set.
+        adopt_delegation_meta(&mut fresh, vault, &Some(log_json.clone()), &None).unwrap();
+        assert_eq!(
+            fresh.fold_owner_set(vault),
+            src_owners,
+            "delegation log syncs: the fresh device folds the SAME owner-set",
+        );
+
+        // Idempotent: re-adopting the same wire does NOT grow the log (dedup).
+        adopt_delegation_meta(&mut fresh, vault, &Some(log_json), &None).unwrap();
+        assert_eq!(
+            fresh.keyset.uik.as_ref().unwrap().delegation_log.len(),
+            2,
+            "re-adopting the same rows de-dups (no unbounded growth)",
+        );
+    }
+
+    /// PARITY: adopting the end-to-end `verify(anchor, members, proof)` TRIPLE
+    /// (`adopt_membership_triple`, the fmt=2 wire) folds to the EXACT SAME owner-set as
+    /// adopting the equivalent cid-keyed `/keys` rows. This is the load-bearing guarantee
+    /// of ET3 — the daemon speaks the triple on the wire but its in-memory keyset (hence
+    /// fold + unlock) is byte-identical to the legacy row path. Same crypto, two wires.
+    #[test]
+    fn membership_triple_adopts_same_owner_set_as_keys_wire() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let vault = "vault-triple-parity";
+        let creator = UikRoot::from_root([0x11u8; 32]);
+        let a = UikRoot::from_root([0x33u8; 32]);
+        let b = UikRoot::from_root([0x44u8; 32]);
+        let creator_id = creator.user_id();
+        let (a_id, b_id) = (a.user_id(), b.user_id());
+        let creator_pub = creator.signing().public_bytes().to_vec();
+
+        // SOURCE: the SAME v2 keyset the /keys wire produces — creator owner-grant @0 + an
+        // owner-signed log (creator→A owner, A→B owner) — folded to its owner-set.
+        let mut source = empty_keyset_store();
+        let cg = creator
+            .signing()
+            .sign(&crate::identity::role_grant_input(vault, &creator_id, "owner", 0))
+            .to_vec();
+        source.set_uik_cred(
+            "cid-c".into(),
+            creator_id.clone(),
+            creator_pub.clone(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Owner,
+            cg.clone(),
+        );
+        for (cid, who, id) in [("cid-a", &a, &a_id), ("cid-b", &b, &b_id)] {
+            source.set_uik_cred(
+                cid.into(),
+                id.clone(),
+                who.signing().public_bytes().to_vec(),
+                vec![9u8; 32],
+                vec![1u8; 40],
+                vec![2u8; 40],
+                MemberRole::Member,
+                Vec::new(),
+            );
+        }
+        source.keyset.uik.as_mut().unwrap().creator_sig_pub = creator_pub.clone();
+        for (signer, subj, seq) in [(&creator, &a_id, 1u64), (&a, &b_id, 2u64)] {
+            let gid = signer.user_id();
+            let gpub = signer.signing().public_bytes().to_vec();
+            let sig = signer
+                .signing()
+                .sign(&crate::identity::delegation_event_input(
+                    vault, "set", subj, "owner", &gid, seq, 0,
+                ))
+                .to_vec();
+            source
+                .keyset
+                .uik
+                .as_mut()
+                .unwrap()
+                .delegation_log
+                .push(sealed_vault::DelegationEvent {
+                    op: "set".into(),
+                    subject_id: subj.clone(),
+                    role: MemberRole::Owner,
+                    granter_id: gid,
+                    granter_sig_pub: gpub,
+                    seq,
+                    role_epoch: 0,
+                    sig,
+                });
+        }
+        let src_owners = source.fold_owner_set(vault);
+        assert_eq!(src_owners.get(&a_id), Some(&MemberRole::Owner));
+        assert_eq!(src_owners.get(&b_id), Some(&MemberRole::Owner));
+
+        // Build the EQUIVALENT triple (a GET /v/{vid}/membership body) from the SAME data.
+        let enc = |bytes: &[u8]| STANDARD.encode(bytes);
+        let member = |role: &str, sig: Option<&[u8]>| {
+            let mut m = serde_json::json!({
+                "role": role,
+                "k_encapped": enc(&[1u8; 40]),
+                "k_ct": enc(&[2u8; 40]),
+            });
+            if let Some(s) = sig {
+                m["role_sig"] = serde_json::Value::String(enc(s));
+            }
+            m
+        };
+        let ident = |uik: &UikRoot| {
+            serde_json::json!({ "sig_pub": enc(&uik.signing().public_bytes()), "enc_pub": enc(&[9u8; 32]) })
+        };
+        let mut members = serde_json::Map::new();
+        members.insert(creator_id.clone(), member("owner", Some(&cg)));
+        members.insert(a_id.clone(), member("member", None));
+        members.insert(b_id.clone(), member("member", None));
+        let mut identities = serde_json::Map::new();
+        identities.insert(creator_id.clone(), ident(&creator));
+        identities.insert(a_id.clone(), ident(&a));
+        identities.insert(b_id.clone(), ident(&b));
+        let log_json =
+            serde_json::to_value(&source.keyset.uik.as_ref().unwrap().delegation_log).unwrap();
+        let anchor_b64 = enc(&creator_pub);
+        let body = serde_json::json!({
+            "anchor": anchor_b64,
+            "members": serde_json::Value::Object(members),
+            "proof": { "delegation_log": log_json, "succession": [], "generation": 0 },
+            "identities": serde_json::Value::Object(identities),
+            "credentials": [ { "cid": "cid-c", "identity_id": creator_id.clone() } ],
+        });
+
+        // Adopt the TRIPLE into a fresh keyset and assert the owner-set is IDENTICAL.
+        let mut fresh = empty_keyset_store();
+        adopt_membership_triple(&mut fresh, vault, &anchor_b64, &body).unwrap();
+        assert_eq!(
+            fresh.fold_owner_set(vault),
+            src_owners,
+            "the membership TRIPLE folds to the SAME owner-set as the /keys wire",
+        );
+    }
+
+    /// F1 regression: a checkpoint member seated by a valid root-signed `role_sig` folds as
+    /// OWNER even when its K-DELIVERY fields (`enc_pub` / `k_encapped` / `k_ct`) are absent.
+    /// The fold is about AUTHORITY (sig_pub + role_sig), not delivery; the backend + frontend
+    /// seat such a member, so the daemon must too, or the owner-set diverges across layers.
+    #[test]
+    fn membership_triple_seats_checkpoint_owner_without_k_delivery_fields() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let vault = "vault-f1";
+        let creator = UikRoot::from_root([0x11u8; 32]);
+        let m = UikRoot::from_root([0x55u8; 32]);
+        let creator_id = creator.user_id();
+        let m_id = m.user_id();
+        let enc = |b: &[u8]| STANDARD.encode(b);
+
+        // Both owner via root-signed checkpoint grants @0; `m` gets NO enc_pub / k_encapped / k_ct.
+        let cg = creator.signing().sign(&crate::identity::role_grant_input(vault, &creator_id, "owner", 0)).to_vec();
+        let mg = creator.signing().sign(&crate::identity::role_grant_input(vault, &m_id, "owner", 0)).to_vec();
+        let mut members = serde_json::Map::new();
+        members.insert(creator_id.clone(), serde_json::json!({
+            "role": "owner", "k_encapped": enc(&[1u8; 40]), "k_ct": enc(&[2u8; 40]), "role_sig": enc(&cg),
+        }));
+        members.insert(m_id.clone(), serde_json::json!({ "role": "owner", "role_sig": enc(&mg) }));
+        let mut identities = serde_json::Map::new();
+        identities.insert(creator_id.clone(), serde_json::json!({
+            "sig_pub": enc(&creator.signing().public_bytes()), "enc_pub": enc(&[9u8; 32]),
+        }));
+        // `m`: sig_pub present, enc_pub MISSING (nullable column).
+        identities.insert(m_id.clone(), serde_json::json!({ "sig_pub": enc(&m.signing().public_bytes()) }));
+        let anchor_b64 = enc(&creator.signing().public_bytes());
+        let body = serde_json::json!({
+            "anchor": anchor_b64,
+            "members": serde_json::Value::Object(members),
+            "proof": { "generation": 0 },
+            "identities": serde_json::Value::Object(identities),
+            "credentials": [ { "cid": "cid-c", "identity_id": creator_id.clone() } ],
+        });
+        let mut pv = empty_keyset_store();
+        adopt_membership_triple(&mut pv, vault, &anchor_b64, &body).unwrap();
+        assert_eq!(
+            pv.fold_owner_set(vault).get(&m_id),
+            Some(&MemberRole::Owner),
+            "a checkpoint owner with a valid role_sig folds as owner even with no enc_pub/K",
+        );
+    }
+
+    /// A compaction (root-signed SELF-succession) syncs through the `/keys` wire: the
+    /// derived `role_epoch` advances on a fresh device that adopts the carried
+    /// `root_succession`, so a stale pre-compaction grant is dropped there too.
+    #[test]
+    fn compaction_syncs_and_derives_role_epoch() {
+        use crate::crypto::vault_key::UikRoot;
+        use crate::storage::plaintext::MemberRole;
+        use base64::Engine as _;
+
+        let vault = "vault-compact-sync";
+        let creator = UikRoot::from_root([0x11u8; 32]);
+        let member = UikRoot::from_root([0x22u8; 32]);
+        let creator_id = creator.user_id();
+        let member_id = member.user_id();
+        let creator_pub = creator.signing().public_bytes().to_vec();
+
+        // creator owner-grant @0, member owner-grant @0 (a checkpoint grant, so a
+        // compaction that doesn't re-sign it must drop the member).
+        let mut pv = empty_keyset_store();
+        let cg = creator
+            .signing()
+            .sign(&crate::identity::role_grant_input(
+                vault,
+                &creator_id,
+                "owner",
+                0,
+            ))
+            .to_vec();
+        pv.set_uik_cred(
+            "cid-c".into(),
+            creator_id.clone(),
+            creator_pub.clone(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Owner,
+            cg,
+        );
+        let mg = creator
+            .signing()
+            .sign(&crate::identity::role_grant_input(
+                vault, &member_id, "owner", 0,
+            ))
+            .to_vec();
+        pv.set_uik_cred(
+            "cid-m".into(),
+            member_id.clone(),
+            member.signing().public_bytes().to_vec(),
+            vec![9u8; 32],
+            vec![1u8; 40],
+            vec![2u8; 40],
+            MemberRole::Owner,
+            mg,
+        );
+        pv.keyset.uik.as_mut().unwrap().creator_sig_pub = creator_pub.clone();
+        assert_eq!(
+            pv.fold_owner_set(vault).get(&member_id),
+            Some(&MemberRole::Owner),
+            "member is an owner @epoch 0",
+        );
+
+        // The creator compacts to epoch 1 (self-succession) WITHOUT re-signing the
+        // member's grant → serialize the succession chain to the wire.
+        let root_id = creator_id.clone();
+        let succ_sig = creator
+            .signing()
+            .sign(&crate::identity::root_succession_input(
+                vault,
+                &root_id,
+                &root_id,
+                &creator.signing().public_bytes(),
+                1,
+            ))
+            .to_vec();
+        let succ_json = serde_json::json!([{
+            "old_root_id": root_id,
+            "new_root_id": root_id,
+            "new_root_sig_pub": base64::engine::general_purpose::STANDARD.encode(&creator_pub),
+            "role_epoch": 1u64,
+            "sig": base64::engine::general_purpose::STANDARD.encode(&succ_sig),
+        }]);
+
+        // A fresh device with the SAME creds but no succession → member still owner.
+        // Adopt the carried compaction → derived epoch is 1, the stale grant drops.
+        adopt_delegation_meta(&mut pv, vault, &None, &Some(succ_json.clone())).unwrap();
+        let os = pv.fold_owner_set(vault);
+        assert_eq!(
+            os.get(&creator_id),
+            Some(&MemberRole::Owner),
+            "the root stays an owner across compaction (genesis pin)",
+        );
+        assert!(
+            !os.contains_key(&member_id),
+            "compaction syncs: derived role_epoch=1 drops the member's stale @0 grant",
+        );
+        // Dedup: re-adopting the same cert doesn't grow the chain.
+        adopt_delegation_meta(&mut pv, vault, &None, &Some(succ_json)).unwrap();
+        assert_eq!(
+            pv.keyset.uik.as_ref().unwrap().root_succession.len(),
+            1,
+            "re-adopting the same succession cert de-dups",
+        );
+    }
+
+    /// The vault's ROOT owner (creator) anchor is TOFU-pinned SET-ONCE (design/
+    /// identity-uik-aik.md §4.3). Adopting a keyset that claims creator=A pins A;
+    /// a LATER adopt claiming creator=B must NOT overwrite it — else a colluding
+    /// backend could swap the role anchor to a key it controls and forge the
+    /// owner-set. First-seen wins (mirrors `adopt_rekey_meta`'s monotonic rule).
+    #[test]
+    fn creator_sig_pub_set_once() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        let cid_b64 = URL_SAFE_NO_PAD.encode(b"c");
+        let pub_a = vec![0xAAu8; 32];
+        let pub_b = vec![0xBBu8; 32];
+
+        // A minimal valid `/keys` row carrying the keyset-LEVEL creator anchor.
+        let row = |creator_pub: &[u8], version: u64| -> KeyRow {
+            let data = serde_json::json!({
+                "x": "x",
+                "y": "y",
+                "device_name": "Dev",
+                "prf_salt": STANDARD.encode([0u8; 32]),
+                "wrapped_key": STANDARD.encode([0u8; 48]),
+                "uik_creator_sig_pub": STANDARD.encode(creator_pub),
+            });
+            serde_json::from_value(serde_json::json!({
+                "cid": cid_b64,
+                "version": version,
+                "seq": version,
+                "data": data,
+            }))
+            .unwrap()
+        };
+
+        let mut peer = empty_keyset_store();
+        // First adopt pins creator = A.
+        adopt_key_rows(&mut peer, "v", std::slice::from_ref(&row(&pub_a, 1))).unwrap();
+        assert_eq!(
+            peer.keyset.uik.as_ref().unwrap().creator_sig_pub,
+            pub_a,
+            "first-seen creator anchor pinned"
+        );
+
+        // A later adopt claiming creator = B must NOT overwrite the pin.
+        adopt_key_rows(&mut peer, "v", std::slice::from_ref(&row(&pub_b, 2))).unwrap();
+        assert_eq!(
+            peer.keyset.uik.as_ref().unwrap().creator_sig_pub,
+            pub_a,
+            "creator pin is set-once (TOFU); a swap attempt is ignored"
+        );
     }
 }
 
@@ -2800,6 +4958,30 @@ mod tests {
             .join("vault.dat")
             .exists());
         assert!(!version_sidecar(dir.path(), "v-del").exists());
+    }
+
+    /// `parse_shared_from_body` maps the server `kind` envelope field (team §4):
+    /// "shared"→Some(true), "private"→Some(false); absent / null / unrecognized →
+    /// None so the caller leaves the last known value (fail-safe private default).
+    #[test]
+    fn parse_shared_from_body_maps_kind_field() {
+        use serde_json::json;
+        assert_eq!(
+            parse_shared_from_body(&json!({"kind": "shared"})),
+            Some(true)
+        );
+        assert_eq!(
+            parse_shared_from_body(&json!({"kind": "private"})),
+            Some(false)
+        );
+        assert_eq!(parse_shared_from_body(&json!({"kind": "bogus"})), None);
+        assert_eq!(parse_shared_from_body(&json!({"kind": null})), None);
+        assert_eq!(parse_shared_from_body(&json!({})), None);
+        // Coexists with a real live envelope (blob + version + kind).
+        assert_eq!(
+            parse_shared_from_body(&json!({"version": 5u64, "blob": {}, "kind": "shared"})),
+            Some(true)
+        );
     }
 
     /// `{ unchanged: true }` (no status, or status:"live") classifies as
@@ -2925,10 +5107,14 @@ mod tests {
                 KnownVault {
                     daemon: "http://localhost:1".into(),
                     vault: "vid-A".into(),
+                    label: None,
+                    kind: None,
                 },
                 KnownVault {
                     daemon: "http://localhost:1".into(),
                     vault: "vid-B".into(),
+                    label: None,
+                    kind: None,
                 },
             ],
             ..Default::default()

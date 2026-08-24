@@ -52,6 +52,14 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
         return problem(ScCode::MethodNotAllowed, "GET only");
     }
     let path = req.uri().path().to_string();
+    // The exact origin-form target on the wire (path + any query) — the hop-A PoP
+    // binds THIS string (`apiface:<pq>`), so the shim signs the same request-line
+    // target it sends and a token can't be lifted to another api-face path.
+    let pq = req
+        .uri()
+        .path_and_query()
+        .map(|x| x.as_str().to_string())
+        .unwrap_or_else(|| path.clone());
 
     // ── Unauthenticated: liveness + public CA ────────────────────────────────
     if path == "/health" {
@@ -66,25 +74,98 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
 
     // ── Bearer-gated reads (§8) ──────────────────────────────────────────────
     if let Some(op_id) = path.strip_prefix("/op/") {
-        if let Err(r) = require_key(state, req.headers()).await {
-            return r;
+        let caller = match require_agent(state, req.headers(), &pq).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        // Op-agent binding (team §C1): an agent-created op is pollable only by
+        // the agent that triggered it — a different (still valid) agent gets the
+        // same shape as an unknown op, so this face leaks nothing about other
+        // agents' pending work. Ops with no agent stamp (ceremonies) stay
+        // reachable by any valid agent, matching today's user-surface semantics.
+        // `caller` is the resolved attribution (hop-A `ag_` or legacy key prefix),
+        // the SAME id the proxy path stamped on the op at creation — so the two
+        // faces compare like-for-like across the dual-auth window.
+        {
+            let bound = state
+                .approvals
+                .lock()
+                .unwrap()
+                .get(op_id)
+                .and_then(|r| r.agent_prefix.clone());
+            if let Some(expected) = bound {
+                if caller != expected {
+                    return problem(ScCode::NotFound, "Not found");
+                }
+            }
         }
         return match crate::server::handlers::approve::op_poll_value(state, op_id) {
             Ok(v) => op_poll_response(&v),
             Err(e) => app_err(e),
         };
     }
+    // GET /vaults — the agent's vault index (team §A/§7.7): every vault this
+    // daemon holds, with lock state and a per-vault connection summary the
+    // caller's reach mask has already been applied to. EXISTS ONLY ON THIS
+    // AUTHED AGENT FACE — the control plane deliberately never exposes a
+    // vault index (see registry.rs's no-vault_id note). The vid in each entry
+    // is the address the agent puts on the wire (proxy auth / URL); item
+    // names stay bare and resolve inside the chosen vault.
+    if path == "/vaults" {
+        let agent = match require_agent(state, req.headers(), &pq).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let mut vaults: Vec<Value> = Vec::new();
+        let ids = state.vaults.list().unwrap_or_default();
+        for vid in ids {
+            let locked = state.is_vault_locked(&vid);
+            let mut conns: Vec<Value> = Vec::new();
+            if !locked {
+                let snapshot = state.connections_snapshot(&vid);
+                let candidates: Vec<String> = snapshot.iter().map(|(id, _)| id.clone()).collect();
+                let allowed = state.agent_allowed_connections(&vid, &agent, &candidates);
+                let allow: Option<std::collections::HashSet<String>> =
+                    allowed.map(|w| w.into_iter().collect());
+                for (id, conn) in snapshot {
+                    let masked = allow.as_ref().map(|a| !a.contains(&id)).unwrap_or(false);
+                    let mut row = json!({ "id": id, "service": conn.service });
+                    if masked {
+                        row["locked"] = Value::Bool(true);
+                    }
+                    conns.push(row);
+                }
+                conns.sort_by(|a, b| {
+                    a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or(""))
+                });
+            }
+            vaults.push(json!({
+                "vid": vid,
+                "locked": locked,
+                "connections": conns,
+            }));
+        }
+        return json(StatusCode::OK, &json!({ "vaults": vaults }));
+    }
     if let Some(vid) = path
         .strip_prefix("/v/")
         .and_then(|r| r.strip_suffix("/registry"))
     {
-        if let Err(r) = require_key(state, req.headers()).await {
-            return r;
-        }
+        let agent = match require_agent(state, req.headers(), &pq).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
         let q = crate::server::handlers::registry::RegistryQuery::from_query_str(
             req.uri().query().unwrap_or(""),
         );
-        return match crate::server::handlers::registry::vault_registry_value(state, vid, &q) {
+        // Agent surface: annotate reach-masked connections as locked stubs, keyed
+        // by the resolved attribution (hop-A `ag_` or legacy key prefix).
+        return match crate::server::handlers::registry::vault_registry_value(
+            state,
+            vid,
+            &q,
+            Some(agent.as_str()),
+        ) {
             Ok(v) => json(StatusCode::OK, &v),
             Err(e) => app_err(e),
         };
@@ -93,25 +174,81 @@ pub async fn respond(state: &Arc<AppState>, req: &Request<Body>) -> Response<Bod
     problem(ScCode::NotFound, "Not found")
 }
 
-/// Gate a request on the agent Bearer key (§8): the same membership check the
-/// control plane uses, via the pure `check_token`. On a miss with a key
-/// PRESENT, one debounced hash refresh (a just-minted `sc agent add` key must
-/// not 401 for the 30s sync loop), then re-check. `Err` carries the ready 401.
-async fn require_key(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), Response<Body>> {
+/// Gate an api-face request and resolve the caller's attribution (§8). Dual-auth:
+///
+/// - **hop-A AIK PoP** — a `scpop1…` token in the Bearer slot (the `sc` transport
+///   holds the AIK and mints it, keeping the key out of the child env). Crypto-
+///   verified against the request-line target (`apiface:<pq>`, account-scoped
+///   `vault=""`; the api-face is account-scoped, exactly like the legacy shared
+///   key hash-set), then authorized by `ag_` ∈ ANY unlocked vault's authorized-
+///   agents table. A `scpop1…` that doesn't verify/authorize is a 401 — it's not
+///   an api-key, so there's nothing to fall back to. Returns the resolved `ag_`.
+/// - **legacy Bearer api-key** — the same membership check the control plane uses
+///   via the pure `check_token`. On a miss with a key PRESENT, one debounced hash
+///   refresh (a just-minted `sc agent add` key must not 401 for the 30s sync
+///   loop), then re-check. Returns the key prefix (never the full key).
+///
+/// The returned id is the SAME attribution the proxy path stamps
+/// (`BrokerHandler::agent_attribution`), so op-binding, reach masks, and registry
+/// annotation agree across both faces. `Err` carries the ready 401.
+async fn require_agent(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    pq: &str,
+) -> Result<String, Response<Body>> {
     let token = bearer_token(headers);
+    // hop-A: an AIK PoP in the Bearer slot (`scpop1.…`) is unambiguous vs. an
+    // `sc_…` api-key — verify + authorize here; on failure it's a hard 401 (a
+    // PoP string is never a hash-set member, so no api-key fallback applies).
+    if let Some(tok) = token.as_deref() {
+        if tok.starts_with(&format!("{}.", crate::agent_pop::TOKEN_PREFIX)) {
+            let target = crate::agent_pop::apiface_target(pq);
+            return match crate::agent_pop::verify_agent_proxy_pop(
+                tok,
+                "",
+                &target,
+                crate::util::now_unix(),
+                crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
+            ) {
+                // Verified AIK, authorized on some unlocked vault → attribution.
+                Some(ag) if state.agent_is_authorized_any(&ag) => Ok(ag),
+                // Verified AIK but NOT authorized anywhere yet: distinct from a bad
+                // credential — the fix is a Console authorize (Agents tab), not a
+                // key change (same fail-loudly posture as the proxy path).
+                Some(_) => Err(problem(
+                    ScCode::AgentNotAuthorized,
+                    "this agent isn't authorized on any of your vaults yet — \
+                     authorize it in the SafeClaw console (Agents tab)",
+                )),
+                // Not a valid/fresh PoP at all → generic 401 (no api-key fallback:
+                // a `scpop1…` string is never a hash-set member).
+                None => Err(problem(
+                    ScCode::Unauthorized,
+                    "missing or invalid agent api key",
+                )),
+            };
+        }
+    }
+    // Legacy Bearer api-key (dual-auth) — unchanged, incl. the debounced refresh.
     if key_in_set(state, token.as_deref()) {
-        return Ok(());
+        return Ok(legacy_attribution(token.as_deref()));
     }
     if token.is_some()
         && crate::sync::refresh_agent_keys_on_miss(state).await
         && key_in_set(state, token.as_deref())
     {
-        return Ok(());
+        return Ok(legacy_attribution(token.as_deref()));
     }
     Err(problem(
         ScCode::Unauthorized,
         "missing or invalid agent api key",
     ))
+}
+
+/// The legacy attribution id for a Bearer api-key: its prefix (never the full
+/// key/token), matching the proxy path's `legacy_key_prefix`.
+fn legacy_attribution(token: Option<&str>) -> String {
+    token.map(crate::audit::agent_key_prefix).unwrap_or_default()
 }
 
 fn key_in_set(state: &AppState, token: Option<&str>) -> bool {

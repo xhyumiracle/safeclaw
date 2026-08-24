@@ -10,7 +10,7 @@ Multi-account: switch the phantom value (__sc__vercel_work__).
 id = "vercel"
 name = "Vercel"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 hosts = ["api.vercel.com"]
 secrets = ["VERCEL_API_TOKEN"]

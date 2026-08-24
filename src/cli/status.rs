@@ -1,7 +1,6 @@
 //! `safeclaw status` / `safeclaw vault status` — current vault status.
 
 use crate::cli::active::{frontend_origin, join_vault_url, load as load_config};
-use crate::config::StatusArgs;
 
 #[derive(Debug)]
 pub struct VaultStatus {
@@ -35,41 +34,82 @@ pub struct LocalDaemon {
 }
 
 pub async fn probe_local_daemon(control_root: &str) -> LocalDaemon {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(400))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => {
-            return LocalDaemon {
-                up: false,
-                version: None,
-                vault_count: None,
-            }
-        }
-    };
+    // Liveness must AGREE with the signal `sc up` gates on. `sc up` no-ops when a
+    // raw TCP connect to the control port succeeds (service::control_port_alive),
+    // so `sc status` has to call that same daemon "running" or the two verbs
+    // contradict each other: the fresh-Mac wedge where `sc up` returns done,
+    // `sc status` says not-running, and `sc serve` then fails address-in-use. A
+    // raw connect also refuses instantly when the daemon is truly down, so the
+    // common "down" verdict stays snappy.
+    if !control_port_tcp_alive(control_root).await {
+        return LocalDaemon {
+            up: false,
+            version: None,
+            vault_count: None,
+        };
+    }
+    // Socket is held ⇒ the daemon IS up. Enrich with version/vault_count via an
+    // HTTP /health round-trip, retried briefly: a cold multi-vault start can bind
+    // the port a beat before /health answers, and a proxy-leaked or slow shot must
+    // not erase the "running" verdict the TCP connect already proved.
     let health_url = format!("{}/health", control_root.trim_end_matches('/'));
-    let resp = match client.get(&health_url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => {
-            return LocalDaemon {
-                up: false,
-                version: None,
-                vault_count: None,
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(700))
+        .build()
+        .ok();
+    if let Some(client) = client.as_ref() {
+        for attempt in 0..3u8 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            if let Ok(r) = client.get(&health_url).send().await {
+                if r.status().is_success() {
+                    let body: serde_json::Value =
+                        r.json().await.unwrap_or(serde_json::Value::Null);
+                    let version = body
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let vault_count = body.get("vault_count").and_then(|v| v.as_u64());
+                    return LocalDaemon {
+                        up: true,
+                        version,
+                        vault_count,
+                    };
+                }
             }
         }
-    };
-    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-    let version = body
-        .get("version")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let vault_count = body.get("vault_count").and_then(|v| v.as_u64());
+    }
+    // Socket held but HTTP wouldn't complete (proxy leak / still mid-start). Still
+    // up: report running without version rather than contradict `sc up`.
     LocalDaemon {
         up: true,
-        version,
-        vault_count,
+        version: None,
+        vault_count: None,
     }
+}
+
+/// Raw TCP liveness on the control port — the SAME honest signal
+/// `service::control_port_alive` uses to gate `sc up`, so `sc status` can never
+/// disagree with it. Targets the same host:port the HTTP probe resolves
+/// (loopback in the normal case; an env-pinned host when a shell carries a
+/// `$SAFECLAW_BROKER_URL`). Fully async so it never blocks the runtime; ~600ms
+/// ceiling, but a down daemon refuses immediately.
+async fn control_port_tcp_alive(control_root: &str) -> bool {
+    let authority = control_root
+        .trim_end_matches('/')
+        .split("://")
+        .last()
+        .unwrap_or(control_root)
+        .to_string();
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(600),
+            tokio::net::TcpStream::connect(authority.as_str()),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
@@ -142,23 +182,27 @@ pub async fn fetch_status(custodian: &str, vault: &str) -> VaultStatus {
     }
 }
 
-pub async fn run(args: StatusArgs) -> Result<(), String> {
+pub async fn run(json: bool) -> Result<(), String> {
     let cfg = load_config()?;
     // ONE control root for the probe and every fetch below — derived env-first
     // (an agent's shelled `sc status` reports the agent's own daemon).
     let control = crate::cli::active::control_root(&cfg);
     let d = probe_local_daemon(&control).await;
 
-    // Vault resolution mirrors `resolve_active` (§5): `--vault` isn't a status
-    // arg, so it's env-pin > config default. Surface BOTH so a shell pinned to a
+    // Vault resolution mirrors `resolve_active` (§5): global `--vault` flag >
+    // env pin > config default. Surface pin AND default so a shell pinned to a
     // different vault than the device default is legible (no coined verdict — the
     // facts). Routing DETECTION is gone (§9): the broker is opt-in, the agent
     // routes explicitly with `sc run`, so there's no "am I routed?" to report.
+    let flag = crate::cli::active::vault_flag();
     let env_pin = std::env::var("SAFECLAW_VAULT_ID")
         .ok()
         .filter(|s| !s.is_empty());
     let config_default = cfg.vault.clone();
-    let active_vault = env_pin.clone().or_else(|| config_default.clone());
+    let active_vault = flag
+        .clone()
+        .or_else(|| env_pin.clone())
+        .or_else(|| config_default.clone());
 
     let vault = match active_vault.as_deref() {
         Some(v) => Some(fetch_status(&control, v).await),
@@ -172,7 +216,7 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
     // URL next to it is exactly what makes a moved port diagnosable.
     let broker = crate::cli::active::api_face_root(&cfg);
 
-    if args.json {
+    if json {
         print_json(
             &d,
             &control,
@@ -249,11 +293,14 @@ pub async fn run(args: StatusArgs) -> Result<(), String> {
         }
     }
     // Pin-vs-config (§5): flag a shell pinned to a different vault than the device
-    // default so a surprising `sc` target is legible.
-    if let (Some(pin), Some(def)) = (env_pin.as_deref(), config_default.as_deref()) {
-        if pin != def {
-            println!("  note:  this shell is pinned to {} via $SAFECLAW_VAULT_ID; the device default is {}", pin, def);
-            println!("         unset SAFECLAW_VAULT_ID (or re-run `eval \"$(sc env)\"`) to follow the default");
+    // default so a surprising `sc` target is legible. Suppressed under an explicit
+    // `--vault` (a deliberate per-call choice needs no warning).
+    if flag.is_none() {
+        if let (Some(pin), Some(def)) = (env_pin.as_deref(), config_default.as_deref()) {
+            if pin != def {
+                println!("  note:  this shell is pinned to {} via $SAFECLAW_VAULT_ID; the device default is {}", pin, def);
+                println!("         unset SAFECLAW_VAULT_ID to follow the default");
+            }
         }
     }
     // Connections are NOT shown here: while the vault is locked they can't be
@@ -363,7 +410,7 @@ pub fn print_status(s: &VaultStatus) {
             println!("  state:    not found (run `sc vault create`, or pick a different URL with `sc vault use`)");
         }
         VaultState::Locked { passkeys } => {
-            println!("  state:    locked (run `sc up` to unlock)");
+            println!("  state:    locked (run `sc unlock`)");
             println!("  passkeys: {}", passkeys);
         }
         VaultState::Unlocked { passkeys, secrets } => {

@@ -10,7 +10,7 @@ Multi-account: switch the phantom value (__sc__neon_work__).
 id = "neon"
 name = "Neon"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 hosts = ["console.neon.tech"]
 secrets = ["NEON_API_KEY"]

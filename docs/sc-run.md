@@ -20,8 +20,8 @@ nothing is revealed.
 Three steps, always the same:
 
 1. **Find the phantom.** `sc connection ls` lists every connection with its
-   hosts and phantom (agents read `GET /v/<vault>/registry` instead). Copy it
-   verbatim; never construct one by guessing.
+   hosts and phantom (add `--json` for a machine-readable list). Copy it exactly
+   as shown.
 2. **Place it** where the credential belongs: an env var a tool reads, an
    `Authorization` header, a config file, even a URL path
    (`https://api.telegram.org/bot__sc__telegram__/sendMessage`).
@@ -69,7 +69,7 @@ On a brokered call, an auth failure is usually routing, not the credential.
 Check in order:
 
 1. Did the command actually run under `sc run --`?
-2. Is the phantom verbatim from `sc connection ls` (or the registry)?
+2. Is the phantom verbatim from `sc connection ls`?
 3. Is the destination one of that connection's hosts?
 4. Still failing: `sc doctor`, and the error's `SafeClaw: <code>` line maps to
    a fix in [DIAGNOSTICS.md](reference/diagnostics.md).

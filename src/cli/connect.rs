@@ -27,12 +27,12 @@ use crate::cli::active::resolve_active;
 use crate::cli::approve::{act_result, approve_op, deposit_values, ApproveOpts};
 use crate::cli::conn::{slugify_conn_id, valid_role, validate_raw_host};
 use crate::cli::webauthn::now_unix;
-use crate::config::{ConnectArgs, ConnectionLsArgs, ConnectionRmArgs};
+use crate::config::{ConnectArgs, ConnectionRmArgs};
 use crate::service::ServiceRegistry;
 use crate::storage::plaintext::suggested_secret_key;
 
 pub async fn run(mut args: ConnectArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
 
     // Resolve the connection id: slugify a provided handle, or (no id given) run
     // the TTY wizard — which prompts the id and may also pick a `--service`.
@@ -109,14 +109,14 @@ fn resolve_conn_id(args: &mut ConnectArgs) -> Result<String, String> {
 
 /// `sc connection ls` — the agent-usable connection projection (the same rows
 /// `sc status` prints), optionally as JSON.
-pub async fn run_ls(args: ConnectionLsArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+pub async fn run_ls(json: bool) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(None)?;
     let conns = crate::cli::discovery::connections(&custodian, &vault).await?;
 
-    if args.json {
+    if json {
         let arr: Vec<Value> = conns
             .iter()
-            .map(|c| serde_json::json!({ "id": c.name, "hosts": c.hosts, "phantoms": c.phantoms }))
+            .map(|c| serde_json::json!({ "id": c.name, "hosts": c.hosts, "phantoms": c.phantoms, "setup": c.setup }))
             .collect();
         println!(
             "{}",
@@ -152,7 +152,7 @@ pub async fn run_ls(args: ConnectionLsArgs) -> Result<(), String> {
 /// `--keep-secrets` keeps everything (unreference only). Two passkey gestures
 /// (unlock + write); confirms first unless `--yes`.
 pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     let id = slugify_conn_id(&args.id);
     if id.is_empty() {
         return Err(format!("'{}' is not a valid connection id", args.id));
@@ -187,7 +187,7 @@ pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "connection-rm" }, "target": id, "scope": { "keep_secrets": args.keep_secrets } },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,
@@ -303,7 +303,7 @@ async fn run_raw(
     let op = json!({
         "act": { "type": { "custom": "connection-add" }, "target": name, "scope": scope },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,
@@ -436,7 +436,7 @@ async fn run_service_backed(
     let op = json!({
         "act": { "type": { "custom": "connection-add" }, "target": name, "scope": scope },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,

@@ -26,6 +26,7 @@ use crate::error::{AppError, Result};
 use crate::protocol::Operation;
 use crate::server::handlers::op::validate_vault_id;
 use crate::state::AppState;
+use crate::storage::item::VaultKeys;
 use crate::storage::plaintext::VaultPlaintextView;
 use crate::storage::sealed_vault::find_pubkey_in_registry;
 
@@ -64,11 +65,19 @@ pub async fn passkeys(
     // enrolled vault that simply had no secrets yet.
     let per_item_path = state.vaults.per_item_path(&vault_id)?;
     let vault_path = state.vaults.vault_path(&vault_id)?;
-    let (registry, credentials) =
+    // Enrolled passkeys come from BOTH keyset shapes: the v1 legacy `credentials` rows
+    // (which carry prf_salt / wc_check / pubkey) AND the v2 membership `uik.creds` (which
+    // carry only identity + K-seal — the recovery material lives in the cloud and is
+    // served to the grant page directly). A migrated / born-v2 keyset has an EMPTY
+    // `credentials` vec, so without the uik pass below this endpoint returned zero
+    // passkeys → the daemon reported "vault has no enrolled passkeys" and could not run
+    // the unlock / approve ceremony.
+    let (registry, credentials, uik_creds) =
         if let Some(pv) = crate::storage::sealed_vault::read_per_item(&per_item_path)? {
-            (pv.keyset.registry, pv.keyset.credentials)
+            let uik_creds = pv.keyset.uik.map(|u| u.creds).unwrap_or_default();
+            (pv.keyset.registry, pv.keyset.credentials, uik_creds)
         } else if let Some(v) = crate::storage::sealed_vault::read(&vault_path)? {
-            (v.registry, v.credentials)
+            (v.registry, v.credentials, Default::default())
         } else {
             return Ok(Json(json!({ "vault_exists": false, "passkeys": [] })));
         };
@@ -90,7 +99,7 @@ pub async fn passkeys(
     if state.is_vault_locked(&vault_id) {
         tracing::debug!(vault = %vault_id, "GET /passkeys while vault locked — prf_salt returned; TODO: gate on session token (F-24)");
     }
-    let metas: Vec<PasskeyMeta> = credentials
+    let mut metas: Vec<PasskeyMeta> = credentials
         .iter()
         .map(|c| {
             // Emit credential_id as base64url-no-pad. credentialId is the one
@@ -115,6 +124,31 @@ pub async fn passkeys(
             }
         })
         .collect();
+    // v2 (membership) keyset: the account's OWN passkeys live in `uik.creds` keyed by
+    // their credential id. OTHER team members are keyed by `us_…` (a person id, not an
+    // offerable credential) — excluded (you can only unlock with your own passkey).
+    // These entries carry identity + K-seal, NOT the recovery material (prf_salt /
+    // wc_check / pubkey): that lives in the cloud and is served straight to the grant
+    // page (backend `grantPasskeyMaterial`), so the credential_id alone is enough to
+    // OFFER the ceremony and to satisfy the non-empty enrolled-passkeys check.
+    {
+        let have: std::collections::HashSet<String> =
+            metas.iter().map(|m| m.credential_id.clone()).collect();
+        for cid in uik_creds.keys() {
+            if cid.starts_with("us_") || have.contains(cid.as_str()) {
+                continue;
+            }
+            metas.push(PasskeyMeta {
+                credential_id: cid.clone(),
+                device_name: String::new(),
+                created_at: 0,
+                prf_salt: String::new(),
+                public_key_x: None,
+                public_key_y: None,
+                wc_check: None,
+            });
+        }
+    }
     // Pending-passkey deposits (Stage 1 done, awaiting Stage 2 Enroll).
     // list() opportunistically GC-sweeps expired files — that's the only
     // place we know the daemon is actively serving this vault. Failure to
@@ -315,6 +349,60 @@ pub fn unwrap_k_from_keyset(
     Ok(zeroize::Zeroizing::new(k_bytes))
 }
 
+/// Acquire the vault state key `K` from a keyset given the 32-byte secret the
+/// grant delivered — the v1/v2 unified K-acquisition seam.
+///
+/// - **v1 keyset** (`uik = None`): `secret` is the custody wrapping key `W_c`;
+///   unwrap `K̂_c` directly ([`unwrap_k_from_keyset`]).
+/// - **v2 keyset** (`custody → UIK → K`, team-shared-vault-security-model.md §5):
+///   `secret` is the member's UIK **root** (the browser already custody-unwrapped
+///   it from the passkey PRF), and `K` is HPKE-sealed to the member's UIK enc key
+///   in this credential's per-row seal ([`crate::crypto::vault_key::UikRoot::open_k`]).
+///
+/// One seam so no read path can diverge on how a grant resolves `K` across the
+/// two keyset formats. The grant wire is identical in both cases (a 32-byte
+/// secret HPKE-sealed to the daemon's `sc_pk`); only its meaning differs, and
+/// the keyset shape (`uik.is_some()`) — not the wire — selects the branch.
+pub fn acquire_k_from_keyset(
+    keyset: &crate::storage::sealed_vault::Keyset,
+    secret: &[u8],
+    credential_id_bytes: &[u8],
+    vault_id: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let Some(uik) = keyset.uik.as_ref() else {
+        // v1: `secret` is W_c → unwrap K directly.
+        return unwrap_k_from_keyset(keyset, secret, credential_id_bytes);
+    };
+    // v2: `secret` is the UIK root → open K from this member's K-seal.
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    if secret.len() != 32 {
+        return Err(AppError::Unauthorized("UIK root must be 32 bytes".into()));
+    }
+    let mut root = zeroize::Zeroizing::new([0u8; 32]);
+    root.copy_from_slice(secret);
+    let uik_root = crate::crypto::vault_key::UikRoot::from_root(*root);
+    // The K seal (`k_encapped`/`k_ct`) is per-PERSON: it seals K to this member's UIK
+    // encryption key, so EVERY credential of the person carries the SAME seal (the
+    // membership fold copies `m.k_encapped` onto each cred row). Prefer this
+    // credential's own entry, but if it isn't in the synced keyset yet — an
+    // upgraded/newly-added passkey the daemon's since-cursor hasn't caught (e.g.
+    // `putCredentialWrap` doesn't bump `keyset_seq`) — fall back to ANY entry for the
+    // SAME person, resolved from the delivered root's `us_…`. Safe: the delivered root
+    // proves the approver controls THIS person's UIK, so opening with that person's own
+    // seal is exactly right and never crosses to another member (open_k is
+    // authenticated, so a mismatched root fails closed anyway).
+    let cid_b64 = URL_SAFE_NO_PAD.encode(credential_id_bytes);
+    let us_id = uik_root.user_id();
+    let entry = uik
+        .creds
+        .get(&cid_b64)
+        .or_else(|| uik.creds.values().find(|c| c.user_id == us_id))
+        .ok_or_else(|| AppError::Unauthorized("no UIK seal for this member".into()))?;
+    uik_root.open_k(vault_id, &entry.k_encapped, &entry.k_ct)
+}
+
+
 /// Per-item analogue of [`decrypt_vault_view`]: unwrap `K` from the keyset via
 /// the grant, then fold all live item rows into a [`VaultPlaintextView`]. Used
 /// by the per-item Export path. Discards `K` after the fold (read-only).
@@ -324,8 +412,8 @@ pub fn decrypt_vault_view_peritem(
     vault: &crate::storage::sealed_vault::PerItemVault,
     vault_id: &str,
 ) -> Result<VaultPlaintextView> {
-    let k = unwrap_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes)?;
-    vault.fold_view::<StdPrimitives>(&k, vault_id)
+    let k = acquire_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes, vault_id)?;
+    vault.fold_view::<StdPrimitives>(VaultKeys::from_material(&k), vault_id)
 }
 
 /// Per-item analogue of [`decrypt_vault_view_keep_key`]: like
@@ -339,8 +427,8 @@ pub fn decrypt_vault_view_peritem_keep_key(
     vault: &crate::storage::sealed_vault::PerItemVault,
     vault_id: &str,
 ) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
-    let k = unwrap_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes)?;
-    let view = vault.fold_view::<StdPrimitives>(&k, vault_id)?;
+    let k = acquire_k_from_keyset(&vault.keyset, wrapping_key, credential_id_bytes, vault_id)?;
+    let view = vault.fold_view::<StdPrimitives>(VaultKeys::from_material(&k), vault_id)?;
     Ok((view, k))
 }
 
@@ -354,7 +442,7 @@ pub fn decrypt_vault_view_peritem_with_key(
     vault: &crate::storage::sealed_vault::PerItemVault,
     vault_id: &str,
 ) -> Result<VaultPlaintextView> {
-    vault.fold_view::<StdPrimitives>(k, vault_id)
+    vault.fold_view::<StdPrimitives>(VaultKeys::from_material(k), vault_id)
 }
 
 /// THE per-item read seam for the live grant paths (Export / Use / unlock).
@@ -398,12 +486,18 @@ pub fn open_view_for_grant_keep_key(
 ) -> Result<(VaultPlaintextView, zeroize::Zeroizing<Vec<u8>>)> {
     if let Ok(path) = state.vaults.per_item_path(vault_id) {
         if let Ok(Some(pv)) = crate::storage::sealed_vault::read_per_item(&path) {
-            return decrypt_vault_view_peritem_keep_key(
+            let (view, k) = decrypt_vault_view_peritem_keep_key(
                 wrapping_key,
                 credential_id_bytes,
                 &pv,
                 vault_id,
-            );
+            )?;
+            // Team serve-time policy (the shared-vault owner lock-list: which
+            // owner-only config the backend write-gates) is CLOSED: it lives in
+            // the private safeclaw-ee overlay behind this seam, so a personal /
+            // open-source build (NoopHooks) registers nothing. team-edition §9.
+            state.team.on_vault_unlocked(state, vault_id, &k);
+            return Ok((view, k));
         }
     }
     // Whole-blob fallback — see open_view_for_grant.

@@ -10,7 +10,7 @@ Multi-account: switch the phantom value (__sc__netlify_work__).
 id = "netlify"
 name = "Netlify"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 hosts = ["api.netlify.com"]
 secrets = ["NETLIFY_API_TOKEN"]

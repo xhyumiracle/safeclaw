@@ -27,7 +27,7 @@ enum BrokerIntent {
 }
 
 pub async fn run_set(args: SetArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     // §1: secret KEYs are ALWAYS uppercase. Force-uppercase on input (a lowercase
     // key is auto-converted, never stored lowercase) so there is one canonical
     // form. Reject anything that isn't a valid env KEY even after uppercasing.
@@ -81,7 +81,7 @@ pub async fn run_set(args: SetArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "secret-set" }, "target": key, "scope": scope },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,
@@ -195,7 +195,7 @@ fn prompt_host(key: &str) -> Result<String, String> {
 }
 
 pub async fn run_rm(args: RmArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     // §1: secret KEYs are canonical uppercase — normalize on input so `sc rm
     // github_token` finds the stored `GITHUB_TOKEN`.
     let key = args.key.trim().to_ascii_uppercase();
@@ -206,7 +206,7 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     // op). The referenced-by detail is reported AFTER — the daemon computes it
     // while it holds the open vault. The KEY name rides the op (public); the
     // value never leaves the vault.
-    if !args.force && std::io::stdin().is_terminal() {
+    if !args.yes && std::io::stdin().is_terminal() {
         let ans = crate::cli::connect::prompt_line(&format!("Remove key '{}'? [y/N]: ", key))?;
         if !matches!(ans.trim(), "y" | "Y" | "yes" | "YES") {
             eprintln!("aborted");
@@ -216,7 +216,7 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "secret-rm" }, "target": key, "scope": null },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,
@@ -253,7 +253,7 @@ pub async fn run_rm(args: RmArgs) -> Result<(), String> {
 }
 
 pub async fn run_get(args: GetArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+    let (custodian, vault) = resolve_active(None)?;
     // Case-SENSITIVE exact match — the mainstream convention for env vars and
     // secret managers (GCP/AWS/Vault). `get` reads across ALL stores: native
     // keys are canonical UPPERCASE, but external stores (GCP Secret Manager)
@@ -269,7 +269,7 @@ pub async fn run_get(args: GetArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": "export", "target": key, "scope": null },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = ApproveOpts {
         no_browser: args.no_browser,

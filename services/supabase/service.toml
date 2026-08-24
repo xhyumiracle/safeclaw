@@ -12,7 +12,7 @@ value (__sc__supabase_work__).
 id = "supabase"
 name = "Supabase"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 hosts = ["api.supabase.com"]
 secrets = ["SUPABASE_ACCESS_TOKEN"]

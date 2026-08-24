@@ -1,7 +1,7 @@
 //! `safeclaw passkey ...` — manage the active vault's enrolled passkeys.
 //!
-//! Only `ls` ships today; `add` / `remove` / `rename` need the same
-//! WebAuthn + crypto plumbing as `sc vault create` and `sc write` —
+//! Only `ls` ships today; `add` / `rm` / `rename` need the same
+//! WebAuthn + crypto plumbing as `sc vault create` and `sc write`,
 //! they'll land alongside those. The placeholder stubs print a clear
 //! "deferred" message so the surface is discoverable from `--help`.
 
@@ -10,21 +10,21 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::cli::active::resolve_active;
-use crate::config::{CommonArgs, PasskeyRemoveArgs, PasskeyRenameArgs, PasskeySubcommand};
+use crate::config::{PasskeyRemoveArgs, PasskeyRenameArgs, PasskeySubcommand};
 
-pub async fn run(sub: PasskeySubcommand) -> Result<(), String> {
+pub async fn run(sub: PasskeySubcommand, json: bool) -> Result<(), String> {
     match sub {
-        PasskeySubcommand::Ls(a) => run_ls(a).await,
+        PasskeySubcommand::Ls(_a) => run_ls(json).await,
         PasskeySubcommand::Add(_) => Err(
-            "passkey add — not yet implemented (needs the /v/new-style crypto ceremony)"
+            "passkey add, not yet implemented (needs the /v/new-style crypto ceremony)"
                 .into(),
         ),
-        PasskeySubcommand::Remove(a) => Err(format!(
-            "passkey remove {} — not yet implemented (needs passkey-signed Custom op)",
+        PasskeySubcommand::Rm(a) => Err(format!(
+            "passkey rm {}, not yet implemented (needs passkey-signed Custom op)",
             a.credential_id
         )),
         PasskeySubcommand::Rename(a) => Err(format!(
-            "passkey rename {} -> {} — not yet implemented (daemon has no metadata-update endpoint)",
+            "passkey rename {} -> {}, not yet implemented (daemon has no metadata-update endpoint)",
             a.credential_id, a.new_name
         )),
     }
@@ -51,8 +51,8 @@ struct PasskeyMeta {
     created_at: Option<String>,
 }
 
-async fn run_ls(args: CommonArgs) -> Result<(), String> {
-    let (custodian, vault) = resolve_active(args.vault.as_deref())?;
+async fn run_ls(json: bool) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(None)?;
     let url = format!(
         "{}/v/{}/passkeys",
         custodian.trim_end_matches('/'),
@@ -75,6 +75,29 @@ async fn run_ls(args: CommonArgs) -> Result<(), String> {
         ));
     }
     let body: PasskeysBody = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+    if json {
+        // Machine-readable mirror of the human table: one object per enrolled
+        // passkey (public metadata only). A not-yet-enrolled or empty vault
+        // emits an empty array.
+        let arr: Vec<serde_json::Value> = body
+            .passkeys
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "credential_id": p.credential_id,
+                    "device_name": p.device_name,
+                    "transports": p.transports,
+                    "last_used_at": p.last_used_at,
+                    "created_at": p.created_at,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".into())
+        );
+        return Ok(());
+    }
     if !body.vault_exists {
         println!(
             "(vault {} is not yet enrolled — run `safeclaw setup`)",

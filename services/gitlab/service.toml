@@ -11,7 +11,7 @@ Same shape for remote add / push / fetch. Multi-account: switch the phantom valu
 id = "gitlab"
 name = "GitLab"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 # One GitLab connection (one PAT) backs both the REST API (gitlab.com/api/v4) and
 # git-over-HTTPS (gitlab.com). Both share GITLAB_TOKEN.

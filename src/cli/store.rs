@@ -11,11 +11,11 @@ use serde::Deserialize;
 use crate::cli::active::resolve_active;
 use crate::config::StoreSubcommand;
 
-pub async fn run(sub: StoreSubcommand) -> Result<(), String> {
+pub async fn run(sub: StoreSubcommand, json: bool) -> Result<(), String> {
     match sub {
-        StoreSubcommand::Ls(args) => {
-            let (custodian, vault) = resolve_active(args.vault.as_deref())?;
-            ls(&custodian, &vault).await
+        StoreSubcommand::Ls(_args) => {
+            let (custodian, vault) = resolve_active(None)?;
+            ls(&custodian, &vault, json).await
         }
     }
 }
@@ -41,7 +41,7 @@ struct StoreError {
     error: String,
 }
 
-async fn ls(custodian: &str, vault: &str) -> Result<(), String> {
+async fn ls(custodian: &str, vault: &str, json: bool) -> Result<(), String> {
     let url = format!(
         "{}/v/{}/secret-keys",
         custodian.trim_end_matches('/'),
@@ -67,6 +67,33 @@ async fn ls(custodian: &str, vault: &str) -> Result<(), String> {
         ));
     }
     let body: KeysKnown = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+
+    if json {
+        // Machine-readable mirror of the human table: one object per store (id,
+        // kind, key count) plus any per-store list errors.
+        let stores: Vec<serde_json::Value> = body
+            .stores
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "kind": s.kind,
+                    "keys": s.keys.len(),
+                })
+            })
+            .collect();
+        let errors: Vec<serde_json::Value> = body
+            .store_errors
+            .iter()
+            .map(|e| serde_json::json!({ "store_id": e.store_id, "error": e.error }))
+            .collect();
+        let out = serde_json::json!({ "stores": stores, "store_errors": errors });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into())
+        );
+        return Ok(());
+    }
 
     if body.stores.is_empty() && body.store_errors.is_empty() {
         println!("(no external stores connected)");

@@ -10,7 +10,8 @@ curl -fsSL https://raw.githubusercontent.com/SafeClaw-OSS/safeclaw/main/install.
 ```
 
 Puts the `sc` binary in `~/.local/bin` after verifying its `SHA256SUMS`. No
-sudo, no system changes. `sc --version` to confirm.
+sudo, no system changes. `sc --version` to confirm. Supported platforms and how
+to verify the download: [Platform support](reference/platform-support.md).
 
 ## 2. Create your vault
 
@@ -26,14 +27,14 @@ install prompt. Paste the prompt to your agent and it does the rest. What it
 runs:
 
 ```bash
-sc login --pair-token spt_…   # pair this machine; brings the daemon up and
+sc login                      # pair this machine; brings the daemon up and
                               # prints a passkey-approval link you open once
 sc agent add my-agent         # mint the agent's env file:
-                              # SAFECLAW_BROKER_URL / SAFECLAW_VAULT_ID / SAFECLAW_API_KEY
+                              # SAFECLAW_BROKER_URL / SAFECLAW_AGENT_IDENTITY
 ```
 
-The pair token is single-use and the approval is a passkey tap in your
-browser. After this, `sc status` shows the daemon up and the vault unlocked.
+The approval is a passkey tap in your browser. After this, `sc status` shows
+the daemon up and the vault unlocked.
 
 ## 4. Add a credential
 

@@ -13,7 +13,6 @@
 use std::time::Duration;
 
 use crate::cli::active::{config_path, resolve_active};
-use crate::config::CommonArgs;
 
 #[derive(Debug, Clone, Copy)]
 enum Mark {
@@ -26,6 +25,14 @@ impl Mark {
     fn label(self) -> &'static str {
         match self {
             Mark::Ok => "ok  ",
+            Mark::Warn => "warn",
+            Mark::Fail => "fail",
+        }
+    }
+    /// Untrimmed key for machine output (`--json`).
+    fn key(self) -> &'static str {
+        match self {
+            Mark::Ok => "ok",
             Mark::Warn => "warn",
             Mark::Fail => "fail",
         }
@@ -49,9 +56,29 @@ impl Report {
         }
         !self.rows.iter().any(|(m, _)| matches!(m, Mark::Fail))
     }
+    /// Render the report either as the human check list or (when `json`) as a
+    /// `{ ok, checks: [{ level, message }] }` object mirroring the same rows.
+    /// Returns the overall pass/fail status either way.
+    fn emit(&self, json: bool) -> bool {
+        if !json {
+            return self.print_and_status();
+        }
+        let checks: Vec<serde_json::Value> = self
+            .rows
+            .iter()
+            .map(|(m, msg)| serde_json::json!({ "level": m.key(), "message": msg }))
+            .collect();
+        let ok = !self.rows.iter().any(|(m, _)| matches!(m, Mark::Fail));
+        let out = serde_json::json!({ "ok": ok, "checks": checks });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".into())
+        );
+        ok
+    }
 }
 
-pub async fn run(args: CommonArgs) -> Result<(), String> {
+pub async fn run(json: bool) -> Result<(), String> {
     let mut report = Report::new();
 
     // Platform + build (debug aid): the first thing a bug report needs — which
@@ -116,7 +143,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
     }
 
     // Active config resolution
-    let resolved = resolve_active(args.vault.as_deref());
+    let resolved = resolve_active(None);
     let (custodian, vault) = match resolved {
         Ok(pair) => {
             report.push(
@@ -127,7 +154,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         }
         Err(e) => {
             report.push(Mark::Fail, format!("active config: {}", e));
-            let _ = report.print_and_status();
+            let _ = report.emit(json);
             return Err("active-config resolution failed".into());
         }
     };
@@ -196,20 +223,26 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         Err(e) => report.push(Mark::Warn, format!("vault probe: {}", e)),
     }
 
-    // SAFECLAW_API_KEY (informational): the AGENT's identity. The proxy
-    // verifies it before any phantom substitution (§8) — localhost included —
-    // so an agent's env must carry one (minted by `sc agent add`); a human
-    // shell without it just can't broker credentials, everything else works.
-    match std::env::var("SAFECLAW_API_KEY") {
-        Ok(v) if !v.is_empty() => report.push(
-            Mark::Ok,
-            format!("$SAFECLAW_API_KEY: set ({} chars)", v.len()),
-        ),
-        _ => report.push(
-            Mark::Ok,
-            "$SAFECLAW_API_KEY: unset (fine for a human shell — credential \
-             substitution needs an agent env, minted by `sc agent add`)",
-        ),
+    // Agent identity (informational): a current agent authenticates by its AIK
+    // (`SAFECLAW_AGENT_IDENTITY`, a path to an identity file `sc run` signs with);
+    // a legacy agent may instead carry `SAFECLAW_API_KEY`. Either one lets this
+    // shell broker credentials, and a human shell needs neither. Report whichever
+    // is present so a fully set-up keyless agent is never told it has no agent env.
+    match std::env::var("SAFECLAW_AGENT_IDENTITY") {
+        Ok(v) if !v.is_empty() => {
+            report.push(Mark::Ok, format!("$SAFECLAW_AGENT_IDENTITY: set ({})", v))
+        }
+        _ => match std::env::var("SAFECLAW_API_KEY") {
+            Ok(v) if !v.is_empty() => report.push(
+                Mark::Ok,
+                format!("$SAFECLAW_API_KEY: set ({} chars, legacy)", v.len()),
+            ),
+            _ => report.push(
+                Mark::Ok,
+                "agent identity: none in this shell (fine for a human shell; an \
+                 agent gets one from `sc agent add`)",
+            ),
+        },
     }
 
     // Egress proxy (informational): the one upstream the daemon + this CLI use to
@@ -271,7 +304,7 @@ pub async fn run(args: CommonArgs) -> Result<(), String> {
         Err(_) => {}
     }
 
-    let ok = report.print_and_status();
+    let ok = report.emit(json);
     if ok {
         Ok(())
     } else {

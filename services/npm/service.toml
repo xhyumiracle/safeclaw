@@ -1,8 +1,5 @@
 setup = """
-Routed (under `sc run` / the env bundle)? Nothing to configure — npm honours the
-proxy + CA env directly, so the npm token never enters .npmrc, env, or the agent
-process.
-Not routed? Prefix the publish: `sc run -- npm publish`.
+Run the publish under `sc run -- npm publish`.
 Store an npm *automation* token in the vault (bypasses 2FA-on-publish; the broker
 can't supply an interactive OTP). Expect a passkey prompt on publish — tap the
 approve link (in npm's error output), then re-run.
@@ -12,7 +9,7 @@ approve link (in npm's error output), then re-run.
 id = "npm"
 name = "npm"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 hosts = ["registry.npmjs.org"]
 secrets = ["NPM_TOKEN"]

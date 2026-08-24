@@ -290,11 +290,40 @@ pub async fn approve_op(
     // has NO vault.dat — its keyset (credential pubkeys) lives in the per-item
     // store. Read it once so credential lookup + the read grants (Unlock / Use /
     // Export) below work for those vaults too.
-    let existing_per_item = state
+    let mut existing_per_item = state
         .vaults
         .per_item_path(&vault_id)
         .ok()
         .and_then(|p| read_per_item(&p).ok().flatten());
+    // SELF-HEAL a stale keyset registry before validating. If the credential this
+    // grant is signed with isn't resolvable yet, force a FULL membership re-pull
+    // and re-read. An out-of-band x/y backfill (a credential's WebAuthn pubkey
+    // added to an already-synced membership) does NOT bump the membership seq, so
+    // the daemon never re-pulled and `credential_lookup` misses it even though the
+    // cloud offers it ("unknown credential"). Best-effort: a failed re-pull just
+    // leaves the original miss to surface (now as a clear rejection, not a hang).
+    let cred_resolvable = existing_vault
+        .as_ref()
+        .and_then(|v| find_pubkey(v, &grant.credential_id))
+        .or_else(|| {
+            existing_per_item
+                .as_ref()
+                .and_then(|pv| find_pubkey_in_registry(&pv.keyset.registry, &grant.credential_id))
+        })
+        .is_some();
+    if !cred_resolvable {
+        match crate::sync::resync_membership_now(&state, &vault_id).await {
+            Ok(n) => {
+                tracing::info!(op = %op_id, vault = %vault_id, adopted = n, "approve self-heal: re-pulled membership for unresolved credential");
+                existing_per_item = state
+                    .vaults
+                    .per_item_path(&vault_id)
+                    .ok()
+                    .and_then(|p| read_per_item(&p).ok().flatten());
+            }
+            Err(e) => tracing::debug!(op = %op_id, "approve self-heal re-pull failed: {}", e),
+        }
+    }
     let lookup_credential = |cred_id_b64: &str| -> Option<PasskeyEntry> {
         existing_vault
             .as_ref()
@@ -786,12 +815,14 @@ pub async fn approve_op(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let pc = state
-                .approvals
-                .lock()
-                .unwrap()
-                .get(&op_id)
-                .and_then(|r| r.policy_context.clone());
+            let (pc, grant_agent) = {
+                let store = state.approvals.lock().unwrap();
+                let rec = store.get(&op_id);
+                (
+                    rec.and_then(|r| r.policy_context.clone()),
+                    rec.and_then(|r| r.agent_prefix.clone()).unwrap_or_default(),
+                )
+            };
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -842,6 +873,7 @@ pub async fn approve_op(
                 if !conn.is_empty() && !method.is_empty() && !host.is_empty() && !path.is_empty() {
                     state.op_grant_insert(
                         &vault_id,
+                        &grant_agent,
                         &conn,
                         method,
                         &host,
@@ -860,7 +892,13 @@ pub async fn approve_op(
                 // Unscoped ask (and legacy no-context ops): conn-keyed value with
                 // the grant-window TTL, read by the downgraded-to-Allow retry.
                 let ttl = pc.as_ref().map(|p| p.ttl_seconds).unwrap_or(300);
-                state.cache_insert(&vault_id, &conn, s_o, Some(now + ttl));
+                state.cache_insert(
+                    &vault_id,
+                    &conn,
+                    s_o,
+                    Some(now + ttl),
+                    Some(grant_agent.clone()),
+                );
             }
             (
                 json!({ "ok": true, "act": "use", "authorized": true, "stream": true }),
@@ -1706,7 +1744,7 @@ pub async fn approve_op(
     // the record before mutation so we can write into the rule-approvals
     // cache below — without this, an `ask`-with-TTL approval would never
     // short-circuit the next matching request.
-    let (rec_id, rec_vault_id, response_preview, policy_ctx_for_cache) = {
+    let (rec_id, rec_vault_id, response_preview, policy_ctx_for_cache, rec_agent_prefix) = {
         let mut store = state.approvals.lock().unwrap();
         let rec = store
             .approve(&op_id, cached_value.clone())
@@ -1725,7 +1763,13 @@ pub async fn approve_op(
         } else {
             None
         };
-        (rec.id.clone(), rec.vault_id.clone(), preview, pc)
+        (
+            rec.id.clone(),
+            rec.vault_id.clone(),
+            preview,
+            pc,
+            rec.agent_prefix.clone().unwrap_or_default(),
+        )
     };
 
     // Cache write: an Ask-level approval scopes a TTL'd "next matching
@@ -1793,6 +1837,7 @@ pub async fn approve_op(
             if !conn.is_empty() && !req_method.is_empty() {
                 state.record_ask_approval(
                     &rec_vault_id,
+                    &rec_agent_prefix,
                     &conn,
                     pc.rule_id,
                     &req_method,
@@ -1946,12 +1991,19 @@ fn seed_per_item_store(
             registry: vault.registry.clone(),
             credentials: vault.credentials.clone(),
             keyset_version,
+            // Bootstrapped from a v1 whole-blob vault → v1 keyset (a v2 vault is
+            // born directly as a per-item store in the ceremony, never here).
+            uik: None,
         },
         items: std::collections::BTreeMap::new(),
         items_seq,
         keyset_seq,
     };
-    if let Err(e) = pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view) {
+    if let Err(e) = pv.seed_items_from_view::<sudp::primitives::StdPrimitives>(
+        crate::storage::item::VaultKeys::single(k),
+        vault_id,
+        view,
+    ) {
         tracing::warn!(vault = %vault_id, "per-item seed from view failed: {}", e);
         return;
     }
@@ -2011,6 +2063,7 @@ pub(crate) fn bootstrap_cache_from_view(
         .iter()
         .map(|(c, conn)| (c.clone(), conn.clone()))
         .collect();
+    cache.agents = view.aux.agents.clone();
     // Snapshot native-store item names (names only, never values). Surface
     // for GET /v/{vid}/secret-keys so the frontend can compute "which
     // services are reachable" without re-walking the kv map.
@@ -2087,6 +2140,7 @@ pub(crate) fn bootstrap_cache_from_view(
                             value: val.to_vec(),
                             expires_at: None, // allow = lives whole unlocked session
                             from_bootstrap: true,
+                            agent_prefix: None,
                         },
                     );
                 }
@@ -2149,6 +2203,7 @@ pub(crate) fn bootstrap_cache_from_view(
                         value: val.to_vec(),
                         expires_at: None,
                         from_bootstrap: true,
+                        agent_prefix: None,
                     },
                 );
             }
@@ -2207,6 +2262,7 @@ pub(crate) fn bootstrap_cache_from_view(
                     value: primary,
                     expires_at: None,
                     from_bootstrap: true,
+                    agent_prefix: None,
                 },
             );
         }
@@ -2422,6 +2478,7 @@ pub(crate) async fn lazy_fill_external(
                     value: val,
                     expires_at: None,
                     from_bootstrap: true,
+                    agent_prefix: None,
                 });
         }
         if !map.is_empty() {
@@ -2499,6 +2556,7 @@ mod tests {
         let view = VaultPlaintextView {
             aux,
             native_secrets,
+            legacy_addressing: false,
         };
 
         let cache = bootstrap_cache_from_view(&view, &state);

@@ -11,7 +11,7 @@ value (__sc__cloudflare_dns_work__).
 id = "cloudflare_dns"
 name = "Cloudflare DNS"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 hosts = ["api.cloudflare.com"]
 secrets = ["CLOUDFLARE_API_TOKEN"]

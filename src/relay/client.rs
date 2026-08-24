@@ -10,6 +10,7 @@ use base64::{
 };
 use serde_json::{json, Value};
 
+use crate::device_auth::DikRequestExt;
 use crate::state::AppState;
 
 /// Poll cadence (v1.1, mode-dependent). The wait between polls is
@@ -73,6 +74,10 @@ pub fn spawn_register_and_poll(
     op: Value,
     r: String,
     expires_at: u64,
+    // The triggering agent's id (api-key prefix / AIK id), forwarded to the
+    // relay so the approve page can name WHO asked. None for user-initiated
+    // lifecycle ceremonies (unlock/lock/delete).
+    agent_id: Option<String>,
 ) {
     let (relay_url, auth_token) = match resolve_relay(&state) {
         Some(v) => v,
@@ -88,6 +93,7 @@ pub fn spawn_register_and_poll(
             &op,
             &r,
             expires_at,
+            agent_id.as_deref(),
         )
         .await
         {
@@ -113,10 +119,12 @@ pub fn spawn_cancel(state: Arc<AppState>, vault_id: String, op_id: String) {
             Ok(c) => c,
             Err(_) => return,
         };
+        let cancel_body = json!({ "daemon_pubkey": daemon_pubkey });
         match client
             .post(&url)
             .bearer_auth(&auth_token)
-            .json(&json!({ "daemon_pubkey": daemon_pubkey }))
+            .dik_pop("POST", &url, &serde_json::to_vec(&cancel_body).unwrap_or_default())
+            .json(&cancel_body)
             .send()
             .await
         {
@@ -162,6 +170,7 @@ async fn run(
     op: &Value,
     r: &str,
     expires_at: u64,
+    agent_id: Option<&str>,
 ) -> Result<(), String> {
     let base = relay_url.trim_end_matches('/');
     // v1.1: register for `op` stream events before anything can flip the
@@ -183,17 +192,23 @@ async fn run(
     let op_summary = STANDARD.encode(serde_json::to_vec(op).unwrap_or_default());
     let passkeys = fetch_passkeys(&client, state.config.port, vault_id).await;
     let reg_url = format!("{}/v/{}/op/relay/register", base, vault_id);
+    let reg_body = json!({
+        "op_id": op_id,
+        "daemon_pubkey": daemon_pubkey,
+        "op_summary": op_summary,
+        "passkeys": passkeys,
+        "r": r,
+        "expires_at": expires_at,
+        // WHO triggered this op — the agent the local broker authenticated.
+        // Advisory attribution for the approve page (the backend resolves it to
+        // a label); null for user-initiated lifecycle ceremonies.
+        "agent_id": agent_id,
+    });
     let reg = client
         .post(&reg_url)
         .bearer_auth(auth_token)
-        .json(&json!({
-            "op_id": op_id,
-            "daemon_pubkey": daemon_pubkey,
-            "op_summary": op_summary,
-            "passkeys": passkeys,
-            "r": r,
-            "expires_at": expires_at,
-        }))
+        .dik_pop("POST", &reg_url, &serde_json::to_vec(&reg_body).unwrap_or_default())
+        .json(&reg_body)
         .send()
         .await
         .map_err(|e| format!("relay register: {}", e))?;
@@ -211,7 +226,13 @@ async fn run(
             return Ok(()); // op expired; stop quietly
         }
         let last_poll = tokio::time::Instant::now();
-        let resp = match client.get(&poll_url).bearer_auth(auth_token).send().await {
+        let resp = match client
+            .get(&poll_url)
+            .bearer_auth(auth_token)
+            .dik_pop("GET", &poll_url, &[])
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(op = %op_id, "relay poll transient error: {}", e);
@@ -228,14 +249,14 @@ async fn run(
                     .map_err(|e| format!("relay poll parse: {}", e))?;
                 let grant = body.get("sealed_grant").cloned().unwrap_or(body);
                 if let Err(e) = apply_grant(state.clone(), op_id, grant).await {
-                    // The human APPROVED but the daemon couldn't apply. The
-                    // canonical cause — a value stash dying under a longer op
-                    // window — is structurally gone (both derive from
-                    // aux.policy.timeout now); this is belt-and-suspenders.
-                    // A consent that silently evaporates is the worst UX
-                    // ("I approved — where did it go?"): terminalize the
-                    // local row as `expired` WITH the reason so it ships to
-                    // the cloud feed instead of sitting `pending`, invisible.
+                    // The human APPROVED but the daemon can't apply this grant.
+                    // The canonical cause now is a tapped passkey that isn't in
+                    // THIS vault's keyset ("unknown credential"), after the approve
+                    // path's self-heal re-pull still couldn't resolve it. Record the
+                    // reason locally, then REJECT the op so `sc unlock` / `sc op
+                    // wait` returns a definitive, actionable error. Ending the poll
+                    // with Err instead (the old behavior) left the relay op
+                    // 'approved' and hung the CLI forever on "Waiting for approval".
                     if let Ok(audit) = state.audits.for_vault(vault_id) {
                         let _ = audit.finalize(
                             op_id,
@@ -246,7 +267,9 @@ async fn run(
                             None,
                         );
                     }
-                    return Err(e);
+                    tracing::warn!(op = %op_id, "approved grant could not be applied ({}); rejecting so the CLI fails clearly instead of hanging", e);
+                    apply_reject(state.clone(), op_id).await;
+                    return Ok(());
                 }
                 return Ok(());
             }

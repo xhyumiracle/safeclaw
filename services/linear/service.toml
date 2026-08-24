@@ -13,7 +13,7 @@ Multi-account: switch the phantom value (__sc__linear_work__).
 id = "linear"
 name = "Linear"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 hosts = ["api.linear.app"]
 secrets = ["LINEAR_API_KEY"]

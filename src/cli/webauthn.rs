@@ -93,7 +93,6 @@ pub async fn do_browser_gesture(
     let state_token = random_hex(16);
     let (tx, rx) = oneshot::channel::<GestureResult>();
     let cb_state = Arc::new(CbState {
-        expected_state: state_token.clone(),
         tx: Mutex::new(Some(tx)),
     });
     let app = Router::new()
@@ -174,8 +173,8 @@ pub async fn create_op(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        // Surface the daemon's human message (e.g. the 423 "vault locked — run
-        // `sc up` to unlock" hint) instead of a raw JSON error envelope.
+        // Surface the daemon's human message (e.g. the 423 "vault locked. Run
+        // `sc unlock`" hint) instead of a raw JSON error envelope.
         let msg = serde_json::from_str::<Value>(&body)
             .ok()
             .and_then(|v| v["message"].as_str().map(str::to_string))
@@ -310,7 +309,6 @@ pub fn random_hex(n: usize) -> String {
 }
 
 struct CbState {
-    expected_state: String,
     tx: Mutex<Option<oneshot::Sender<GestureResult>>>,
 }
 

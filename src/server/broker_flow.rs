@@ -74,15 +74,23 @@ pub fn register_pending_use(
 
     let (op_id, expires_at) = {
         let mut store = state.approvals.lock().unwrap();
-        let id =
-            store.create_with_policy(vault_id.to_string(), op.clone(), r.clone(), policy_context);
+        // Op-agent binding (team §C1): the triggering agent's prefix lands on
+        // the record so every consumption surface can enforce "only the agent
+        // this was approved FOR can use it".
+        let id = store.create_bound(
+            vault_id.to_string(),
+            op.clone(),
+            r.clone(),
+            policy_context,
+            agent_prefix.clone(),
+        );
         let exp = store.get(&id).map(|rec| rec.expires_at_unix).unwrap_or(0);
         (id, exp)
     };
 
     if let Ok(audit_store) = state.audits.for_vault(vault_id) {
         let mut row = audit::row_from_op(&op_id, &op, now as i64, expires_at as i64);
-        row.agent_prefix = agent_prefix;
+        row.agent_prefix = agent_prefix.clone();
         if let Err(e) = audit_store.insert(&row) {
             tracing::warn!(vault = %vault_id, op = %op_id, "audit insert pending (use) failed: {}", e);
         }
@@ -95,6 +103,7 @@ pub fn register_pending_use(
         serde_json::to_value(&op).unwrap_or(Value::Null),
         r.clone(),
         expires_at,
+        agent_prefix,
     );
 
     state.emit_event(ApprovalEvent {

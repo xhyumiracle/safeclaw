@@ -956,6 +956,8 @@ fn reconcile_per_item_after_connect(
                     registry: vault.registry.clone(),
                     credentials: vault.credentials.clone(),
                     keyset_version: 0,
+                    // Bootstrapped from a v1 whole-blob vault → v1 keyset.
+                    uik: None,
                 },
                 items: std::collections::BTreeMap::new(),
                 items_seq: 0,
@@ -963,7 +965,11 @@ fn reconcile_per_item_after_connect(
             }
         }
     };
-    match pv.reconcile_from_view::<sudp::primitives::StdPrimitives>(k, vault_id, view) {
+    match pv.reconcile_from_view::<sudp::primitives::StdPrimitives>(
+        crate::storage::item::VaultKeys::single(k),
+        vault_id,
+        view,
+    ) {
         Ok(changed) => {
             if changed.is_empty() {
                 return;

@@ -20,7 +20,7 @@
 //! flag; and rc builds still can't reach a prod-paired user, who derives stable.
 //! This mirrors the backend's registry channel, which likewise keys off the
 //! `dev.` frontend host rather than a parallel indicator (see
-//! [[project_release_channels]]). `--pre` / `--stable` force a channel for the
+//! [[project_release_channels]]). `--prerelease` / `--stable` force a channel for the
 //! rare cross-grain case (pull an rc while on prod, or drop a dev box to stable).
 
 use std::time::Duration;
@@ -45,7 +45,7 @@ fn asset_name() -> Result<&'static str, String> {
 }
 
 /// Decide the release channel and WHY, before any network call. Explicit flags
-/// win (`--stable` > derivation, `--pre` > derivation; the two can't co-occur —
+/// win (`--stable` > derivation, `--prerelease` > derivation; the two can't co-occur,
 /// clap `conflicts_with`). Otherwise it's derived from the paired cloud's
 /// frontend host: a `dev.` prefix (e.g. `dev.safeclaw.pro`) is a dogfood box and
 /// tracks pre-releases; prod, self-host, and an unpaired daemon all track stable
@@ -57,8 +57,8 @@ fn resolve_channel(args: &UpgradeArgs) -> (bool, String) {
     if args.stable {
         return (false, "stable (--stable)".to_string());
     }
-    if args.pre {
-        return (true, "pre-release (--pre)".to_string());
+    if args.prerelease {
+        return (true, "pre-release (--prerelease)".to_string());
     }
     match frontend_origin() {
         Some(origin) if origin_host(&origin).starts_with("dev.") => (
@@ -146,7 +146,7 @@ mod tests {
     fn args(pre: bool, stable: bool) -> UpgradeArgs {
         UpgradeArgs {
             force: false,
-            pre,
+            prerelease: pre,
             stable,
         }
     }
@@ -170,8 +170,8 @@ mod tests {
         assert!(why.contains("--stable"));
 
         let (pre, why) = resolve_channel(&args(true, false));
-        assert!(pre, "--pre forces pre-release");
-        assert!(why.contains("--pre"));
+        assert!(pre, "--prerelease forces pre-release");
+        assert!(why.contains("--prerelease"));
     }
 }
 
@@ -184,7 +184,7 @@ pub async fn run(args: UpgradeArgs) -> Result<(), String> {
 
     // 0. Resolve which release to pull from. The channel is derived from the
     //    paired cloud (dev → pre-release, prod/self-host/unpaired → stable),
-    //    unless `--pre`/`--stable` force it. Stable = GitHub's `latest` pointer
+    //    unless `--prerelease`/`--stable` force it. Stable = GitHub's `latest` pointer
     //    (skips pre-releases); pre-release = the newest release incl.
     //    pre-releases, resolved by tag → the exact `releases/download/<tag>` base.
     let (want_pre, reason) = resolve_channel(&args);

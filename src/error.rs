@@ -26,6 +26,13 @@ pub enum ScCode {
     CaUnavailable,
     // ── proxy plane (credential pipeline) ────────────────────────────────
     AgentKey,
+    /// A cryptographically-VALID agent AIK proof-of-possession whose `ag_` is NOT
+    /// in this vault's authorized-agents table (design §11): the agent proved its
+    /// identity but the user hasn't authorized it here yet. DISTINCT from
+    /// `AgentKey` (no / invalid credential) — the fix is a one-click Console
+    /// authorize (Agents tab), not a credential change, so it must NEVER read as
+    /// "bad key" (that sends the user debugging the wrong thing).
+    AgentNotAuthorized,
     AmbiguousPhantom,
     ApprovalNeeded,
     ApprovalRegister,
@@ -33,6 +40,14 @@ pub enum ScCode {
     EgressUnreachable,
     ExposesUnsupported,
     HostForbidden,
+    /// A team reach mask excludes this connection for the calling agent
+    /// (team §8.1: visible-but-locked — the connection exists, this agent
+    /// is not enabled for it; the responsible member can enable it).
+    MaskNotEnabled,
+    /// Shared-vault offline lease expired — the daemon has been cut off from
+    /// the cloud (network, or revoked membership parking its sync) beyond the
+    /// lease window; team credentials stop serving until contact resumes.
+    TeamLeaseExpired,
     HostNotAnchored,
     MultiConnection,
     NoVault,
@@ -45,6 +60,11 @@ pub enum ScCode {
     UnknownConnection,
     UpstreamBody,
     UpstreamError,
+    /// The local daemon is too old for a vault it's brokering — the cloud returned
+    /// `SC_UPGRADE_REQUIRED` for this vault's sync (a newer item format). The agent
+    /// should tell the user to run `sc upgrade`, NOT retry or work around it (the
+    /// unified upgrade-required channel; design/agent-device-identity-mtls.md 甲).
+    UpgradeRequired,
 }
 
 impl ScCode {
@@ -79,6 +99,13 @@ impl ScCode {
             Internal => (500, "internal", "Internal error", "retry", "internal"),
             CaUnavailable => (500, "ca_unavailable", "CA unavailable", "retry", "internal"),
             AgentKey => (407, "agent_key", "Agent key invalid", "configure", "auth"),
+            AgentNotAuthorized => (
+                403,
+                "agent_not_authorized",
+                "Agent not authorized on this vault",
+                "none",
+                "auth",
+            ),
             AmbiguousPhantom => (
                 400,
                 "ambiguous_phantom",
@@ -122,6 +149,20 @@ impl ScCode {
                 "request",
             ),
             HostForbidden => (403, "host_forbidden", "Host forbidden", "none", "policy"),
+            MaskNotEnabled => (
+                403,
+                "mask_not_enabled",
+                "Connection not enabled for this agent",
+                "none",
+                "policy",
+            ),
+            TeamLeaseExpired => (
+                403,
+                "team_lease_expired",
+                "Shared-vault offline lease expired",
+                "retry",
+                "policy",
+            ),
             HostNotAnchored => (
                 403,
                 "host_not_anchored",
@@ -188,6 +229,13 @@ impl ScCode {
                 "retry",
                 "upstream",
             ),
+            UpgradeRequired => (
+                426,
+                "upgrade_required",
+                "SafeClaw needs an update",
+                "configure",
+                "config",
+            ),
         }
     }
 
@@ -203,7 +251,7 @@ impl ScCode {
 /// The ONE canonical remediation line for a locked vault — every surface
 /// (control 423, proxy 423, CLI) says exactly this, so the agent sees one
 /// consistent state and relays one consistent fix.
-pub const VAULT_LOCKED_MSG: &str = "vault locked — run `sc up` to unlock, then retry";
+pub const VAULT_LOCKED_MSG: &str = "vault locked. Run `sc unlock`, then retry";
 
 /// RFC 9457 `application/problem+json` body for a code + detail message.
 /// Extension members: `code` / `action` / `cause` (see [`ScCode::row`]),
@@ -233,7 +281,7 @@ pub enum AppError {
     NotFound,
     Conflict(String),
     /// Vault is locked (no in-memory key). Distinct from `Conflict` so the agent
-    /// can tell "unlock needed → run `sc up`" apart from other 409s. HTTP 423.
+    /// can tell "unlock needed → run `sc unlock`" apart from other 409s. HTTP 423.
     VaultLocked,
     TooManyRequests,
     Internal(String),
@@ -340,6 +388,7 @@ mod tests {
             Internal,
             CaUnavailable,
             AgentKey,
+            AgentNotAuthorized,
             AmbiguousPhantom,
             ApprovalNeeded,
             ApprovalRegister,

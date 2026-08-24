@@ -31,39 +31,58 @@ fn is_localhost(custodian: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-pub async fn run(sub: VaultSubcommand) -> Result<(), String> {
+pub async fn run(sub: VaultSubcommand, json: bool) -> Result<(), String> {
     match sub {
-        VaultSubcommand::Status(a) => crate::cli::status::run(a).await,
-        VaultSubcommand::Ls => run_ls().await,
+        VaultSubcommand::Status(_a) => crate::cli::status::run(json).await,
+        VaultSubcommand::Ls(_a) => run_ls(json).await,
         VaultSubcommand::Use(a) => run_use(a).await,
         VaultSubcommand::Forget(a) => run_forget(a).await,
         VaultSubcommand::Create(a) => run_create(a).await,
-        VaultSubcommand::Delete(a) => run_delete(a).await,
+        VaultSubcommand::Rm(a) => run_rm(a).await,
         VaultSubcommand::Unlock(a) => crate::cli::unlock::run_unlock(a).await,
         VaultSubcommand::Lock(a) => crate::cli::unlock::run_lock(a).await,
     }
 }
 
-async fn run_ls() -> Result<(), String> {
+async fn run_ls(json: bool) -> Result<(), String> {
     let cfg = load_config()?;
     let known = known_vaults();
+    let active = (cfg.daemon.as_deref(), cfg.vault.as_deref());
+    if json {
+        let rows: Vec<serde_json::Value> = known
+            .iter()
+            .map(|kv| {
+                json!({
+                    "url": join_vault_url(&kv.daemon, &kv.vault),
+                    "daemon": kv.daemon,
+                    "vault": kv.vault,
+                    "label": kv.label,
+                    "kind": kv.kind,
+                    "default": active == (Some(kv.daemon.as_str()), Some(kv.vault.as_str())),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).unwrap_or_default()
+        );
+        return Ok(());
+    }
     if known.is_empty() {
         println!("(no vaults yet — `safeclaw vault create` or `safeclaw vault use`)");
         return Ok(());
     }
-    let active = (cfg.daemon.as_deref(), cfg.vault.as_deref());
     for (i, kv) in known.iter().enumerate() {
         let marker = if active == (Some(&kv.daemon), Some(&kv.vault)) {
             "*"
         } else {
             " "
         };
-        println!(
-            "  {} {}) {}",
-            marker,
-            i + 1,
-            join_vault_url(&kv.daemon, &kv.vault)
-        );
+        // Lead with the human name + kind so an agent told "the team vault" can
+        // pick the right one; the id trails as the canonical, copyable handle.
+        let name = kv.label.as_deref().unwrap_or("(unnamed)");
+        let kind = kv.kind.as_deref().unwrap_or("?");
+        println!("  {} {}) {} ({})  {}", marker, i + 1, name, kind, kv.vault);
     }
     Ok(())
 }
@@ -80,7 +99,16 @@ fn resolve_url_or_idx(arg: &str) -> Result<(String, String), String> {
         let kv = &known[idx - 1];
         return Ok((kv.daemon.clone(), kv.vault.clone()));
     }
-    split_vault_url(arg).ok_or_else(|| format!("not a valid SAFECLAW_VAULT_URL or index: {}", arg))
+    if let Some(pair) = split_vault_url(arg) {
+        return Ok(pair);
+    }
+    // Otherwise resolve it as a vault TOKEN — id, unique id-prefix, or exact name
+    // (case-insensitive) — via the same git/docker/kubectl resolver `--vault`
+    // uses, so `sc vault use` and `sc run --vault` accept identical handles
+    // (including a quoted name). Ambiguity fails loud with candidates; a name
+    // with spaces just needs quoting.
+    let cfg = load_config().unwrap_or_default();
+    crate::cli::active::resolve_vault_token(arg, &cfg)
 }
 
 async fn run_use(args: VaultUseArgs) -> Result<(), String> {
@@ -122,6 +150,20 @@ async fn run_use(args: VaultUseArgs) -> Result<(), String> {
     }
     put_active(&custodian, &vault).map_err(|e| format!("save config: {}", e))?;
     print_status(&s);
+    // Pin-aware (design/vault-addressing.md): a shell that carries a launch pin
+    // keeps targeting it — say so here, at the moment of the switch, instead of
+    // letting the very next `sc ls` contradict the header above.
+    if let Ok(pin) = std::env::var("SAFECLAW_VAULT_ID") {
+        if !pin.is_empty() && pin != vault {
+            eprintln!(
+                "note: this shell is pinned to {} via $SAFECLAW_VAULT_ID, so `sc` here still targets it;",
+                pin
+            );
+            eprintln!(
+                "      the new default applies everywhere else — `unset SAFECLAW_VAULT_ID` to follow it here"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -378,7 +420,7 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
             }
         },
         "bind": { "redeemer": vault_id },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let (op_id, r) = create_op(&custodian, &vault_id, &enroll_op).await?;
     let r_bytes = STANDARD
@@ -445,9 +487,9 @@ async fn run_create(args: VaultCreateArgs) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
-    if !args.yes_i_mean_it {
-        return Err("destructive — pass --yes-i-mean-it to confirm vault deletion".into());
+async fn run_rm(args: VaultDeleteArgs) -> Result<(), String> {
+    if !args.yes {
+        return Err("destructive; pass -y/--yes to confirm vault deletion".into());
     }
     let (custodian, _) = resolve_active(Some(args.vault.as_str()))?;
     let vault = args.vault.trim().to_string();
@@ -472,7 +514,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
     let op = json!({
         "act": { "type": { "custom": "vault-delete" }, "target": "", "scope": null },
         "bind": { "redeemer": vault },
-        "valid": { "iat": now_unix(), "multiplicity": "one" }
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
     });
     let opts = crate::cli::approve::ApproveOpts {
         no_browser: args.no_browser,
@@ -487,7 +529,7 @@ async fn run_delete(args: VaultDeleteArgs) -> Result<(), String> {
         &opts,
     )
     .await?;
-    eprintln!("safeclaw vault delete — ok (vault {} wiped)", vault);
+    eprintln!("safeclaw vault rm — ok (vault {} wiped)", vault);
     Ok(())
 }
 

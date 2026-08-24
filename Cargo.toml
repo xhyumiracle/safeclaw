@@ -1,6 +1,6 @@
 [package]
 name = "safeclaw"
-version = "0.9.51"
+version = "0.10.0"
 edition = "2021"
 description = "SafeClaw daemon — multi-vault passkey-gated credential vault for AI agents"
 # Functional Source License 1.1 (Apache-2.0 future). FSL is not an SPDX id,
@@ -34,7 +34,7 @@ hostname = "0.4"
 # implementation; sudp provides the abstract protocol + standard cryptographic
 # profile (Hash/Kdf/Aead/KeyWrap, β computation, grant validation, WebAuthn
 # Authenticator). We keep p256 direct only for places sudp doesn't yet cover.
-sudp = { version = "0.2.1", features = ["std-primitives", "webauthn", "json-canonical"] }
+sudp = { version = "0.3.0", features = ["std-primitives", "webauthn", "json-canonical"] }
 hmac = "0.12"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "jwk"] }
 sha2 = "0.10"
@@ -45,6 +45,13 @@ subtle = "2"
 # for cross-device pending-passkey seals. Suite: DHKEM(X25519, HKDF-SHA-256)
 # + HKDF-SHA-256 + ChaCha20-Poly1305 (= PROTOCOL.md §4.2 mandated).
 hpke = { version = "0.12", features = ["x25519"] }
+# Identity/signing layer (src/identity.rs) — Ed25519 UIK/AIK principals, config
+# signatures, re-key events, server-envelope signing. This is the SafeClaw-level
+# extension on top of sudp (sudp core carries no signing identity); see
+# design/sudp-identity-signing-revision.md §B1. data-encoding = base32 for the
+# self-certifying id (ETH-address style).
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+data-encoding = "2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

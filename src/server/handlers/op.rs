@@ -110,6 +110,7 @@ pub async fn create(
         serde_json::to_value(&op).unwrap_or(Value::Null),
         r.clone(),
         expires_at,
+        None, // user-initiated lifecycle ceremony — no triggering agent
     );
 
     // Requester-side supersede: a lifecycle ceremony (unlock/lock) is a

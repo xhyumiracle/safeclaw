@@ -6,6 +6,7 @@
 
 pub mod active;
 pub mod agent;
+pub mod agent_shim;
 pub mod apierr;
 pub mod approve;
 pub mod config;

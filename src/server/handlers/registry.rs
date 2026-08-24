@@ -188,6 +188,13 @@ pub struct RegistryConnection {
     /// (invalid_grant) at token mint — user must reconnect. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs_reauth: Option<bool>,
+    /// `true` = the calling agent's reach mask excludes this connection
+    /// (team §8.1 visible-but-locked: it exists, this agent is not enabled;
+    /// naming it in a request gets an explicit `mask_not_enabled` refusal;
+    /// the responsible member can enable it in the console). Only set on the
+    /// agent-facing proxy surface; the console never sees it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -449,6 +456,7 @@ fn build_connection(
         connected,
         phantoms: if summary { Vec::new() } else { phantoms },
         needs_reauth: None,
+        locked: None,
     }
 }
 
@@ -511,14 +519,19 @@ pub async fn vault_registry(
     Path(vault_id): Path<String>,
     Query(q): Query<RegistryQuery>,
 ) -> Result<Json<Value>> {
-    Ok(Json(vault_registry_value(&state, &vault_id, &q)?))
+    Ok(Json(vault_registry_value(&state, &vault_id, &q, None)?))
 }
 
 /// The `/v/{vid}/registry` projection as a plain `Value`. Shared by the axum
 /// control-plane handler (above) AND the 23294 API face (`proxy::api_face`), so
 /// discovery can't drift between the two ports. Pure read — briefly locks
 /// `vault_states`, no I/O.
-pub fn vault_registry_value(state: &AppState, vault_id: &str, q: &RegistryQuery) -> Result<Value> {
+pub fn vault_registry_value(
+    state: &AppState,
+    vault_id: &str,
+    q: &RegistryQuery,
+    agent_prefix: Option<&str>,
+) -> Result<Value> {
     validate_vault_id(vault_id)?;
     let include_policy_rules = q.include_policy_rules();
     let ids_filter = q.ids_filter();
@@ -630,6 +643,27 @@ pub fn vault_registry_value(state: &AppState, vault_id: &str, q: &RegistryQuery)
             conn_rows.push(row);
         }
         conn_rows.sort_by(|a, b| a.id.cmp(&b.id));
+        // Agent-facing reach mask (team §8.1): a masked-off connection stays
+        // VISIBLE (the agent can conclude "exists, but I need enabling" instead
+        // of "not configured") but is stripped to a minimal locked stub — no
+        // hosts/secrets/phantoms.
+        if let Some(agent) = agent_prefix {
+            let candidates: Vec<String> = conn_rows.iter().map(|r| r.id.clone()).collect();
+            if let Some(allowed) = state.agent_allowed_connections(vault_id, agent, &candidates) {
+                use std::collections::HashSet as MaskSet;
+                let allow: MaskSet<&str> = allowed.iter().map(|s| s.as_str()).collect();
+                for row in conn_rows.iter_mut() {
+                    if !allow.contains(row.id.as_str()) {
+                        row.hosts.clear();
+                        row.secrets = None;
+                        row.phantoms.clear();
+                        row.needs_reauth = None;
+                        row.connected = false;
+                        row.locked = Some(true);
+                    }
+                }
+            }
+        }
     }
 
     let vault_entries = if locked {

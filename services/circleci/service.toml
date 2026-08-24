@@ -10,7 +10,7 @@ Multi-account: switch the phantom value (__sc__circleci_work__).
 id = "circleci"
 name = "CircleCI"
 # Classification for browse/filter and policy tag-floors; lowercase-kebab, multi OK.
-tags = ["app"]
+tags = ["dev"]
 
 hosts = ["circleci.com"]
 secrets = ["CIRCLECI_API_TOKEN"]

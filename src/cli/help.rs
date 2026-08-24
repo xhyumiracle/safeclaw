@@ -54,7 +54,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("agent", "Manage agents (API keys)"),
             ("device", "Manage this device's pairing"),
             ("passkey", "Manage enrolled passkeys"),
-            ("vault", "Per-vault lifecycle (e.g. delete)"),
+            ("vault", "Per-vault lifecycle (e.g. rm)"),
         ],
     ),
     (
@@ -63,7 +63,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("sync", "Pull vault state from the cloud now"),
             ("unlock", "Unlock the active vault"),
             ("lock", "Lock the active vault"),
-            ("logs", "Tail the daemon's logs"),
+            ("log", "Tail the daemon's logs"),
             ("doctor", "Run health and reachability checks"),
             ("upgrade", "Self-update to the latest release"),
             ("env", "Print shell exports for your shell"),
@@ -193,6 +193,10 @@ fn render(cmd: &clap::Command) -> String {
     out.push_str(&format!(
         "  {:<pad$}More logging to stderr (-v info, -vv debug, -vvv trace)\n",
         "-v, --verbose"
+    ));
+    out.push_str(&format!(
+        "  {:<pad$}Emit machine-readable JSON where supported\n",
+        "--json"
     ));
     out
 }

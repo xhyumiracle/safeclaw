@@ -312,6 +312,113 @@ pub fn suggested_secret_key(conn_id: &str, service_id: &str, role: &str) -> Stri
     format!("{role}_{qual}")
 }
 
+/// Membership role inside a shared vault. Two tiers by design (team §7.1/§5.15):
+/// `Owner` = manage (config, members, reveal, kill switch); `Member` = edit
+/// (content). Multiple owners are the norm; the LAST owner can never be removed
+/// or demoted (§7.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberRole {
+    Owner,
+    /// The least-privilege default: a cred that loads without an explicit role
+    /// (legacy row, serde default) is a `Member`, never an `Owner`. This is the
+    /// fail-closed choice for the owner-authority anchor — a missing role can
+    /// never silently confer owner powers.
+    #[default]
+    Member,
+}
+
+/// A single agent's reach mask — which connections of THIS vault the agent may
+/// use (design/team §8.1). The mask defaults OPEN and the console writes a
+/// BLACKLIST: `Blocked { deny }` lets the agent reach everything EXCEPT the
+/// listed connections, so a connection added to the vault later (or an unknown
+/// id) is reachable unless it is explicitly denied — fail-open by design. `All`
+/// is the default (absent item ≡ `All`, personal parity). Everything else about
+/// agent permissioning (per-request levels, approvals) stays vault-wide policy —
+/// the mask is a reach/visibility gate, deliberately not a rule tree.
+///
+/// Wire shape (untagged serde distinguishes purely by JSON shape — string vs
+/// object):
+///   `All`     → the bare string `"all"`
+///   `Blocked` → a JSON object  `{ "deny": ["a","b"] }`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", untagged)]
+pub enum AgentMask {
+    /// `"all"` — no restriction from the mask (the default; fail-open).
+    All(AllTag),
+    /// Blacklist of denied `connection_id`s (wire `{ "deny": [...] }`): the
+    /// agent reaches everything EXCEPT these. Connections added later or unknown
+    /// ids are allowed (fail-open). This is what the console writes.
+    Blocked { deny: Vec<String> },
+}
+
+/// Serde helper: the `All` arm serializes as the bare string `"all"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AllTag {
+    #[serde(rename = "all")]
+    All,
+}
+
+impl Default for AgentMask {
+    fn default() -> Self {
+        AgentMask::All(AllTag::All)
+    }
+}
+
+impl AgentMask {
+    /// Does the mask let this agent reach `connection_id`? THE reach verdict —
+    /// the proxy deny, the registry annotation and `GET /vaults` all read this
+    /// (team §8.1 ONE pipeline). `All` allows everything; the `Blocked` blacklist
+    /// allows everything not denied (fail-open, incl. later/unknown ids).
+    pub fn allows(&self, connection_id: &str) -> bool {
+        match self {
+            AgentMask::All(_) => true,
+            AgentMask::Blocked { deny } => !deny.iter().any(|c| c == connection_id),
+        }
+    }
+}
+
+/// One row of a vault's **authorized-agents table** — the item body under
+/// `aux:agent/<ag_id>` (design/agent-device-identity-mtls.md §11.1). It records
+/// the agent's self-certifying pubkey, the owning member (`us_…`) whose UIK
+/// authority admits it, and the connection reach mask.
+///
+/// **This table is the daemon's ONLY agent-authz source** (§11.1): the presented
+/// AIK's pubkey → `ag_id` → an item here → apply this mask. **Presence in the
+/// table = authorized; dropping the item = a clean vault-level revoke** (no
+/// re-key — the agent never held K). There is no separate admission mode: an
+/// `ag_id` with no item is simply not authorized.
+///
+/// Each item is **UIK-signed** and folded through [`crate::identity::config_sig_input`]
+/// under the logical name `agent/<ag_id>`; the fold verifies the signer is
+/// EITHER this `owner` (a member authorizing their OWN agent) OR any owner
+/// (owner override). Because the daemon holds only PUBLIC keys, it cannot
+/// re-sign a folded row, so the verified signed wrapper is retained in
+/// [`Self::signed_body`] and re-emitted byte-identically.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentEntry {
+    /// The agent's Ed25519 signing pubkey (base64url-nopad). Self-certifying:
+    /// `derive_id(Agent, pubkey)` MUST equal this item's `ag_id` (the map key).
+    /// Empty on a legacy prefix-keyed grant (pre-AIK); such a row is never
+    /// AIK-consultable (no cert maps to it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_pubkey: String,
+    /// The owning member's `us_…`. The authorizing UIK signer must be this owner
+    /// (self-service for one's OWN agent) OR any owner. Empty on a legacy grant.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
+    /// Connection reach mask (deny-list; `All` = unrestricted).
+    #[serde(default)]
+    pub connections: AgentMask,
+    /// The verified signed wrapper (`{ data, uik_sig, uik_sign_pub }`) exactly as
+    /// folded from cloud, retained so the daemon can re-emit this row
+    /// byte-identically (it holds only PUBLIC keys and cannot re-sign). `None` for
+    /// a legacy raw (unsigned) row → the daemon re-emits the raw body. Never
+    /// serialized as a struct field; consulted directly by the seal path.
+    #[serde(skip)]
+    pub signed_body: Option<serde_json::Value>,
+}
+
 /// `aux` payload — everything inside `ProtectedState.aux` for v4 vaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultAux {
@@ -348,6 +455,13 @@ pub struct VaultAux {
     /// it never shadows a built-in id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub services: BTreeMap<String, String>,
+    /// The vault's **authorized-agents table** (design §11.1), keyed by `ag_id`
+    /// (`derive_id(Agent, pubkey)`). **Presence = authorized**; an `ag_id` with no
+    /// entry is not authorized (there is no admission mode). Each [`AgentEntry`] is
+    /// UIK-signed. Sliced to `aux:agent/<ag_id>` items (one per agent = independent
+    /// CAS, same pattern as connections). Team §8.1 / identity §11.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentEntry>,
 }
 
 impl VaultAux {
@@ -373,6 +487,7 @@ impl VaultAux {
             connections: BTreeMap::new(),
             audit_retention_days: None,
             services: BTreeMap::new(),
+            agents: BTreeMap::new(),
         }
     }
 }
@@ -388,6 +503,10 @@ pub struct VaultPlaintextView {
     /// because the view's lifetime is the request, not the protocol
     /// boundary — sudp's zeroize is preserved up to the moment we copy.
     pub native_secrets: BTreeMap<String, Vec<u8>>,
+    /// True when the fold saw any live legacy `aux:*` item — the trigger for
+    /// the one-shot addressing migration (team §8.3). Always false for views
+    /// opened from a whole-blob `ProtectedState` (no addressing there).
+    pub legacy_addressing: bool,
 }
 
 impl VaultPlaintextView {
@@ -408,6 +527,7 @@ impl VaultPlaintextView {
         Ok(VaultPlaintextView {
             aux,
             native_secrets,
+            legacy_addressing: false,
         })
     }
 

@@ -54,6 +54,14 @@ pub struct BrokerHandler {
     /// (§8) — the agent's identity, verified in `pipeline` before any phantom
     /// substitution. Inherited by inner-request clones alongside `vid`.
     pub key: Option<String>,
+    /// The `ag_…` id of a CRYPTO-VERIFIED agent PoP token (hop-A), resolved at
+    /// CONNECT time in `should_intercept` (that's where the CONNECT authority the
+    /// token binds is available) and inherited by inner-request clones. `Some`
+    /// only when the `Proxy-Authorization` password was a valid, fresh `scpop1…`
+    /// token for this vault+target; `None` for the legacy Basic api-key path. The
+    /// authorization check (this `ag_` ∈ the vault's authorized-agents table) is
+    /// still done in `pipeline` — this field is only "who proved possession".
+    pub agent_id: Option<String>,
     /// Set on the allow/forward path; consumed by `handle_response`.
     pub pending: Option<AuditPending>,
 }
@@ -64,6 +72,7 @@ impl BrokerHandler {
             state,
             vid: None,
             key: None,
+            agent_id: None,
             pending: None,
         }
     }
@@ -78,6 +87,24 @@ impl HttpHandler for BrokerHandler {
         let (vid, key) = creds_from_proxy_auth(req);
         self.vid = vid;
         self.key = key;
+        // hop-A: if the Proxy-Auth password is an agent PoP token (`scpop1…`),
+        // crypto-verify it HERE — the CONNECT authority it binds (`host:port`) is
+        // only available at CONNECT time (the inner-request pipeline sees a bare
+        // host). A valid, fresh token for THIS vault + target resolves the `ag_`
+        // id; the authorization check (`ag_` ∈ the vault's authorized-agents
+        // table) happens in `pipeline`. Dual-auth: a non-PoP password (a legacy
+        // Basic api-key) leaves `agent_id` None and takes the hash-set path, so
+        // nothing bricks. Only the crypto (signature + freshness) is checked here.
+        self.agent_id = match (self.vid.as_deref(), self.key.as_deref(), req.uri().authority()) {
+            (Some(vid), Some(key), Some(authority)) => crate::agent_pop::verify_agent_proxy_pop(
+                key,
+                vid,
+                authority.as_str(),
+                crate::util::now_unix(),
+                crate::agent_pop::DEFAULT_MAX_SKEW_SECS,
+            ),
+            _ => None,
+        };
         // Absent Proxy-Auth (no vid) → non-participating traffic: blind-tunnel it
         // (§8; a stray phantom then reaches upstream literally → clean 401, never
         // a leak). A creds-less CONNECT to a host we DO anchor was already met
@@ -169,8 +196,29 @@ impl BrokerHandler {
     /// — before injecting any credential. Same membership check the control
     /// plane + API face use, via the pure `check_token`.
     fn key_is_valid(&self) -> bool {
+        // hop-A path: a crypto-verified agent PoP (resolved in `should_intercept`)
+        // is valid iff its `ag_` is in THIS vault's authorized-agents table
+        // (§11 presence = authorized). Dual-auth: if there's no PoP, or it isn't
+        // authorized for this vault, fall back to the legacy synced api-key
+        // hash-set — so a legacy Basic api-key keeps working unchanged.
+        if let (Some(ag), Some(vid)) = (self.agent_id.as_deref(), self.vid.as_deref()) {
+            if self.state.agent_is_authorized(vid, ag) {
+                return true;
+            }
+        }
         let hashes = self.state.agent_key_hashes.lock().unwrap();
         crate::api_key::check_token(&hashes, self.key.as_deref()).is_ok()
+    }
+
+    /// Stable attribution id for the current agent — used for audit rows, the
+    /// mask lookup, and the grant cache key. For a hop-A PoP agent it's the
+    /// resolved `ag_` (so approvals cache + replay correctly, and mask is
+    /// ag_-keyed per §11); for the legacy Basic path it's the api-key prefix
+    /// (never the full key/token). One helper so all three surfaces agree.
+    fn agent_attribution(&self) -> Option<String> {
+        self.agent_id
+            .clone()
+            .or_else(|| legacy_key_prefix(self.key.as_deref()))
     }
 
     async fn pipeline(&mut self, ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
@@ -276,7 +324,7 @@ impl BrokerHandler {
             // caller simply forgot it; left untouched the request goes upstream
             // unauthenticated and the puzzling result is a bare 401/403 with no
             // hint that the credential was never in the request. Leave a greppable
-            // breadcrumb (`sc logs --raw | grep phantom`) for exactly that debug.
+            // breadcrumb (`sc log --raw | grep phantom`) for exactly that debug.
             tracing::debug!(
                 host = %dest_host,
                 "routed to an anchored host but the request carries no phantom — \
@@ -324,6 +372,29 @@ impl BrokerHandler {
         // miss with a key PRESENT, refresh the hash-set once (debounced): a key
         // minted seconds ago by `sc agent add` must not 407 for the 30s loop.
         if !self.key_is_valid() {
+            // A cryptographically-VALID AIK PoP (agent_id resolved in
+            // should_intercept) that isn't authorized on THIS vault is a distinct
+            // case from a bad/absent credential: `agent_id.is_some()` here means the
+            // signature + freshness checked out but `ag_ ∉` the vault's
+            // authorized-agents table. The api-key hash-set refresh can't help (the
+            // password slot is a `scpop1…` token, never a key), and calling it "bad
+            // key" sends the user debugging the wrong thing. Fail LOUDLY with the
+            // real fix: authorize it in the Console (Agents tab), then retry (the
+            // grant syncs into the vault's agents table within seconds).
+            if self.agent_id.is_some() {
+                // Deep-link straight to THIS vault's Agents tab so the agent can
+                // relay a one-click fix. The daemon owns both pieces (origin from
+                // its paired config + the vault_id it's enforcing on) and is the
+                // sole party in this LOCAL-enforcement path — the web isn't in the
+                // loop to supply the URL. Path segment matches the console's
+                // /vault/{id}/{tab} routing.
+                let hint = format!(
+                    "this agent isn't authorized on this vault yet — authorize it in the \
+                     SafeClaw console (Agents tab), then retry: {}/vault/{}/agents",
+                    self.state.config.origin, self.vid.as_deref().unwrap_or_default(),
+                );
+                return err_response(ScCode::AgentNotAuthorized, &hint).into();
+            }
             let refreshed =
                 self.key.is_some() && crate::sync::refresh_agent_keys_on_miss(&self.state).await;
             if !refreshed || !self.key_is_valid() {
@@ -347,8 +418,50 @@ impl BrokerHandler {
                 .into()
             }
         };
+        // Daemon too old for this vault's format (cloud returned SC_UPGRADE_REQUIRED
+        // for its sync, design 甲) → fail LOUDLY so the agent runs `sc upgrade`,
+        // instead of a silent parked-sync mystery the agent works around or calls a bug.
+        if self.state.is_vault_upgrade_required(&vault_id) {
+            return err_response(
+                ScCode::UpgradeRequired,
+                "SafeClaw needs an update to use this vault — run `sc upgrade`",
+            )
+            .into();
+        }
         if self.state.is_vault_locked(&vault_id) {
             return err_response(ScCode::VaultLocked, crate::error::VAULT_LOCKED_MSG).into();
+        }
+
+        // ── reach mask (team §8.1) ───────────────────────────────────────────
+        // Visible-but-locked semantics: a masked-off connection is announced as
+        // `locked` in the registry, and a named use gets THIS explicit,
+        // actionable refusal — never a silent 404, never a policy prompt.
+        {
+            // Mask lookup key = the agent's attribution id (resolved `ag_` for a
+            // hop-A PoP agent — table+mask are ag_-keyed since §11 — else the
+            // legacy api-key prefix for the dual-auth Basic path).
+            let mask_agent = self.agent_attribution().unwrap_or_default();
+            if self.state.agent_mask_allows(&vault_id, &mask_agent, &conn) == Some(false) {
+                return err_response(
+                    ScCode::MaskNotEnabled,
+                    &format!(
+                        "connection '{}' exists in this vault but is not enabled for this agent; \
+                         the responsible member can enable it in the console (Agents)",
+                        conn
+                    ),
+                )
+                .into();
+            }
+        }
+
+        // ── team serve gate (shared-vault offline lease, etc.) ───────────────
+        // Serve-time team policy is team-EXCLUSIVE (team-edition §9) and lives in
+        // the closed `safeclaw-ee` overlay behind this hook. The open build wires
+        // `NoopHooks` → no gate, so a personal vault is never leased. The overlay
+        // impl reads `vault_is_shared` + `cloud_contact_age_secs` (both kept as
+        // neutral core bookkeeping) to enforce the offline lease.
+        if let Some(denial) = self.state.team.serve_gate(self.state.as_ref(), &vault_id) {
+            return err_response(denial.code, &denial.message).into();
         }
 
         // ── resolve the connection ───────────────────────────────────────────
@@ -448,8 +561,12 @@ impl BrokerHandler {
         // ── policy ───────────────────────────────────────────────────────────
         // The same lossy view the phantom scan used (unified boundary).
         let body_for_policy = body_text.as_deref();
+        // Op-agent binding: every approval/grant surface below keys on the
+        // requesting agent (the pipeline validated self.key before secrets).
+        let agent_prefix = self.agent_attribution().unwrap_or_default();
         let decision = self.state.evaluate_request_policy(
             &vault_id,
+            &agent_prefix,
             &conn,
             &service_id,
             &method,
@@ -478,7 +595,7 @@ impl BrokerHandler {
                     service: service_id.clone(),
                     method: method.clone(),
                     path: path.clone(),
-                    agent_prefix: self.key.as_deref().map(crate::audit::agent_key_prefix),
+                    agent_prefix: self.agent_attribution(),
                 },
                 0,
             );
@@ -508,6 +625,7 @@ impl BrokerHandler {
             AccessLevel::AskAlways => (
                 self.state.op_grant_take(
                     &vault_id,
+                    &agent_prefix,
                     &conn,
                     &method,
                     &dest_host,
@@ -524,6 +642,7 @@ impl BrokerHandler {
             AccessLevel::Ask if scoped => (
                 self.state.op_grant_take(
                     &vault_id,
+                    &agent_prefix,
                     &conn,
                     &method,
                     &dest_host,
@@ -533,7 +652,10 @@ impl BrokerHandler {
                 ),
                 None,
             ),
-            AccessLevel::Ask => (self.state.cache_lookup_grant(&vault_id, &conn), None),
+            AccessLevel::Ask => (
+                self.state.cache_lookup_grant(&vault_id, &conn, &agent_prefix),
+                None,
+            ),
             _ => (
                 self.state.cache_lookup(&vault_id, &conn),
                 self.state.cache_lookup_secrets(&vault_id, &conn),
@@ -695,7 +817,7 @@ impl BrokerHandler {
             service: service_id,
             method,
             path,
-            agent_prefix: self.key.as_deref().map(crate::audit::agent_key_prefix),
+            agent_prefix: self.agent_attribution(),
         });
         Request::from_parts(parts, out_body).into()
     }
@@ -823,6 +945,14 @@ impl BrokerHandler {
             "path": path,
             "authorize_only": true,
         });
+        // Op-agent binding (team §C1): the requesting agent's key prefix is
+        // signed into β via the scope, so the human's approval covers "for
+        // THIS agent" — swapping agents invalidates the grant. The grant page
+        // can render it as the requester line. Enforcement reads the record's
+        // copy (ApprovalRecord.agent_prefix), not this.
+        if let Some(prefix) = self.agent_attribution() {
+            scope["agent"] = serde_json::Value::String(prefix);
+        }
         // Phase 2: fold the bound `[requests]` scope-field VALUES and the consent
         // template into the op scope. They are signed into β (the user's passkey
         // authorizes exactly the fields shown) and re-derived at approve to build
@@ -874,7 +1004,7 @@ impl BrokerHandler {
             op,
             Some(pc),
             ip,
-            self.key.as_deref().map(crate::audit::agent_key_prefix),
+            self.agent_attribution(),
         ) {
             Ok((op_id, _r, expires_at)) => {
                 let approve_url = crate::cli::active::grant_url(&op_id);
@@ -937,11 +1067,15 @@ impl BrokerHandler {
     ) -> RequestOrResponse {
         use crate::protocol::operation::{Act, ActType, Bind, Operation, Valid};
         let now = now_secs();
-        let scope = json!({
+        let mut scope = json!({
             "connection_id": conn,
             "host": host,
             "etld1": etld1(host),
         });
+        // Same signed agent stamp as the credential-use op above.
+        if let Some(prefix) = self.agent_attribution() {
+            scope["agent"] = serde_json::Value::String(prefix);
+        }
         let op = Operation {
             act: Act {
                 kind: ActType::Custom("widen-host".into()),
@@ -962,7 +1096,7 @@ impl BrokerHandler {
             op,
             None,
             ip,
-            self.key.as_deref().map(crate::audit::agent_key_prefix),
+            self.agent_attribution(),
         ) {
             Ok((op_id, _r, exp)) => {
                 let approve_url = crate::cli::active::grant_url(&op_id);
@@ -1067,6 +1201,14 @@ fn merge_phantoms(acc: &mut Vec<Phantom>, more: Vec<Phantom>) {
             acc.push(p);
         }
     }
+}
+
+/// The legacy Basic api-key attribution prefix (never the full key). Factored out
+/// of [`BrokerHandler::agent_attribution`] so that helper can reference it without
+/// the raw-prefix expression appearing at the call sites (all of which now go
+/// through `agent_attribution` so PoP `ag_` and legacy prefixes resolve uniformly).
+fn legacy_key_prefix(key: Option<&str>) -> Option<String> {
+    key.map(crate::audit::agent_key_prefix)
 }
 
 /// Read `(vid, api-key)` from a CONNECT's `Proxy-Authorization: Basic

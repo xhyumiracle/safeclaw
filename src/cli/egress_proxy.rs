@@ -168,7 +168,19 @@ pub fn apply_effective(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
 /// the given overall timeout. Routing sync/relay through here is what makes
 /// `sc proxy set` reach them without a daemon restart — see the module header.
 pub fn client(timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> {
-    apply_effective(reqwest::Client::builder().timeout(timeout)).build()
+    apply_effective(reqwest::Client::builder().timeout(timeout).default_headers(version_headers()))
+        .build()
+}
+
+/// Every cloud call announces the binary version (team §8.3: the backend's
+/// format gate + the /admin version census read it). One constant header —
+/// no fingerprinting surface beyond what User-Agent already carries.
+fn version_headers() -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    if let Ok(v) = reqwest::header::HeaderValue::from_str(env!("CARGO_PKG_VERSION")) {
+        h.insert("x-safeclaw-version", v);
+    }
+    h
 }
 
 /// The constructor for the daemon's STREAMING cloud connection (the SSE sync
@@ -179,7 +191,12 @@ pub fn client(timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> 
 /// stream at the deadline. Liveness on the open stream is the caller's job
 /// (sync_stream's 45s no-bytes watchdog).
 pub fn client_streaming(connect: std::time::Duration) -> reqwest::Result<reqwest::Client> {
-    apply_effective(reqwest::Client::builder().connect_timeout(connect)).build()
+    apply_effective(
+        reqwest::Client::builder()
+            .connect_timeout(connect)
+            .default_headers(version_headers()),
+    )
+    .build()
 }
 
 /// The first non-empty proxy set in THIS process's env right now. Read once by
