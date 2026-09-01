@@ -31,6 +31,12 @@ pub async fn run(args: RunArgs) -> Result<(), String> {
     let ca = resident_ca_path();
     preflight(&ca, &control).await?;
 
+    // Report our live shell proxy to the daemon so its OWN egress (the forward
+    // hop + any OAuth refresh this run triggers) follows the operator's current
+    // proxy state — the daemon, under systemd/launchd, can't inherit our shell.
+    // In-memory on the daemon side (no persisted `sc proxy set`); best-effort.
+    report_ambient_proxy(&control).await;
+
     let proxy_url = agent_proxy_url(&vid);
     // Friendly hint (user's request): a shell with NEITHER an AIK identity nor a
     // legacy api-key can't authenticate credential substitution, so it will 407.
@@ -247,6 +253,48 @@ async fn preflight(ca: &Path, control_root: &str) -> Result<(), String> {
         ));
     }
     Err("SafeClaw isn't running — bring it up with `sc up`, then retry.".into())
+}
+
+/// Tell the LOCAL daemon our live shell egress proxy (`POST /proxy/ambient`) so
+/// its own egress follows the operator's current proxy state — the daemon can't
+/// inherit our shell. In-memory on the daemon side (no persisted `sc proxy set`).
+/// Best-effort: a failure never blocks the run. LOOPBACK-ONLY: the value is a
+/// proxy URL that may carry userinfo credentials, so we never send it to a remote
+/// daemon (which manages egress with its own `sc proxy set`).
+async fn report_ambient_proxy(control_root: &str) {
+    if !is_loopback_authority(&authority_of(control_root)) {
+        return;
+    }
+    let proxy = crate::cli::egress_proxy::ambient();
+    let url = format!("{}/proxy/ambient", control_root.trim_end_matches('/'));
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    else {
+        return;
+    };
+    let _ = client
+        .post(&url)
+        .json(&serde_json::json!({ "proxy": proxy }))
+        .send()
+        .await;
+}
+
+/// Is `authority` (`host[:port]`) a loopback address? Keeps the ambient-proxy
+/// report on-box only, so a userinfo-bearing proxy URL never leaks to a remote
+/// daemon. `control_root` always carries a port, so a bare-IPv6 authority (no
+/// port) isn't a real input here.
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 /// Exec the child with the bundle merged into the inherited env. On unix this

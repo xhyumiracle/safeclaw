@@ -23,18 +23,36 @@
 //! so this only fills the gap, never overrides an operator who set it directly.
 //! Hosts that must stay direct (e.g. a narrow proxy that can't reach us) go in
 //! the operator's own `NO_PROXY` — we never silently carve the backend out.
+//!
+//! LIVE FOLLOW (so a proxied agent just works without `sc proxy set`): every
+//! `sc run` reports its shell proxy to the daemon's in-memory ambient slot (see
+//! [`ambient`] / [`set_ambient`] and `POST /proxy/ambient`). The daemon then
+//! follows the operator's CURRENT shell proxy, nothing is persisted, and a shell
+//! with no proxy simply falls back to the file. `sc proxy set` stays the
+//! explicit override and the only option for a headless/remote daemon that no
+//! `sc run` ever reports to. Ambient and file are ONE resolver ([`effective`]),
+//! not two mechanisms — ambient is just the env tier kept live instead of frozen.
 
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use crate::config::default_state_dir;
 
-/// The operator's REAL shell egress proxy, captured ONCE by `apply_to_env`
-/// before it fills any env slot from the stored file. Needed by [`effective`]:
-/// after `apply_to_env` has copied the file value into the env, we can no longer
-/// tell an env-from-shell proxy from an env-from-file one, but env > config must
-/// still hold. `None` = no shell proxy was set; unset (`get()` is `None`) = the
-/// capture never ran (e.g. a unit test not going through `apply_to_env`).
-static SHELL_PROXY: OnceLock<Option<String>> = OnceLock::new();
+/// The LIVE "ambient" egress proxy: the operator's shell proxy, kept CURRENT.
+///
+/// In a short-lived `sc` process this is SEEDED once from that process's own
+/// shell at startup (`apply_to_env`) and never changes — so `effective()` is
+/// still "this shell's proxy, else the file", exactly as before. In the
+/// long-running daemon it is seeded from the daemon's OWN startup env (empty
+/// under systemd/launchd, which don't inherit a shell) and then REFRESHED by
+/// every `sc run`, which reports its shell proxy to `POST /proxy/ambient`. That
+/// is what lets the daemon follow the operator's live proxy state with NO
+/// persisted `sc proxy set`, and with no stale-value risk: it is in-memory only,
+/// so a restart clears it and the next `sc run` re-seeds it.
+///
+/// `Some(url)` = an ambient proxy to use; `None` = none reported, fall through
+/// to the file. Starts `None` (unseeded) until `apply_to_env` runs — so a unit
+/// test that never calls it sees `effective()` == the file, as before.
+static AMBIENT: RwLock<Option<String>> = RwLock::new(None);
 
 /// Persisted egress-proxy URL location: `<state_dir>/egress-proxy` (one line, the
 /// URL). Absent/empty = no configured egress proxy.
@@ -82,9 +100,16 @@ pub fn clear() -> Result<(), String> {
 /// GitHub fetch both honour it. An already-set `HTTPS_PROXY` in the real env
 /// takes precedence and is left untouched (env > config).
 pub fn apply_to_env() {
-    // Snapshot any REAL shell proxy BEFORE we fill env slots from the file, so
-    // `effective()` can keep env > config even after this pollutes the env.
-    let _ = SHELL_PROXY.get_or_init(shell_proxy_now);
+    // Seed the ambient proxy from THIS process's REAL shell BEFORE we fill env
+    // slots from the file, so `effective()` keeps env > config even after this
+    // pollutes the env. Only seed an empty slot: a `/proxy/ambient` push that
+    // already set a live value (daemon) must not be clobbered by a later call.
+    {
+        let mut a = AMBIENT.write().unwrap();
+        if a.is_none() {
+            *a = shell_proxy_now();
+        }
+    }
     let Some(url) = load() else { return };
     for key in [
         "HTTPS_PROXY",
@@ -109,15 +134,46 @@ pub fn apply_to_env() {
 
 /// The egress proxy the DAEMON's own swappable clients (the shared reqwest
 /// client + the resident proxy's forward connector) should use RIGHT NOW,
-/// honouring env > config: a real shell proxy (captured at startup) wins;
-/// otherwise the stored file — re-read FRESH so a runtime `sc proxy set` (which
-/// rewrites the file) takes effect via `/proxy/reload` without touching, or
-/// re-reading, process env. Falls back to [`load`] if the capture never ran.
+/// honouring env > config: the live ambient proxy (the shell proxy `sc run`
+/// last reported, or this process's own shell) wins; otherwise the stored file,
+/// re-read FRESH so a runtime `sc proxy set` (which rewrites the file) or an
+/// ambient push takes effect via `/proxy/reload` / `/proxy/ambient` with no
+/// restart. Falls back to [`load`] when nothing ambient is set.
 pub fn effective() -> Option<String> {
-    match SHELL_PROXY.get() {
-        Some(Some(shell)) => Some(shell.clone()),
-        _ => load(),
+    let ambient = AMBIENT.read().unwrap();
+    let file = load();
+    resolve(ambient.as_deref(), file.as_deref())
+}
+
+/// Pure precedence: the ambient (live shell / pushed) proxy wins over the stored
+/// file, both over a direct route. Split out so the ordering is unit-testable
+/// without touching the process-global `AMBIENT` (a global-mutating test would
+/// be flaky under parallel runs).
+fn resolve(ambient: Option<&str>, file: Option<&str>) -> Option<String> {
+    ambient.or(file).map(str::to_string)
+}
+
+/// The live ambient egress proxy this process currently holds, WITHOUT the file
+/// fallback. `sc run` reads it to report its shell proxy to the daemon: in a CLI
+/// process this is exactly the shell proxy captured at startup (the file is the
+/// daemon's own concern, so it must not be folded in here). `None` = this shell
+/// has no proxy, which tells the daemon to fall through to its file config.
+pub fn ambient() -> Option<String> {
+    AMBIENT.read().unwrap().clone()
+}
+
+/// Set the live ambient egress proxy — the daemon's `/proxy/ambient` handler
+/// calls this when an `sc run` reports its shell proxy. Returns whether the
+/// value CHANGED, so the caller can skip a client rebuild when it didn't. Never
+/// persists: purely in-memory, so it can never strand the daemon across a
+/// restart the way a stale file could.
+pub fn set_ambient(proxy: Option<String>) -> bool {
+    let mut a = AMBIENT.write().unwrap();
+    if *a == proxy {
+        return false;
     }
+    *a = proxy;
+    true
 }
 
 /// Apply an EXPLICIT egress proxy (or explicit direct) to a reqwest client
@@ -168,8 +224,12 @@ pub fn apply_effective(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
 /// the given overall timeout. Routing sync/relay through here is what makes
 /// `sc proxy set` reach them without a daemon restart — see the module header.
 pub fn client(timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> {
-    apply_effective(reqwest::Client::builder().timeout(timeout).default_headers(version_headers()))
-        .build()
+    apply_effective(
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .default_headers(version_headers()),
+    )
+    .build()
 }
 
 /// Every cloud call announces the binary version (team §8.3: the backend's
@@ -218,4 +278,24 @@ fn shell_proxy_now() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_prefers_ambient_then_file_then_direct() {
+        // Ambient (live shell / pushed) wins over the file...
+        assert_eq!(
+            resolve(Some("http://a"), Some("http://b")).as_deref(),
+            Some("http://a")
+        );
+        // ...file is the fallback when nothing ambient is set...
+        assert_eq!(resolve(None, Some("http://b")).as_deref(), Some("http://b"));
+        // ...ambient alone still routes...
+        assert_eq!(resolve(Some("http://a"), None).as_deref(), Some("http://a"));
+        // ...and neither = direct.
+        assert_eq!(resolve(None, None), None);
+    }
 }

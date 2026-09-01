@@ -10,9 +10,9 @@
 //! in-memory vault key and force the operator to re-unlock; instead
 //! `sc proxy set/clear` writes the stored value and pokes `/proxy/reload`, which
 //! calls [`reload_egress_proxy`]. The client is built with an EXPLICIT proxy
-//! resolved from `egress_proxy::effective()` (NOT the ambient process env, which
-//! `apply_to_env` froze at startup), so a reload fully re-points every future
-//! request.
+//! resolved from `egress_proxy::effective()` (the live ambient proxy an `sc run`
+//! last reported, else the stored file — not the raw process env), so a reload
+//! fully re-points every future request.
 
 use std::sync::RwLock;
 use std::time::Duration;

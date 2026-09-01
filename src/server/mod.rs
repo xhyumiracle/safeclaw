@@ -78,6 +78,10 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         // context, no params: re-reads the local stored value into the live
         // clients so the daemon re-points egress without a restart/re-unlock.
         .route("/proxy/reload", post(handlers::proxy::reload))
+        // Live ambient egress-proxy report (from `sc run`) — the daemon follows
+        // the operator's current shell proxy without a persisted `sc proxy set`.
+        // In-memory only; LOOPBACK-ONLY (it takes a caller-chosen proxy value).
+        .route("/proxy/ambient", post(handlers::proxy::ambient))
         // Browser-fired sync hint (a `no-cors` POST from the console right
         // after it pre-seals an OAuth connect). Authority-free by contract:
         // host-allowlisted, rate-limited, uniform 204 — see nudge.rs. The
