@@ -1108,8 +1108,62 @@ pub async fn approve_op(
                         "widen-host scope needs connection_id + host".into(),
                     ));
                 }
+                // Session snapshot first, so the agent's immediate retry passes
+                // the anchor, then persist DURABLY into `aux.connections[conn]`
+                // so the grant survives a restart / re-unlock — the same
+                // open -> mutate -> reseal -> push path connection-add/secret-set
+                // use. The grant already carries W_c (every approve path attaches
+                // it, act-agnostic: cli/approve.rs + fe vault-grant.ts), so this
+                // opens + reseals the vault like any other mutating custom act.
                 state.widen_connection_host(&vault_id, &conn, &host);
-                tracing::info!(vault = %vault_id, conn = %conn, host = %host, "host widened (session)");
+                crate::cli::conn::validate_raw_host(&host).map_err(AppError::BadRequest)?;
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                match view.aux.connections.get_mut(&conn) {
+                    Some(rec) => {
+                        let hosts = rec.hosts.get_or_insert_with(Vec::new);
+                        if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
+                            hosts.push(host.clone());
+                        }
+                    }
+                    // No explicit record = a synthesized default connection
+                    // (`conn` names a catalog/custom service, brokered off its
+                    // declared hosts). Materialise a record that keeps the
+                    // service binding and pins the just-approved host.
+                    None => {
+                        let bound_service = (view.aux.services.contains_key(&conn)
+                            || state.services.get(&conn).is_some())
+                        .then(|| conn.clone());
+                        view.aux.connections.insert(
+                            conn.clone(),
+                            crate::storage::plaintext::Connection {
+                                name: None,
+                                service: bound_service,
+                                hosts: Some(vec![host.clone()]),
+                                secrets: None,
+                                keys: None,
+                            },
+                        );
+                    }
+                }
+                crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                    .map_err(AppError::Internal)?;
+                {
+                    let state = state.clone();
+                    let vid = vault_id.clone();
+                    tokio::spawn(async move {
+                        crate::sync::push_keys_best_effort(&state, &vid).await;
+                        crate::sync::push_items_best_effort(&state, &vid).await;
+                    });
+                }
+                tracing::info!(vault = %vault_id, conn = %conn, host = %host, "host widened (durable)");
                 (
                     json!({ "ok": true, "act": "widen-host", "connection_id": conn, "host": host }),
                     None,
