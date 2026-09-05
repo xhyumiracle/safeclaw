@@ -1,6 +1,6 @@
 [package]
 name = "safeclaw"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 description = "SafeClaw daemon — multi-vault passkey-gated credential vault for AI agents"
 # Functional Source License 1.1 (Apache-2.0 future). FSL is not an SPDX id,
