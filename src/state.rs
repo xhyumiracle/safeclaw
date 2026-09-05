@@ -1601,7 +1601,7 @@ impl AppState {
             }
             if hosts
                 .iter()
-                .any(|h| crate::core::host::host_matches_exact(host, h))
+                .any(|h| crate::core::host::host_anchor_matches(host, h))
             {
                 hit = true;
             }
@@ -1617,7 +1617,7 @@ impl AppState {
             }
             if hosts
                 .iter()
-                .any(|h| crate::core::host::host_matches_exact(host, h))
+                .any(|h| crate::core::host::host_anchor_matches(host, h))
             {
                 return true;
             }

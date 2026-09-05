@@ -94,10 +94,12 @@ pub fn valid_secret_ref(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Validate a raw connection's anchor host: an exact FQDN — no scheme / path /
-/// port, no wildcard, and not a private / metadata / loopback target. (Raw
-/// connections pin exact FQDNs; `*.suffix` lives only in a curated service
-/// definition where a human confirms the pin.)
+/// Validate a raw connection's anchor host: a bare FQDN (no scheme / path /
+/// port) that is not a private / metadata / loopback target. A leftmost
+/// `*.suffix` wildcard IS allowed — it anchors the whole domain (matched at
+/// runtime by `host_anchor_matches`), so a user who doesn't know the exact API
+/// host can pin `*.example.com`; the suffix must have >=2 labels so a whole TLD
+/// can never be anchored.
 pub fn validate_raw_host(h: &str) -> Result<(), String> {
     let h = h.trim();
     if h.is_empty() {
@@ -112,13 +114,28 @@ pub fn validate_raw_host(h: &str) -> Result<(), String> {
     if h.contains(':') {
         return Err(format!("host '{}' must not carry a port", h));
     }
-    if h.contains('*') {
+    // A leftmost `*.suffix` wildcard is allowed (anchors the whole domain).
+    // Strip it and validate the suffix as the bare domain; require >=2 labels
+    // so a whole TLD (`*.com`) can never be anchored.
+    let bare = match h.strip_prefix("*.") {
+        Some(suffix) => {
+            if !suffix.contains('.') {
+                return Err(format!(
+                    "host '{}' is too broad — a wildcard needs a domain like *.example.com",
+                    h
+                ));
+            }
+            suffix
+        }
+        None => h,
+    };
+    if bare.contains('*') {
         return Err(format!(
-            "host '{}' — wildcards aren't allowed on a raw connection; anchor an exact domain",
+            "host '{}' — only a single leftmost '*.' wildcard is allowed",
             h
         ));
     }
-    if !host_egress_allowed(h) {
+    if !host_egress_allowed(bare) {
         return Err(format!(
             "host '{}' is loopback / private / metadata — not a valid egress target",
             h
@@ -297,7 +314,9 @@ mod tests {
         assert!(validate_raw_host("https://api.stripe.com").is_err());
         assert!(validate_raw_host("api.stripe.com/x").is_err());
         assert!(validate_raw_host("api.stripe.com:443").is_err());
-        assert!(validate_raw_host("*.stripe.com").is_err());
+        assert!(validate_raw_host("*.stripe.com").is_ok()); // wildcard domain allowed
+        assert!(validate_raw_host("*.com").is_err()); // whole TLD too broad
+        assert!(validate_raw_host("a.*.stripe.com").is_err()); // only a leftmost wildcard
         assert!(validate_raw_host("localhost").is_err());
         assert!(validate_raw_host("169.254.169.254").is_err());
         assert!(validate_raw_host("10.0.0.5").is_err());

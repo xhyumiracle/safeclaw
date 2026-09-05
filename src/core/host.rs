@@ -73,11 +73,33 @@ pub fn host_matches_exact(dest_authority: &str, allowed_fqdn: &str) -> bool {
     strip_port(dest_authority).eq_ignore_ascii_case(strip_port(allowed_fqdn))
 }
 
-/// True if `dest_authority` matches any of the `resolved` exact FQDNs.
+/// Match a destination authority against ONE anchor entry, honoring a leftmost
+/// `*.suffix` wildcard at RUNTIME. Unlike the connect-time single-label
+/// [`wildcard_matches`] (TLS-cert rule), a raw-connection wildcard anchor covers
+/// a subdomain at ANY depth so a user who doesn't know the exact API host can
+/// anchor the whole domain: `*.bitquery.io` matches `api.bitquery.io` and
+/// `a.b.bitquery.io`, but NEVER the bare apex `bitquery.io` nor a label-boundary
+/// fake like `notbitquery.io`. A non-wildcard entry is the exact, port-aware,
+/// case-insensitive compare.
+pub fn host_anchor_matches(dest_authority: &str, anchor: &str) -> bool {
+    if let Some(suffix) = anchor.strip_prefix("*.") {
+        let dest = strip_port(dest_authority).to_ascii_lowercase();
+        let suffix = suffix.to_ascii_lowercase();
+        dest.strip_suffix(&suffix)
+            .and_then(|pre| pre.strip_suffix('.'))
+            .map(|pre| !pre.is_empty())
+            .unwrap_or(false)
+    } else {
+        host_matches_exact(dest_authority, anchor)
+    }
+}
+
+/// True if `dest_authority` matches any of the `resolved` anchor entries — an
+/// exact FQDN or a `*.suffix` wildcard (see [`host_anchor_matches`]).
 pub fn host_allowed(dest_authority: &str, resolved: &[String]) -> bool {
     resolved
         .iter()
-        .any(|h| host_matches_exact(dest_authority, h))
+        .any(|h| host_anchor_matches(dest_authority, h))
 }
 
 /// Single-label leftmost wildcard match (TLS-cert rule): `*.suffix` matches
@@ -204,6 +226,26 @@ mod tests {
         assert!(host_allowed("api.github.com:443", &resolved));
         assert!(!host_allowed("evil.com", &resolved));
         assert!(!host_allowed("api.github.com.evil.com", &resolved));
+    }
+
+    #[test]
+    fn wildcard_anchor_covers_subdomains_not_apex_or_lookalikes() {
+        let resolved = vec!["*.bitquery.io".to_string()];
+        // any-depth subdomain matches (case-insensitive, port-aware).
+        assert!(host_allowed("api.bitquery.io", &resolved));
+        assert!(host_allowed("streaming.bitquery.io:443", &resolved));
+        assert!(host_allowed("a.b.bitquery.io", &resolved));
+        assert!(host_allowed("API.BitQuery.io", &resolved));
+        // the bare apex is NOT covered by a `*.` wildcard.
+        assert!(!host_allowed("bitquery.io", &resolved));
+        // label-boundary: a lookalike suffix never matches.
+        assert!(!host_allowed("notbitquery.io", &resolved));
+        assert!(!host_allowed("bitquery.io.evil.com", &resolved));
+        assert!(!host_allowed("evil.com", &resolved));
+        // exact entries stay exact even alongside the wildcard support.
+        let exact = vec!["api.bitquery.io".to_string()];
+        assert!(host_allowed("api.bitquery.io", &exact));
+        assert!(!host_allowed("streaming.bitquery.io", &exact));
     }
 
     #[test]
