@@ -210,6 +210,7 @@ pub async fn run_cli(hooks: Arc<dyn TeamHooks>) -> Result<(), Box<dyn std::error
                 ConnectionSubcommand::Add(a) => cli::connect::run(a).await,
                 ConnectionSubcommand::Ls(_a) => cli::connect::run_ls(json).await,
                 ConnectionSubcommand::Rm(a) => cli::connect::run_rm(a).await,
+                ConnectionSubcommand::AddHost(a) => cli::connect::run_add_host(a).await,
             };
             r.map_err(|e| -> Box<dyn std::error::Error> {
                 eprintln!("safeclaw connection: {}", e);

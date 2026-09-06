@@ -27,7 +27,7 @@ use crate::cli::active::resolve_active;
 use crate::cli::approve::{act_result, approve_op, deposit_values, ApproveOpts};
 use crate::cli::conn::{slugify_conn_id, valid_role, validate_raw_host};
 use crate::cli::webauthn::now_unix;
-use crate::config::{ConnectArgs, ConnectionRmArgs};
+use crate::config::{ConnectArgs, ConnectionAddHostArgs, ConnectionRmArgs};
 use crate::service::ServiceRegistry;
 use crate::storage::plaintext::suggested_secret_key;
 
@@ -151,6 +151,48 @@ pub async fn run_ls(json: bool) -> Result<(), String> {
 /// connection still references is always kept (printed with its claimants);
 /// `--keep-secrets` keeps everything (unreference only). Two passkey gestures
 /// (unlock + write); confirms first unless `--yes`.
+/// `sc connection add-host <id> <host>` — the SELF-SERVICE host widen: an agent
+/// (or a human) proposes adding a host to an existing connection's anchor, the
+/// vault owner approves with a passkey, and the host is added DURABLY. Mints the
+/// SAME `widen-host` op the proxy's one-tap widen uses (approve.rs dispatch), so
+/// reactive and proactive widening share one code path + one consent card. The
+/// host may be an exact FQDN or a leftmost `*.domain` wildcard.
+pub async fn run_add_host(args: ConnectionAddHostArgs) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(None)?;
+    let id = slugify_conn_id(&args.id);
+    if id.is_empty() {
+        return Err(format!("'{}' is not a valid connection id", args.id));
+    }
+    let host = args.host.trim().to_string();
+    validate_raw_host(&host)?;
+
+    let op = json!({
+        "act": {
+            "type": { "custom": "widen-host" },
+            "target": "",
+            "scope": { "connection_id": id, "host": host }
+        },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
+    });
+    let opts = ApproveOpts {
+        no_browser: args.no_browser,
+        cb_port: args.cb_port,
+        timeout: args.timeout,
+    };
+    let body = approve_op(
+        &custodian,
+        &vault,
+        &op,
+        &format!("Add host {} to connection {}", host, id),
+        &opts,
+    )
+    .await?;
+    let _ = act_result(&body);
+    println!("host '{}' added to connection '{}'", host, id);
+    Ok(())
+}
+
 pub async fn run_rm(args: ConnectionRmArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(None)?;
     let id = slugify_conn_id(&args.id);
