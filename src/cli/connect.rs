@@ -27,7 +27,7 @@ use crate::cli::active::resolve_active;
 use crate::cli::approve::{act_result, approve_op, deposit_values, ApproveOpts};
 use crate::cli::conn::{slugify_conn_id, valid_role, validate_raw_host};
 use crate::cli::webauthn::now_unix;
-use crate::config::{ConnectArgs, ConnectionAddHostArgs, ConnectionRmArgs};
+use crate::config::{ConnectArgs, ConnectionHostArgs, ConnectionRmArgs};
 use crate::service::ServiceRegistry;
 use crate::storage::plaintext::suggested_secret_key;
 
@@ -157,7 +157,7 @@ pub async fn run_ls(json: bool) -> Result<(), String> {
 /// SAME `widen-host` op the proxy's one-tap widen uses (approve.rs dispatch), so
 /// reactive and proactive widening share one code path + one consent card. The
 /// host may be an exact FQDN or a leftmost `*.domain` wildcard.
-pub async fn run_add_host(args: ConnectionAddHostArgs) -> Result<(), String> {
+pub async fn run_add_host(args: ConnectionHostArgs) -> Result<(), String> {
     let (custodian, vault) = resolve_active(None)?;
     let id = slugify_conn_id(&args.id);
     if id.is_empty() {
@@ -190,6 +190,58 @@ pub async fn run_add_host(args: ConnectionAddHostArgs) -> Result<(), String> {
     .await?;
     let _ = act_result(&body);
     println!("host '{}' added to connection '{}'", host, id);
+    Ok(())
+}
+
+/// `sc connection rm-host <id> <host>` — the inverse of `add-host`: propose
+/// REMOVING a host from a connection's anchor (tighten access). Same passkey
+/// approval; mints the `narrow-host` op the dispatch removes durably. Idempotent
+/// — a host not on the anchor reports nothing removed (no error).
+pub async fn run_rm_host(args: ConnectionHostArgs) -> Result<(), String> {
+    let (custodian, vault) = resolve_active(None)?;
+    let id = slugify_conn_id(&args.id);
+    if id.is_empty() {
+        return Err(format!("'{}' is not a valid connection id", args.id));
+    }
+    let host = args.host.trim().to_string();
+    if host.is_empty() {
+        return Err("host cannot be empty".into());
+    }
+
+    let op = json!({
+        "act": {
+            "type": { "custom": "narrow-host" },
+            "target": "",
+            "scope": { "connection_id": id, "host": host }
+        },
+        "bind": { "redeemer": vault },
+        "valid": { "iat": now_unix(), "multiplicity": 1 }
+    });
+    let opts = ApproveOpts {
+        no_browser: args.no_browser,
+        cb_port: args.cb_port,
+        timeout: args.timeout,
+    };
+    let body = approve_op(
+        &custodian,
+        &vault,
+        &op,
+        &format!("Remove host {} from connection {}", host, id),
+        &opts,
+    )
+    .await?;
+    let removed = act_result(&body)
+        .get("removed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if removed {
+        println!("host '{}' removed from connection '{}'", host, id);
+    } else {
+        println!(
+            "host '{}' was not on connection '{}' (nothing to remove)",
+            host, id
+        );
+    }
     Ok(())
 }
 

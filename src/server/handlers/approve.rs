@@ -226,6 +226,7 @@ pub(crate) const DISPATCHED_CUSTOM_ACTS: &[&str] = &[
     "vault-delete",
     "rename-passkey",
     "widen-host",
+    "narrow-host",
     "service-ls",
     "service-rm",
     "service-add",
@@ -1166,6 +1167,69 @@ pub async fn approve_op(
                 tracing::info!(vault = %vault_id, conn = %conn, host = %host, "host widened (durable)");
                 (
                     json!({ "ok": true, "act": "widen-host", "connection_id": conn, "host": host }),
+                    None,
+                )
+            }
+            // Inverse of widen-host — remove a host from a connection's anchor
+            // (tighten access). Minted by `sc connection rm-host`; passkey-gated
+            // like every vault mutation. Durable: open under the grant, drop the
+            // host from aux.connections[conn].hosts, reseal + push (the re-bootstrap
+            // in persist refreshes the routing snapshot, so no session call).
+            // Idempotent — a host not on the anchor is a no-op (removed = false).
+            "narrow-host" => {
+                let conn = validated
+                    .op
+                    .act
+                    .scope
+                    .get("connection_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let host = validated
+                    .op
+                    .act
+                    .scope
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if conn.is_empty() || host.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "narrow-host scope needs connection_id + host".into(),
+                    ));
+                }
+                let (mut view, k) =
+                    crate::server::handlers::metadata::open_view_for_grant_keep_key(
+                        &state,
+                        &vault_id,
+                        &validated.op,
+                        &validated.wrapping_key,
+                        &validated.credential_id_bytes,
+                        existing_vault.as_ref(),
+                    )?;
+                let mut removed = false;
+                if let Some(rec) = view.aux.connections.get_mut(&conn) {
+                    if let Some(hosts) = rec.hosts.as_mut() {
+                        let before = hosts.len();
+                        hosts.retain(|h| !h.eq_ignore_ascii_case(&host));
+                        removed = hosts.len() != before;
+                    }
+                }
+                if removed {
+                    crate::auth::connect::persist_mutated_view(&state, &vault_id, &view, &k)
+                        .map_err(AppError::Internal)?;
+                    {
+                        let state = state.clone();
+                        let vid = vault_id.clone();
+                        tokio::spawn(async move {
+                            crate::sync::push_keys_best_effort(&state, &vid).await;
+                            crate::sync::push_items_best_effort(&state, &vid).await;
+                        });
+                    }
+                }
+                tracing::info!(vault = %vault_id, conn = %conn, host = %host, removed, "host narrowed");
+                (
+                    json!({ "ok": true, "act": "narrow-host", "connection_id": conn, "host": host, "removed": removed }),
                     None,
                 )
             }

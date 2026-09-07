@@ -297,20 +297,27 @@ pub enum ConnectionSubcommand {
     /// proxy's one-tap host widen — how an agent that hit a host it can't reach
     /// asks for access instead of a human editing the vault by hand.
     #[command(name = "add-host")]
-    AddHost(ConnectionAddHostArgs),
+    AddHost(ConnectionHostArgs),
+    /// Propose REMOVING a host from a connection's anchor (tighten access) — the
+    /// inverse of `add-host`. Same passkey approval; idempotent (a host not on
+    /// the anchor reports nothing removed).
+    #[command(name = "rm-host")]
+    RmHost(ConnectionHostArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ConnectionLsArgs {}
 
+/// Args for `sc connection add-host` / `rm-host` — one passkey-approved host
+/// edit on an existing connection's anchor.
 #[derive(Debug, Args)]
-pub struct ConnectionAddHostArgs {
-    /// The connection to widen (see `sc connection ls`). Free text is slugified
+pub struct ConnectionHostArgs {
+    /// The connection to edit (see `sc connection ls`). Free text is slugified
     /// the same way `add` mints the id.
     #[arg(value_name = "ID")]
     pub id: String,
-    /// The host to allow: an exact FQDN (`api.example.com`) or a leftmost
-    /// `*.domain` wildcard (`*.example.com`) covering every subdomain.
+    /// The host: an exact FQDN (`api.example.com`) or a leftmost `*.domain`
+    /// wildcard (`*.example.com`) covering every subdomain.
     #[arg(value_name = "HOST")]
     pub host: String,
     #[arg(long)]

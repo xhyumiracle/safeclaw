@@ -48,12 +48,23 @@ facts = [
 [acts.widen-host]
 action = "Permanently allow {{vars.scope.host}}"
 action_zh = "永久允许 {{vars.scope.host}}"
-explain = "Adds this exact host to the connection's allowed destinations forever. Every future brokered request may send its credential here without asking again. Grant only a host you trust."
-explain_zh = "将此确切主机永久添加到该连接的允许目标。今后每个代理请求都可能不再询问就把凭证发送到这里。仅授权你信任的主机。"
+explain = "Adds this host to the connection's allowed destinations forever. Every future brokered request may send its credential here without asking again. Grant only a host you trust."
+explain_zh = "将此主机永久添加到该连接的允许目标。今后每个代理请求都可能不再询问就把凭证发送到这里。仅授权你信任的主机。"
 tone = "danger"
 facts = [
   { label = "Connection", label_zh = "连接", value = "{{vars.scope.connection_id}}" },
-  { label = "Exact host", label_zh = "确切主机", value = "{{vars.scope.host}}" },
+  { label = "Host", label_zh = "主机", value = "{{vars.scope.host}}" },
+]
+
+[acts.narrow-host]
+action = "Stop allowing {{vars.scope.host}}"
+action_zh = "不再允许 {{vars.scope.host}}"
+explain = "Removes this host from the connection's allowed destinations. Brokered requests can no longer send the credential there. Tightening access is always safe."
+explain_zh = "将此主机从该连接的允许目标中移除。此后代理请求不能再把凭证发送到这里。收紧权限始终是安全的。"
+tone = "neutral"
+facts = [
+  { label = "Connection", label_zh = "连接", value = "{{vars.scope.connection_id}}" },
+  { label = "Host", label_zh = "主机", value = "{{vars.scope.host}}" },
 ]
 
 [acts.service-ls]
